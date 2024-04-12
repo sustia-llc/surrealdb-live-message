@@ -1,0 +1,27 @@
+[package]
+name = "surrealdb-live-message"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1.37.0", features = ["full", "macros", "rt-multi-thread"] }
+surrealdb = { version = "1.4.0", features = ["kv-mem"] }
+futures = "0.3.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+miette = "7"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio-graceful-shutdown = "0.15"
+lazy_static = "1.4"
+
+[dev-dependencies]
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.28.0", default-features = false, features = ["signal"] }
+
+[[test]]
+name = "integration_test"
+path = "test/integration_test.rs"
+
