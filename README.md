@@ -3,7 +3,7 @@
 ## Requirements
 * [Rust](https://www.rust-lang.org/tools/install)
 * [SurrealDB](https://surrealdb.com/docs/surrealdb/installation/)
-# test
+## Test
 ## Terminal 1
 ```sh
 # start surrealdb
@@ -14,7 +14,7 @@ surreal start --log debug --user root --pass root memory
 # run the integration test
 cargo test --test integration_test
 ```
-# run
+## Run
 ## Terminal 1
 ```sh
 # start surrealdb
@@ -36,3 +36,11 @@ update message:bob set from = agent:alice, payload = { Text: { content: 'Hello, 
 # check message history
 select * from message_history
 ```
+## Documentation
+
+For detailed documentation on SurrealDB, visit [SurrealDB's Documentation](https://surrealdb.com/docs).
+
+## Acknowledgments
+* [tokio-graceful-shutdown](https://github.com/Finomnis/tokio-graceful-shutdown)
+* [surrealdb](https://github.com/surrealdb/surrealdb)
+
