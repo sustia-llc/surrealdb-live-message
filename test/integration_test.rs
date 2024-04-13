@@ -3,9 +3,9 @@ use surrealdb::opt::auth::Root;
 use surrealdb::opt::Resource;
 use surrealdb::Surreal;
 use tokio::time::{sleep, Duration};
-use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
+use tokio_graceful_shutdown::{SubsystemBuilder,Toplevel};
 
-use surrealdb_live_message::agent::{get_registry, Agent, AGENT_ALICE, AGENT_BOB};
+use surrealdb_live_message::agent::{get_registry, AGENT_ALICE, AGENT_BOB};
 use surrealdb_live_message::message::{
     MessageHistory, Payload, TextPayload, MESSAGE_HISTORY_TABLE, MESSAGE_TABLE,
 };
@@ -20,14 +20,19 @@ async fn setup() -> Surreal<Client> {
     .await
     .unwrap();
     db.use_ns("test").use_db("test").await.unwrap();
+    clear_tables(&db).await;
     db
 }
 
-async fn teardown(db: &Surreal<Client>) {
+async fn clear_tables(db: &Surreal<Client>) {
     db.delete(Resource::from(MESSAGE_HISTORY_TABLE))
         .await
         .unwrap();
     db.delete(Resource::from(MESSAGE_TABLE)).await.unwrap();
+}
+
+async fn teardown(db: &Surreal<Client>) {
+    clear_tables(db).await;
 }
 
 #[tokio::test]
