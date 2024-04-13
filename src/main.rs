@@ -1,14 +1,9 @@
-mod agent;
-mod message;
-mod top;
 use miette::Result;
-
 use surrealdb::opt::auth::Root;
 use tokio::time::Duration;
 use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
 
 use surrealdb_live_message::connection;
-// use surrealdb_live_message::get_registry;
 use surrealdb_live_message::top::top_level;
 
 #[tokio::main]
