@@ -24,6 +24,7 @@ surreal start --log debug --user root --pass root memory
 ```sh
 # start the app
 cargo run
+# when finished with client below, hit ctrl-c to view the log outputs from the subsystems shutdowns
 ```
 ## Terminal 3
 ```sh
