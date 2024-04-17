@@ -2,6 +2,7 @@ use futures::StreamExt;
 use miette::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use surrealdb::opt::Resource;
 use surrealdb::sql::{Datetime, Thing};
 use surrealdb::Notification;
 use tokio::sync::oneshot;
@@ -13,8 +14,6 @@ use crate::message::{save_message_history, Message, Payload, TextPayload, MESSAG
 // use crate::get_registry;
 
 pub const AGENT_TABLE: &str = "agent";
-pub const AGENT_BOB: &str = "bob";
-pub const AGENT_ALICE: &str = "alice";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Agent {
@@ -44,13 +43,13 @@ impl Agent {
             .unwrap();
         let mut registry = REGISTRY.lock().unwrap();
         registry.push(agent.clone());
- 
+
         agent
     }
 
     pub async fn create_message_record(&self) -> surrealdb::Result<()> {
         let db = connection().await.to_owned();
-        // create initial message queue for alice
+        // create initial message queue for agent
         let text_payload = TextPayload {
             content: "Initializing message queue".to_owned(),
         };
@@ -129,6 +128,7 @@ impl Agent {
                     tracing::debug!("Shutdown signal received, terminating listen function.");
                     drop(message_stream);
                     drop(response);
+                    db.delete(Resource::from((MESSAGE_TABLE, name))).await.expect("agent message delete failed");
                     // TODO: verify live query is killed
                     break;
                 }
@@ -138,21 +138,18 @@ impl Agent {
     }
 }
 
-pub async fn agent_subsystem(
-    name: Arc<String>,
-    subsys: SubsystemHandle,
-) -> Result<()> {
+pub async fn agent_subsystem(name: Arc<String>, subsys: SubsystemHandle) -> Result<()> {
     tracing::info!("{} started.", name);
     let agent = Agent::new(name.as_str()).await;
     agent.create_message_record().await.unwrap();
 
-// FIXME: add agent to registry
-    // { 
+    // FIXME: add agent to registry
+    // {
     //     let agent_clone = agent.clone();
     //     let mut registry = get_registry().lock().unwrap();
     //     registry.add_agent(agent_clone);
     // }
-    
+
     let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
     let listen_task = tokio::spawn({
         async move {
