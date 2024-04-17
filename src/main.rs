@@ -6,6 +6,9 @@ use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
 use surrealdb_live_message::connection;
 use surrealdb_live_message::top::top_level;
 
+const AGENT_BOB: &str = "bob";
+const AGENT_ALICE: &str = "alice";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -20,8 +23,9 @@ async fn main() -> Result<()> {
     .unwrap();
     db.use_ns("test").use_db("test").await.unwrap();
     // Setup and execute subsystem tree
+    let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
     Toplevel::new(move |s| async move {
-        s.start(SubsystemBuilder::new("top_level", move |s| top_level(s)));
+        s.start(SubsystemBuilder::new("top_level", move |s| top_level(s, names)));
     })
     .catch_signals()
     .handle_shutdown_requests(Duration::from_millis(1000))

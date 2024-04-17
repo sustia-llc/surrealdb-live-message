@@ -3,13 +3,16 @@ use surrealdb::opt::auth::Root;
 use surrealdb::opt::Resource;
 use surrealdb::Surreal;
 use tokio::time::{sleep, Duration};
-use tokio_graceful_shutdown::{SubsystemBuilder,Toplevel};
+use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
 
-use surrealdb_live_message::agent::{get_registry, AGENT_ALICE, AGENT_BOB};
+use surrealdb_live_message::agent::get_registry;
 use surrealdb_live_message::message::{
     MessageHistory, Payload, TextPayload, MESSAGE_HISTORY_TABLE, MESSAGE_TABLE,
 };
-use surrealdb_live_message::top::top_level;
+use surrealdb_live_message::top;
+
+const AGENT_BOB: &str = "bob";
+const AGENT_ALICE: &str = "alice";
 
 async fn setup() -> Surreal<Client> {
     let db = Surreal::new::<Ws>("localhost:8000").await.unwrap();
@@ -40,29 +43,47 @@ async fn test_agent_messaging() {
     use nix::sys::signal::{self, Signal};
     use nix::unistd::Pid;
 
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
+
     let db = setup().await;
+
     tokio::join!(
         async {
-            sleep(Duration::from_secs(5)).await;
+            while !top::is_ready() {
+                sleep(Duration::from_millis(100)).await;
+            }
             let registry = get_registry();
             let agents = registry.lock().unwrap();
             assert_eq!(agents.len(), 2);
 
-            let alice = agents.iter().find(|&a| a.id.id.to_string() == AGENT_ALICE).expect("Failed to find alice");
-            let bob = agents.iter().find(|&a| a.id.id.to_string() == AGENT_BOB).expect("Failed to find bob");
-    
+            let alice = agents
+                .iter()
+                .find(|&a| a.id.id.to_string() == AGENT_ALICE)
+                .expect("Failed to find alice");
+            let bob = agents
+                .iter()
+                .find(|&a| a.id.id.to_string() == AGENT_BOB)
+                .expect("Failed to find bob");
+
             // Send messages
             let text_payload = TextPayload {
                 content: "Hello from Alice!".to_string(),
             };
             let payload = Payload::Text(text_payload);
-            alice.send(AGENT_BOB, payload).await.expect("Failed to send message");
+            alice
+                .send(AGENT_BOB, payload)
+                .await
+                .expect("Failed to send message");
 
             let text_payload = TextPayload {
                 content: "Hello from Bob!".to_string(),
             };
             let payload = Payload::Text(text_payload);
-            bob.send(AGENT_ALICE, payload).await.expect("Failed to send message");
+            bob.send(AGENT_ALICE, payload)
+                .await
+                .expect("Failed to send message");
 
             sleep(Duration::from_secs(1)).await; // Wait for messages to be processed
 
@@ -85,8 +106,11 @@ async fn test_agent_messaging() {
             signal::kill(Pid::this(), Signal::SIGINT).unwrap();
         },
         async {
+            let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
             let result = Toplevel::new(move |s| async move {
-                s.start(SubsystemBuilder::new("top_level", move |s| top_level(s)));
+                s.start(SubsystemBuilder::new("top_level", move |s| {
+                    top::top_level(s, names)
+                }));
             })
             .catch_signals()
             .handle_shutdown_requests(Duration::from_millis(3000))

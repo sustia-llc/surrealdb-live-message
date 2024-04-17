@@ -1,35 +1,42 @@
+use crate::agent::agent_subsystem;
 use miette::Result;
+use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
-use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
-use crate::agent::{AGENT_BOB, AGENT_ALICE, agent_subsystem};
+use tokio_graceful_shutdown::{NestedSubsystem, SubsystemBuilder, SubsystemHandle};
 
-pub async fn top_level(subsys: SubsystemHandle) -> Result<()> {
+lazy_static::lazy_static! {
+    static ref READY_FLAG: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+}
+
+pub fn is_ready() -> bool {
+    READY_FLAG.load(Ordering::SeqCst)
+}
+
+fn send_ready_signal() {
+    READY_FLAG.store(true, Ordering::SeqCst);
+}
+
+pub async fn top_level(subsys: SubsystemHandle, agent_names: Vec<String>) -> Result<()> {
     tracing::info!("top_level started.");
     tracing::info!("Starting detached agent subsystems ...");
-
-    let bob_subsys = subsys.start(
-        SubsystemBuilder::new("AgentBob", move |s| {
-            agent_subsystem(Arc::new(AGENT_BOB.to_string()), s)
-        })
-        .detached(),
-    );
-
-    let alice_subsys = subsys.start(
-        SubsystemBuilder::new("AgentAlice", move |s| {
-            agent_subsystem(Arc::new(AGENT_ALICE.to_string()), s)
-        })
-        .detached(),
-    );
-
+    let mut agents: Vec<NestedSubsystem<Box<dyn Error + Sync + Send>>> = Vec::new();
+    for name in agent_names {
+        let agent = subsys.start(
+            SubsystemBuilder::new(name.clone(), move |s| agent_subsystem(Arc::new(name), s))
+                .detached(),
+        );
+        agents.push(agent);
+    }
+    send_ready_signal();
     subsys.on_shutdown_requested().await;
 
-    tracing::info!("Initiating AgentBob shutdown ...");
-    bob_subsys.initiate_shutdown();
-    bob_subsys.join().await?;
-    tracing::info!("Initiating AgentAlice shutdown ...");
-    alice_subsys.initiate_shutdown();
-    alice_subsys.join().await?;
+    tracing::info!("Initiating agents shutdown ...");
+    for agent in agents.iter() {
+        agent.initiate_shutdown();
+        agent.join().await?;
+    }
 
     tracing::info!("All agents finished, stopping top_level ...");
     sleep(Duration::from_millis(200)).await;

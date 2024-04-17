@@ -2,9 +2,9 @@ pub mod agent;
 pub mod message;
 pub mod top;
 
+use surrealdb::engine::remote::ws::{Client, Ws};
 use surrealdb::Surreal;
 use tokio::sync::OnceCell;
-use surrealdb::engine::remote::ws::{Client, Ws};
 
 static CONNECTION: OnceCell<Surreal<Client>> = OnceCell::const_new();
 
