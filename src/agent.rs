@@ -5,13 +5,11 @@ use std::sync::{Arc, Mutex};
 use surrealdb::opt::Resource;
 use surrealdb::sql::{Datetime, Thing};
 use surrealdb::Notification;
-use tokio::sync::oneshot;
 use tokio::time::{sleep, Duration};
-use tokio_graceful_shutdown::SubsystemHandle;
+use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 
 use crate::connection;
 use crate::message::{save_message_history, Message, Payload, TextPayload, MESSAGE_TABLE};
-// use crate::get_registry;
 
 pub const AGENT_TABLE: &str = "agent";
 
@@ -89,10 +87,7 @@ impl Agent {
         Ok(())
     }
 
-    pub async fn listen(
-        &self,
-        mut shutdown_signal: oneshot::Receiver<()>,
-    ) -> surrealdb::Result<()> {
+    pub async fn listen(&self, shutdown_signal: SubsystemHandle) -> surrealdb::Result<()> {
         let db = connection().await.to_owned();
 
         let name = &self.id.id.to_string();
@@ -124,7 +119,7 @@ impl Agent {
                         Err(error) => tracing::error!("{}", error),
                     }
                 }
-                _ = &mut shutdown_signal => {
+                _ = shutdown_signal.on_shutdown_requested() => {
                     tracing::debug!("Shutdown signal received, terminating listen function.");
                     drop(message_stream);
                     drop(response);
@@ -143,26 +138,20 @@ pub async fn agent_subsystem(name: Arc<String>, subsys: SubsystemHandle) -> Resu
     let agent = Agent::new(name.as_str()).await;
     agent.create_message_record().await.unwrap();
 
-    // FIXME: add agent to registry
-    // {
-    //     let agent_clone = agent.clone();
-    //     let mut registry = get_registry().lock().unwrap();
-    //     registry.add_agent(agent_clone);
-    // }
-
-    let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
-    let listen_task = tokio::spawn({
-        async move {
+    let listen_subsys = subsys.start(SubsystemBuilder::new(
+        format!("{}-listen", name),
+        |subsys| async move {
             agent
-                .listen(shutdown_receiver)
+                .listen(subsys)
                 .await
                 .expect("Failed to listen for new messages");
-        }
-    });
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        },
+    ).detached());
 
     subsys.on_shutdown_requested().await;
-    let _ = shutdown_sender.send(()); // Ignore the error if the receiver is dropped
-    let _ = listen_task.await; // Wait for the listen task to complete
+    listen_subsys.initiate_shutdown();
+    let _ = listen_subsys.join().await;
 
     tracing::info!("{name} shutting down ...");
     sleep(Duration::from_millis(200)).await;
