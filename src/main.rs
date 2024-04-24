@@ -5,15 +5,15 @@ use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
 
 use surrealdb_live_message::connection;
 use surrealdb_live_message::top::top_level;
+use surrealdb_live_message::logger;
 
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
+    logger::setup();
+
     let db = connection().await.to_owned();
     db.signin(Root {
         username: "root",

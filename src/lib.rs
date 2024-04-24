@@ -1,6 +1,8 @@
 pub mod agent;
 pub mod message;
 pub mod top;
+pub mod settings;
+pub mod logger;
 
 use surrealdb::engine::remote::ws::{Client, Ws};
 use surrealdb::Surreal;

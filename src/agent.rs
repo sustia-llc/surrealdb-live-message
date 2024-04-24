@@ -105,13 +105,13 @@ impl Agent {
 
                             match &message.payload {
                                 Payload::Text(text_payload) => {
-                                    tracing::debug!("{:?}: Text message: {}", action, text_payload.content);
+                                    tracing::info!("{:?}: Text message: {}", action, text_payload.content);
                                 },
                                 Payload::Image(image_payload) => {
-                                    tracing::debug!("Image message: {}, caption: {:?}", image_payload.url, image_payload.caption);
+                                    tracing::info!("Image message: {}, caption: {:?}", image_payload.url, image_payload.caption);
                                 },
                                 Payload::Video(video_payload) => {
-                                    tracing::debug!("Video message: {}, duration: {} seconds", video_payload.url, video_payload.duration);
+                                    tracing::info!("Video message: {}, duration: {} seconds", video_payload.url, video_payload.duration);
                                 },
                             }
                             save_message_history(message).await?;

@@ -1,5 +1,5 @@
 [package]
-name = "surrealdb-live-message"
+name = "surrealdb_live_message"
 version = "0.1.0"
 edition = "2021"
 
@@ -16,7 +16,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio-graceful-shutdown = "0.15"
 lazy_static = "1.4"
-flume = "0.11"
+config = "0.14"
 
 [dev-dependencies]
 [target.'cfg(unix)'.dev-dependencies]

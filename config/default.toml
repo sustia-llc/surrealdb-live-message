@@ -1,0 +1,16 @@
+environment = "development"
+
+[logger]
+level = "info"
+
+[docker]
+platform = "linux/x86_64"
+
+[sdb]
+host = "localhost"
+port = 8000
+image = "surrealdb/surrealdb"
+tag = "latest"
+container_name = "sdb_container"
+namespace = "test"
+database = "test"
