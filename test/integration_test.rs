@@ -1,15 +1,30 @@
+use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use surrealdb::engine::remote::ws::{Client, Ws};
 use surrealdb::opt::auth::Root;
 use surrealdb::opt::Resource;
 use surrealdb::Surreal;
-use tokio::time::{sleep, Duration};
-use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
-
 use surrealdb_live_message::agent::get_registry;
+use surrealdb_live_message::logger;
 use surrealdb_live_message::message::{
     MessageHistory, Payload, TextPayload, MESSAGE_HISTORY_TABLE, MESSAGE_TABLE,
 };
 use surrealdb_live_message::top;
+use tokio::time::{sleep, Duration};
+use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
+
+lazy_static::lazy_static! {
+    static ref READY_FLAG: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+}
+
+fn is_ready() -> bool {
+    READY_FLAG.load(Ordering::SeqCst)
+}
+
+fn set_ready() {
+    READY_FLAG.store(true, Ordering::SeqCst);
+}
 
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
@@ -43,15 +58,14 @@ async fn test_agent_messaging() {
     use nix::sys::signal::{self, Signal};
     use nix::unistd::Pid;
 
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
+    env::set_var("RUN_MODE", "test");
+    logger::setup();
 
     let db = setup().await;
 
     tokio::join!(
         async {
-            while !top::is_ready() {
+            while !is_ready() {
                 sleep(Duration::from_millis(100)).await;
             }
             let registry = get_registry();
@@ -111,6 +125,7 @@ async fn test_agent_messaging() {
                 s.start(SubsystemBuilder::new("top_level", move |s| {
                     top::top_level(s, names)
                 }));
+                set_ready();
             })
             .catch_signals()
             .handle_shutdown_requests(Duration::from_millis(3000))
