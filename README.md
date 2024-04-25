@@ -2,14 +2,9 @@
 - demonstrates a light message layer for multi-agent interaction, based on surrealdb live query. A single message record is created for each agent; agents listen for updates to their message record. Message history is stored in a separate table.
 ## Requirements
 * [Rust](https://www.rust-lang.org/tools/install)
-* [SurrealDB](https://surrealdb.com/docs/surrealdb/installation/)
+* [Docker](https://docs.docker.com/get-docker/)
+* [SurrealDB](https://surrealdb.com/docs/surrealdb/installation/) (for client sql queries, see Run below)
 ## Test
-## Terminal 1
-```sh
-# start surrealdb
-surreal start --log debug --user root --pass root memory
-```
-## Terminal 2
 ```sh
 # run the integration test
 cargo test --test integration_test
@@ -17,16 +12,11 @@ cargo test --test integration_test
 ## Run
 ## Terminal 1
 ```sh
-# start surrealdb
-surreal start --log debug --user root --pass root memory
-```
-## Terminal 2
-```sh
 # start the app
 cargo run
 # when finished with client below, hit ctrl-c to view the log outputs from the subsystem and listener shutdowns
 ```
-## Terminal 3
+## Terminal 2
 ```sh
 # start surrealdb client
 surreal sql --user root --pass root --namespace test --database test

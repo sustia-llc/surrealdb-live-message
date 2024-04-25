@@ -1,16 +1,17 @@
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use surrealdb::engine::remote::ws::{Client, Ws};
-use surrealdb::opt::auth::Root;
+use surrealdb::engine::remote::ws::Client;
 use surrealdb::opt::Resource;
 use surrealdb::Surreal;
-use surrealdb_live_message::agent::get_registry;
 use surrealdb_live_message::logger;
 use surrealdb_live_message::message::{
     MessageHistory, Payload, TextPayload, MESSAGE_HISTORY_TABLE, MESSAGE_TABLE,
 };
-use surrealdb_live_message::top;
+use surrealdb_live_message::subsystems::agent::get_registry;
+use surrealdb_live_message::subsystems::sdb;
+use surrealdb_live_message::sdb_server;
+use surrealdb_live_message::subsystems::agents;
 use tokio::time::{sleep, Duration};
 use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
 
@@ -29,28 +30,11 @@ fn set_ready() {
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
 
-async fn setup() -> Surreal<Client> {
-    let db = Surreal::new::<Ws>("localhost:8000").await.unwrap();
-    db.signin(Root {
-        username: "root",
-        password: "root",
-    })
-    .await
-    .unwrap();
-    db.use_ns("test").use_db("test").await.unwrap();
-    clear_tables(&db).await;
-    db
-}
-
 async fn clear_tables(db: &Surreal<Client>) {
     db.delete(Resource::from(MESSAGE_HISTORY_TABLE))
         .await
         .unwrap();
     db.delete(Resource::from(MESSAGE_TABLE)).await.unwrap();
-}
-
-async fn teardown(db: &Surreal<Client>) {
-    clear_tables(db).await;
 }
 
 #[tokio::test]
@@ -61,13 +45,15 @@ async fn test_agent_messaging() {
     env::set_var("RUN_MODE", "test");
     logger::setup();
 
-    let db = setup().await;
-
     tokio::join!(
         async {
             while !is_ready() {
                 sleep(Duration::from_millis(100)).await;
             }
+
+            let db = sdb::connection().await.to_owned();
+            clear_tables(&db).await;
+
             let registry = get_registry();
             let agents = registry.lock().unwrap();
             assert_eq!(agents.len(), 2);
@@ -116,23 +102,25 @@ async fn test_agent_messaging() {
             let bob_messages: Vec<MessageHistory> = response.take(0).unwrap();
             assert_eq!(bob_messages.len(), 1);
 
+            clear_tables(&db).await;
+
             tracing::debug!("sending SIGINT to itself.");
             signal::kill(Pid::this(), Signal::SIGINT).unwrap();
         },
         async {
             let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
             let result = Toplevel::new(move |s| async move {
-                s.start(SubsystemBuilder::new("top_level", move |s| {
-                    top::top_level(s, names)
+                s.start(SubsystemBuilder::new(sdb::SUBSYS_NAME, sdb::sdb_subsystem));
+                sdb_server::surrealdb_ready().await.unwrap();
+                s.start(SubsystemBuilder::new(agents::SUBSYS_NAME, move |s| {
+                    agents::agents_subsystem(s, names)
                 }));
                 set_ready();
             })
             .catch_signals()
-            .handle_shutdown_requests(Duration::from_millis(3000))
+            .handle_shutdown_requests(Duration::from_secs(4))
             .await;
             assert!(result.is_ok());
-
-            teardown(&db).await;
         },
     );
 }

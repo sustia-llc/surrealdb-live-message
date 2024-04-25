@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.37.0", features = ["full", "macros", "rt-multi-thread"] }
+tokio-stream = "0.1"
 surrealdb = { version = "1.4.2", features = ["kv-mem"] }
 futures = "0.3.3"
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +18,9 @@ tracing-subscriber = "0.3"
 tokio-graceful-shutdown = "0.15"
 lazy_static = "1.4"
 config = "0.14"
+bollard = "0.16"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "gzip"] }
+
 
 [dev-dependencies]
 [target.'cfg(unix)'.dev-dependencies]

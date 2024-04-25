@@ -1,3 +1,4 @@
+use crate::subsystems::sdb;
 use futures::StreamExt;
 use miette::Result;
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,6 @@ use surrealdb::Notification;
 use tokio::time::{sleep, Duration};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 
-use crate::connection;
 use crate::message::{save_message_history, Message, Payload, TextPayload, MESSAGE_TABLE};
 
 pub const AGENT_TABLE: &str = "agent";
@@ -29,7 +29,7 @@ pub fn get_registry() -> &'static Mutex<Vec<Agent>> {
 
 impl Agent {
     pub async fn new(name: &str) -> Self {
-        let db = connection().await.to_owned();
+        let db = sdb::connection().await.to_owned();
         let agent: Agent = db
             .update((AGENT_TABLE, name))
             .content(Agent {
@@ -46,7 +46,7 @@ impl Agent {
     }
 
     pub async fn create_message_record(&self) -> surrealdb::Result<()> {
-        let db = connection().await.to_owned();
+        let db = sdb::connection().await.to_owned();
         // create initial message queue for agent
         let text_payload = TextPayload {
             content: "Initializing message queue".to_owned(),
@@ -56,7 +56,7 @@ impl Agent {
         let user_id: Thing = Thing::from((MESSAGE_TABLE, "user"));
         let message_id: Thing = Thing::from((MESSAGE_TABLE, name.as_str()));
         let _: Message = db
-            .update((MESSAGE_TABLE, name))
+            .create((MESSAGE_TABLE, name))
             .content(Message {
                 id: message_id,
                 payload: Payload::Text(text_payload),
@@ -71,9 +71,9 @@ impl Agent {
     }
 
     pub async fn send(&self, to: &str, payload: Payload) -> surrealdb::Result<()> {
-        let db = connection().await.to_owned();
+        let db = sdb::connection().await.to_owned();
         let _: Message = db
-            .update((MESSAGE_TABLE, to))
+            .create((MESSAGE_TABLE, to))
             .content(Message {
                 id: Thing::from((MESSAGE_TABLE, to)),
                 payload,
@@ -88,7 +88,7 @@ impl Agent {
     }
 
     pub async fn listen(&self, shutdown_signal: SubsystemHandle) -> surrealdb::Result<()> {
-        let db = connection().await.to_owned();
+        let db = sdb::connection().await.to_owned();
 
         let name = &self.id.id.to_string();
         let query = format!("LIVE SELECT * FROM message where id = message:{}", name);
@@ -102,7 +102,11 @@ impl Agent {
                         Ok(notification) => {
                             let action = notification.action;
                             let message: Message = notification.data;
-
+                            if action == surrealdb::Action::Delete {
+                                tracing::debug!("Message deleted: {:?}", message);
+                                continue;
+                            }
+                            
                             match &message.payload {
                                 Payload::Text(text_payload) => {
                                     tracing::info!("{:?}: Text message: {}", action, text_payload.content);
@@ -120,7 +124,7 @@ impl Agent {
                     }
                 }
                 _ = shutdown_signal.on_shutdown_requested() => {
-                    tracing::debug!("Shutdown signal received, terminating listen function.");
+                    tracing::info!("Shutdown signal received, terminating listen function.");
                     drop(message_stream);
                     drop(response);
                     db.delete(Resource::from((MESSAGE_TABLE, name))).await.expect("agent message delete failed");
@@ -134,20 +138,20 @@ impl Agent {
 }
 
 pub async fn agent_subsystem(name: Arc<String>, subsys: SubsystemHandle) -> Result<()> {
-    tracing::info!("{} started.", name);
+    tracing::info!("{} starting.", name);
     let agent = Agent::new(name.as_str()).await;
     agent.create_message_record().await.unwrap();
 
-    let listen_subsys = subsys.start(SubsystemBuilder::new(
-        format!("{}-listen", name),
-        |subsys| async move {
+    let listen_subsys = subsys.start(
+        SubsystemBuilder::new(format!("{}-listen", name), |subsys| async move {
             agent
                 .listen(subsys)
                 .await
                 .expect("Failed to listen for new messages");
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        },
-    ).detached());
+        })
+        .detached(),
+    );
 
     subsys.on_shutdown_requested().await;
     listen_subsys.initiate_shutdown();

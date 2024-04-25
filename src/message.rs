@@ -1,8 +1,7 @@
+use crate::subsystems::sdb;
 use serde::{Deserialize, Serialize};
-use surrealdb::sql::{Datetime, Id, Thing};
 use surrealdb::opt::Resource;
-
-use crate::connection;
+use surrealdb::sql::{Datetime, Id, Thing};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Payload {
@@ -48,7 +47,7 @@ pub struct MessageHistory {
 }
 
 pub async fn save_message_history(message: Message) -> surrealdb::Result<()> {
-    let db = connection().await.to_owned();
+    let db = sdb::connection().await.to_owned();
 
     db.create(Resource::from(MESSAGE_HISTORY_TABLE))
         .content(MessageHistory {

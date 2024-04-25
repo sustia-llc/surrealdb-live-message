@@ -1,4 +1,4 @@
 environment = "test"
 
 [logger]
-level = "debug"
+level = "info"
