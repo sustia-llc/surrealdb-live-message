@@ -1,5 +1,5 @@
 # surrealdb-live-message
-- demonstrates a light message layer for multi-agent interaction, based on surrealdb live query. A single message record is created for each agent; agents listen for updates to their message record. Message history is stored in a separate table.
+- demonstrates a light message layer for multi-agent interaction, based on surrealdb live query. Message records are sent by establishing a graph relation from sending agent to receiving agent.
 ## Requirements
 * [Rust](https://www.rust-lang.org/tools/install)
 * [Docker](https://docs.docker.com/get-docker/)
@@ -21,11 +21,20 @@ cargo run
 # start surrealdb client
 surreal sql --user root --pass root --namespace test --database test
 # message from bob to alice
-update message:alice set from = agent:bob, payload = { Text: { content: 'Hello, Alice!' } }, updated = time::now()
+RELATE agent:bob->message->agent:alice 
+	CONTENT {
+		created: time::now(),
+        payload: { Text: { content: 'Hello, Alice!' } },
+	};
 # message from alice to bob
-update message:bob set from = agent:alice, payload = { Text: { content: 'Hello, Bob!' } }, updated = time::now()
-# check message history
-select * from message_history
+RELATE agent:alice->message->agent:bob 
+	CONTENT {
+		created: time::now(),
+        payload: { Text: { content: 'Hello, Bob!' } },
+	};
+
+# check messages
+select * from message
 ```
 ## Documentation
 

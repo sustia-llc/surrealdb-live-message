@@ -9,7 +9,7 @@ use surrealdb::Notification;
 use tokio::time::{sleep, Duration};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 
-use crate::message::{save_message_history, Message, Payload, TextPayload, MESSAGE_TABLE};
+use crate::message::{Message, Payload, MESSAGE_TABLE};
 
 pub const AGENT_TABLE: &str = "agent";
 
@@ -45,45 +45,14 @@ impl Agent {
         agent
     }
 
-    pub async fn create_message_record(&self) -> surrealdb::Result<()> {
-        let db = sdb::connection().await.to_owned();
-        // create initial message queue for agent
-        let text_payload = TextPayload {
-            content: "Initializing message queue".to_owned(),
-        };
-
-        let name = &self.id.id.to_string();
-        let user_id: Thing = Thing::from((MESSAGE_TABLE, "user"));
-        let message_id: Thing = Thing::from((MESSAGE_TABLE, name.as_str()));
-        let _: Message = db
-            .create((MESSAGE_TABLE, name))
-            .content(Message {
-                id: message_id,
-                payload: Payload::Text(text_payload),
-                from: user_id,
-                created: Some(Datetime::default()),
-                updated: None,
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        Ok(())
-    }
-
     pub async fn send(&self, to: &str, payload: Payload) -> surrealdb::Result<()> {
         let db = sdb::connection().await.to_owned();
-        let _: Message = db
-            .create((MESSAGE_TABLE, to))
-            .content(Message {
-                id: Thing::from((MESSAGE_TABLE, to)),
-                payload,
-                from: self.id.clone(),
-                created: Some(Datetime::default()),
-                updated: None,
-            })
-            .await
-            .unwrap()
-            .unwrap();
+
+        let payload = serde_json::to_string(&payload).unwrap();
+        let from = self.id.id.to_string();
+        let query = format!("RELATE agent:{}->message->agent:{} CONTENT {{ created: time::now(), payload: {{{}}} }};", from, to, payload);
+
+        let _ = db.query(&query).await.unwrap();
         Ok(())
     }
 
@@ -91,7 +60,7 @@ impl Agent {
         let db = sdb::connection().await.to_owned();
 
         let name = &self.id.id.to_string();
-        let query = format!("LIVE SELECT * FROM message where id = message:{}", name);
+        let query = format!("LIVE SELECT * FROM message where out = agent:{}", name);
         let mut response = db.query(&query).await.unwrap();
         let mut message_stream = response.stream::<Notification<Message>>(0)?;
 
@@ -106,7 +75,7 @@ impl Agent {
                                 tracing::debug!("Message deleted: {:?}", message);
                                 continue;
                             }
-                            
+
                             match &message.payload {
                                 Payload::Text(text_payload) => {
                                     tracing::info!("{:?}: Text message: {}", action, text_payload.content);
@@ -118,7 +87,6 @@ impl Agent {
                                     tracing::info!("Video message: {}, duration: {} seconds", video_payload.url, video_payload.duration);
                                 },
                             }
-                            save_message_history(message).await?;
                         }
                         Err(error) => tracing::error!("{}", error),
                     }
@@ -140,7 +108,6 @@ impl Agent {
 pub async fn agent_subsystem(name: Arc<String>, subsys: SubsystemHandle) -> Result<()> {
     tracing::info!("{} starting.", name);
     let agent = Agent::new(name.as_str()).await;
-    agent.create_message_record().await.unwrap();
 
     let listen_subsys = subsys.start(
         SubsystemBuilder::new(format!("{}-listen", name), |subsys| async move {

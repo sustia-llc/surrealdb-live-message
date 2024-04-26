@@ -6,7 +6,7 @@ use surrealdb::opt::Resource;
 use surrealdb::Surreal;
 use surrealdb_live_message::logger;
 use surrealdb_live_message::message::{
-    MessageHistory, Payload, TextPayload, MESSAGE_HISTORY_TABLE, MESSAGE_TABLE,
+    Message, Payload, TextPayload, MESSAGE_TABLE,
 };
 use surrealdb_live_message::subsystems::agent::get_registry;
 use surrealdb_live_message::subsystems::sdb;
@@ -30,10 +30,7 @@ fn set_ready() {
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
 
-async fn clear_tables(db: &Surreal<Client>) {
-    db.delete(Resource::from(MESSAGE_HISTORY_TABLE))
-        .await
-        .unwrap();
+async fn clear_db(db: &Surreal<Client>) {
     db.delete(Resource::from(MESSAGE_TABLE)).await.unwrap();
 }
 
@@ -52,7 +49,7 @@ async fn test_agent_messaging() {
             }
 
             let db = sdb::connection().await.to_owned();
-            clear_tables(&db).await;
+            clear_db(&db).await;
 
             let registry = get_registry();
             let agents = registry.lock().unwrap();
@@ -87,22 +84,22 @@ async fn test_agent_messaging() {
 
             sleep(Duration::from_secs(1)).await; // Wait for messages to be processed
 
-            // Verify messages are saved in the message history
+            // Verify messages
             let mut response = db
-                .query("SELECT * FROM message_history WHERE message.from = agent:alice")
+                .query("SELECT * FROM message WHERE in = agent:alice")
                 .await
                 .unwrap();
-            let alice_messages: Vec<MessageHistory> = response.take(0).unwrap();
+            let alice_messages: Vec<Message> = response.take(0).unwrap();
             assert_eq!(alice_messages.len(), 1);
 
             let mut response = db
-                .query("SELECT * FROM message_history WHERE message.from = agent:bob")
+            .query("SELECT * FROM message WHERE in = agent:bob")
                 .await
                 .unwrap();
-            let bob_messages: Vec<MessageHistory> = response.take(0).unwrap();
+            let bob_messages: Vec<Message> = response.take(0).unwrap();
             assert_eq!(bob_messages.len(), 1);
 
-            clear_tables(&db).await;
+            clear_db(&db).await;
 
             tracing::debug!("sending SIGINT to itself.");
             signal::kill(Pid::this(), Signal::SIGINT).unwrap();
