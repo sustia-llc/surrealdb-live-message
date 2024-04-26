@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         }));
     })
     .catch_signals()
-    .handle_shutdown_requests(Duration::from_millis(1000))
+    .handle_shutdown_requests(Duration::from_secs(4))
     .await
     .map_err(Into::into)
 }
