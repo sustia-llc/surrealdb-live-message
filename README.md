@@ -24,13 +24,13 @@ surreal sql --user root --pass root --namespace test --database test
 RELATE agent:bob->message->agent:alice 
 	CONTENT {
 		created: time::now(),
-        payload: { Text: { content: 'Hello, Alice!' } },
+        	payload: { Text: { content: 'Hello, Alice!' } },
 	};
 # message from alice to bob
 RELATE agent:alice->message->agent:bob 
 	CONTENT {
 		created: time::now(),
-        payload: { Text: { content: 'Hello, Bob!' } },
+        	payload: { Text: { content: 'Hello, Bob!' } },
 	};
 
 # check messages
