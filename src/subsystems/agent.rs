@@ -1,6 +1,7 @@
 use crate::subsystems::sdb;
 use futures::StreamExt;
 use miette::Result;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use surrealdb::opt::Resource;
@@ -19,9 +20,8 @@ pub struct Agent {
     created: Datetime,
 }
 
-lazy_static::lazy_static! {
-    static ref REGISTRY: Mutex<Vec<Agent>> = Mutex::new(Vec::new());
-}
+pub static REGISTRY: Lazy<Mutex<Vec<Agent>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
 
 pub fn get_registry() -> &'static Mutex<Vec<Agent>> {
     &REGISTRY

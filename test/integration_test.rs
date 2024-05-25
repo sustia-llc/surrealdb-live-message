@@ -1,3 +1,4 @@
+use once_cell::sync::Lazy;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -5,19 +6,15 @@ use surrealdb::engine::remote::ws::Client;
 use surrealdb::opt::Resource;
 use surrealdb::Surreal;
 use surrealdb_live_message::logger;
-use surrealdb_live_message::message::{
-    Message, Payload, TextPayload, MESSAGE_TABLE,
-};
-use surrealdb_live_message::subsystems::agent::get_registry;
-use surrealdb_live_message::subsystems::sdb;
+use surrealdb_live_message::message::{Message, Payload, TextPayload, MESSAGE_TABLE};
 use surrealdb_live_message::sdb_server;
+use surrealdb_live_message::subsystems::agent::get_registry;
 use surrealdb_live_message::subsystems::agents;
+use surrealdb_live_message::subsystems::sdb;
 use tokio::time::{sleep, Duration};
 use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
 
-lazy_static::lazy_static! {
-    static ref READY_FLAG: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-}
+pub static READY_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
 
 fn is_ready() -> bool {
     READY_FLAG.load(Ordering::SeqCst)
@@ -93,7 +90,7 @@ async fn test_agent_messaging() {
             assert_eq!(alice_messages.len(), 1);
 
             let mut response = db
-            .query("SELECT * FROM message WHERE in = agent:bob")
+                .query("SELECT * FROM message WHERE in = agent:bob")
                 .await
                 .unwrap();
             let bob_messages: Vec<Message> = response.take(0).unwrap();
