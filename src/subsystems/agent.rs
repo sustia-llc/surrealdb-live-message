@@ -31,14 +31,14 @@ impl Agent {
     pub async fn new(name: &str) -> Self {
         let db = sdb::connection().await.to_owned();
         let agent: Agent = db
-            .update((AGENT_TABLE, name))
+            .upsert((AGENT_TABLE, name))
             .content(Agent {
                 id: Thing::from((AGENT_TABLE, name)),
                 created: Datetime::default(),
             })
             .await
             .unwrap()
-            .unwrap();
+            .expect("Failed to create agent.");
         let mut registry = REGISTRY.lock().unwrap();
         registry.push(agent.clone());
 
@@ -52,7 +52,7 @@ impl Agent {
         let from = self.id.id.to_string();
         let query = format!("RELATE agent:{}->message->agent:{} CONTENT {{ created: time::now(), payload: {{{}}} }};", from, to, payload);
 
-        let _ = db.query(&query).await.unwrap();
+        let _ = db.query(&query).await.expect("RELATE failed.");
         Ok(())
     }
 
@@ -61,7 +61,7 @@ impl Agent {
 
         let name = &self.id.id.to_string();
         let query = format!("LIVE SELECT * FROM message where out = agent:{}", name);
-        let mut response = db.query(&query).await.unwrap();
+        let mut response = db.query(&query).await.expect("LIVE SELECT failed.");
         let mut message_stream = response.stream::<Notification<Message>>(0)?;
 
         loop {

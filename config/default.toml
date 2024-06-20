@@ -7,10 +7,12 @@ level = "info"
 platform = "linux/x86_64"
 
 [sdb]
-host = "localhost"
+host = "127.0.0.1"
 port = 8000
 image = "surrealdb/surrealdb"
-tag = "latest"
+tag = "v2.0.0-alpha.2"
 container_name = "sdb_container"
 namespace = "test"
 database = "test"
+username = "root"
+password = "root"

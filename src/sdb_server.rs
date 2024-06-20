@@ -26,10 +26,11 @@ pub(crate) async fn start_surrealdb_container() -> Result<(), Box<dyn std::error
         tracing::trace!("Pulling image: {:?}", pull_result?);
     }
 
+    let bind_address = format!("0.0.0.0:{}", SETTINGS.sdb.port);
     let cmd = vec![
-        "start", "--log", "trace", "--user", "root", "--pass", "root", "memory",
+        "start", "--log", "trace", "-u", &SETTINGS.sdb.username, "-p", &SETTINGS.sdb.password, "-b", bind_address.as_str(), "memory" 
     ];
-
+    
     let port_bindings = {
         let mut port_map = HashMap::new();
         port_map.insert(

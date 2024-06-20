@@ -25,6 +25,8 @@ pub struct Sdb {
     pub container_name: String,
     pub namespace: String,
     pub database: String,
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

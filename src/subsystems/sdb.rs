@@ -1,12 +1,13 @@
+use crate::sdb_server;
+use crate::settings::SETTINGS;
 use miette::Result;
 use std::{panic, str};
 use surrealdb::engine::remote::ws::{Client, Ws};
+use surrealdb::opt::auth::Root;
 use surrealdb::Surreal;
 use tokio::sync::OnceCell;
 use tokio::time::{sleep, Duration};
 use tokio_graceful_shutdown::SubsystemHandle;
-use crate::sdb_server;
-use crate::settings::SETTINGS;
 
 pub const SUBSYS_NAME: &str = "sdb";
 
@@ -30,6 +31,12 @@ async fn client() -> Surreal<Client> {
         .use_db(&SETTINGS.sdb.database)
         .await
         .unwrap();
+    let _ = db
+        .signin(Root {
+            username: &SETTINGS.sdb.username,
+            password: &SETTINGS.sdb.password,
+        })
+        .await;
     db
 }
 
