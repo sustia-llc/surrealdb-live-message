@@ -1,9 +1,8 @@
 use crate::subsystems::sdb;
 use futures::StreamExt;
 use miette::Result;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use surrealdb::opt::Resource;
 use surrealdb::sql::{Datetime, Thing};
 use surrealdb::Notification;
@@ -20,8 +19,8 @@ pub struct Agent {
     created: Datetime,
 }
 
-pub static REGISTRY: Lazy<Mutex<Vec<Agent>>> =
-    Lazy::new(|| Mutex::new(Vec::new()));
+pub static REGISTRY: LazyLock<Mutex<Vec<Agent>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 pub fn get_registry() -> &'static Mutex<Vec<Agent>> {
     &REGISTRY

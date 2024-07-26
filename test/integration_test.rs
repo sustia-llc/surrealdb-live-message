@@ -1,7 +1,6 @@
-use once_cell::sync::Lazy;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use surrealdb::engine::remote::ws::Client;
 use surrealdb::opt::Resource;
 use surrealdb::Surreal;
@@ -14,7 +13,7 @@ use surrealdb_live_message::subsystems::sdb;
 use tokio::time::{sleep, Duration};
 use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
 
-pub static READY_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
+pub static READY_FLAG: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
 fn is_ready() -> bool {
     READY_FLAG.load(Ordering::SeqCst)
