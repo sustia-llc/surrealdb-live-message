@@ -11,15 +11,13 @@ use tokio_graceful_shutdown::SubsystemHandle;
 
 pub const SUBSYS_NAME: &str = "sdb";
 
-static CONNECTION: OnceCell<Surreal<Client>> = OnceCell::const_new();
-
 pub async fn connection() -> &'static Surreal<Client> {
-    CONNECTION
-        .get_or_init(|| async {
-            tracing::debug!("Connecting to surrealdb");
-            client().await
-        })
-        .await
+    static CONNECTION: OnceCell<Surreal<Client>> = OnceCell::const_new();
+    
+    CONNECTION.get_or_init(|| async {
+        tracing::debug!("Initializing SurrealDB connection");
+        client().await
+    }).await
 }
 
 async fn client() -> Surreal<Client> {
