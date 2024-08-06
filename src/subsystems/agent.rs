@@ -19,8 +19,7 @@ pub struct Agent {
     created: Datetime,
 }
 
-pub static REGISTRY: LazyLock<Mutex<Vec<Agent>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+pub static REGISTRY: LazyLock<Mutex<Vec<Agent>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 pub fn get_registry() -> &'static Mutex<Vec<Agent>> {
     &REGISTRY
@@ -30,7 +29,7 @@ impl Agent {
     pub async fn new(name: &str) -> Self {
         let db = sdb::connection().await.to_owned();
         let agent: Agent = db
-            .upsert((AGENT_TABLE, name))
+            .create((AGENT_TABLE, name))
             .content(Agent {
                 id: Thing::from((AGENT_TABLE, name)),
                 created: Datetime::default(),
