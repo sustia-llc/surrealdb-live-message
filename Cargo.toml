@@ -18,9 +18,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio-graceful-shutdown = "0.15"
 config = "0.14"
-bollard = "0.16"
+bollard = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "gzip"] }
-
 
 [dev-dependencies]
 [target.'cfg(unix)'.dev-dependencies]
