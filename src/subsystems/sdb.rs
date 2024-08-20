@@ -1,4 +1,4 @@
-use crate::sdb_server;
+use crate::sdb_server::SurrealDBContainer;
 use crate::settings::SETTINGS;
 use miette::Result;
 use std::{panic, str};
@@ -43,13 +43,14 @@ pub async fn sdb_subsystem(subsys: SubsystemHandle) -> Result<()> {
         panic!("Production environment not implemented.");
     }
     tracing::debug!("{} subsystem starting.", SUBSYS_NAME);
-    sdb_server::start_surrealdb_container().await.unwrap();
+    let container = SurrealDBContainer::new().await.map_err(|e| miette::miette!(e.to_string()))?;
+    container.start().await.map_err(|e| miette::miette!(e.to_string()))?;
     tracing::debug!("{} started.", SUBSYS_NAME);
 
     subsys.on_shutdown_requested().await;
     tracing::debug!("Shutting down {} subsystem ...", SUBSYS_NAME);
     sleep(Duration::from_secs(2)).await;
-    sdb_server::stop_surrealdb_container().await.unwrap();
+    container.stop().await.map_err(|e| miette::miette!(e.to_string()))?;
     tracing::debug!("{} stopped.", SUBSYS_NAME);
     Ok(())
 }
