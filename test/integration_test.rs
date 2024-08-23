@@ -7,7 +7,7 @@ use surrealdb::Surreal;
 use surrealdb_live_message::logger;
 use surrealdb_live_message::message::{Message, Payload, TextPayload, MESSAGE_TABLE};
 use surrealdb_live_message::sdb_server;
-use surrealdb_live_message::subsystems::agent::get_registry;
+use surrealdb_live_message::subsystems::agent::{get_registry, AGENT_TABLE};
 use surrealdb_live_message::subsystems::agents;
 use surrealdb_live_message::subsystems::sdb;
 use tokio::time::{sleep, Duration};
@@ -28,6 +28,7 @@ const AGENT_ALICE: &str = "alice";
 
 async fn clear_db(db: &Surreal<Client>) {
     db.delete(Resource::from(MESSAGE_TABLE)).await.unwrap();
+    db.delete(Resource::from(AGENT_TABLE)).await.unwrap();
 }
 
 #[tokio::test]
