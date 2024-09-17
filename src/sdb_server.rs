@@ -1,5 +1,5 @@
 use crate::settings::SETTINGS;
-use bollard::container::{CreateContainerOptions, RemoveContainerOptions, StartContainerOptions};
+use bollard::container::{Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions};
 use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
 use bollard::service::PortBinding;
@@ -70,7 +70,7 @@ impl SurrealDBContainer {
             platform: Some(SETTINGS.docker.platform.as_str()),
         };
 
-        let config = bollard::container::Config {
+        let config = Config {
             image: Some(format!("{}:{}", SETTINGS.sdb.image, SETTINGS.sdb.tag)),
             cmd: Some(cmd.iter().map(|&s| s.to_string()).collect()),
             exposed_ports: Some(
