@@ -18,8 +18,6 @@ cargo run
 ```
 ## Terminal 2
 ```sh
-# upgrade to current alpha release
-sudo surreal upgrade --version 2.0.0-alpha.10
 # start surrealdb client
 surreal sql --user root --pass root --namespace test --database test
 # message from bob to alice
