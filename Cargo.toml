@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1.40.0", features = ["full", "macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
-surrealdb = { version = "2.0.0", features = ["kv-mem"] }
+surrealdb = { version = "2.0.1", features = ["kv-mem"] }
 # surrealdb = { git = "https://github.com/surrealdb/surrealdb", tag = "v2.0.0-beta.2", features = ["kv-mem"] }
 futures = "0.3.3"
 serde = { version = "1", features = ["derive"] }
