@@ -6,9 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1.41.0", features = ["full", "macros", "rt-multi-thread"] }
+tokio = { version = "1.41.1", features = ["full", "macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
-surrealdb = { version = "2.0.4", features = ["kv-mem"] }
+surrealdb = { version = "2.1.0", features = ["kv-mem"] }
 # surrealdb = { git = "https://github.com/surrealdb/surrealdb", tag = "v2.0.0-beta.2", features = ["kv-mem"] }
 futures = "0.3.3"
 serde = { version = "1", features = ["derive"] }
@@ -18,7 +18,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio-graceful-shutdown = "0.15"
 config = "0.14"
-bollard = "0.17"
+bollard = "0.18"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "gzip"] }
 
 [dev-dependencies]
