@@ -6,7 +6,6 @@ use surrealdb::opt::Resource;
 use surrealdb::Surreal;
 use surrealdb_live_message::logger;
 use surrealdb_live_message::message::{Message, Payload, TextPayload, MESSAGE_TABLE};
-use surrealdb_live_message::sdb_server;
 use surrealdb_live_message::subsystems::agent::{get_registry, AGENT_TABLE};
 use surrealdb_live_message::subsystems::agents;
 use surrealdb_live_message::subsystems::sdb;
@@ -104,11 +103,15 @@ async fn test_agent_messaging() {
         async {
             let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
             let result = Toplevel::new(move |s| async move {
-                s.start(SubsystemBuilder::new(sdb::SUBSYS_NAME, sdb::sdb_subsystem));
-                sdb_server::surrealdb_ready().await.unwrap();
-                s.start(SubsystemBuilder::new(agents::SUBSYS_NAME, move |s| {
-                    agents::agents_subsystem(s, names)
-                }));
+                s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
+                
+                // Wait for database to be ready
+                let mut rx = sdb::get_ready_receiver();
+                while !*rx.borrow_and_update() {
+                    let _ = rx.changed().await;
+                }
+                
+                s.start(SubsystemBuilder::new("agents", move |s| agents::agents_subsystem(s, names)));
                 set_ready();
             })
             .catch_signals()

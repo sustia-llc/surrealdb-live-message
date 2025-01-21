@@ -7,9 +7,10 @@ use bollard::Docker;
 use miette::Result;
 use std::collections::HashMap;
 use std::default::Default;
-use std::{panic, str};
-use tokio::time::{self, Duration};
+use tokio::time::Duration;
 use tokio_stream::StreamExt;
+use tokio::sync::oneshot;
+
 pub struct SurrealDBContainer {
     docker: Docker,
 }
@@ -20,10 +21,57 @@ impl SurrealDBContainer {
         Ok(Self { docker })
     }
 
-    pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start_and_wait(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.pull_image().await?;
         self.create_and_start_container().await?;
-        Ok(())
+        
+        let (tx, rx) = oneshot::channel();
+        let url = format!("http://{}:{}/health", SETTINGS.sdb.host, SETTINGS.sdb.port);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()?;
+
+        tokio::spawn(async move {
+            let mut attempts = 25;
+            while attempts > 0 {
+                match client.get(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::debug!("SurrealDB health check succeeded");
+                        let _ = tx.send(());
+                        return;
+                    }
+                    Ok(resp) => {
+                        tracing::debug!("Health check returned status: {}", resp.status());
+                        attempts -= 1;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Health check failed: {}", e);
+                        attempts -= 1;
+                    }
+                }
+                if attempts > 0 {
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                }
+            }
+            // Ensure the channel is closed if we run out of attempts
+            drop(tx);
+        });
+
+        // Wait for ready signal or timeout
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(())) => {
+                tracing::info!("SurrealDB is ready and accepting connections");
+                Ok(())
+            }
+            Ok(Err(_)) => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "health check failed after all attempts"
+            ))),
+            Err(_) => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timeout waiting for surrealdb to start"
+            ))),
+        }
     }
 
     async fn pull_image(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -132,24 +180,4 @@ impl Drop for SurrealDBContainer {
             }
         });
     }
-}
-
-pub async fn surrealdb_ready() -> Result<(), Box<dyn std::error::Error>> {
-    let url = &format!("http://{}:{}/health", SETTINGS.sdb.host, SETTINGS.sdb.port);
-
-    let mut attempts = 25;
-
-    while attempts > 0 {
-        if let Err(_e) = reqwest::Client::default().get(url).send().await {
-            tracing::debug!("attempt {:?} failed", 26 - attempts);
-        } else {
-            tracing::debug!("surrealdb ready after {:?} attempts", 26 - attempts);
-            return Ok(());
-        }
-
-        attempts -= 1;
-        time::sleep(Duration::from_millis(200)).await;
-    }
-
-    panic!("timeout waiting for surrealdb");
 }
