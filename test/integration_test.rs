@@ -1,6 +1,5 @@
 use std::env;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::OnceLock;
 use surrealdb::engine::remote::ws::Client;
 use surrealdb::opt::Resource;
 use surrealdb::Surreal;
@@ -11,15 +10,15 @@ use surrealdb_live_message::subsystems::agents;
 use surrealdb_live_message::subsystems::sdb;
 use tokio::time::{sleep, Duration};
 use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
+use tokio::sync::watch;
 
-pub static READY_FLAG: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+static SETUP_READY: OnceLock<watch::Sender<bool>> = OnceLock::new();
 
-fn is_ready() -> bool {
-    READY_FLAG.load(Ordering::SeqCst)
-}
-
-fn set_ready() {
-    READY_FLAG.store(true, Ordering::SeqCst);
+fn get_ready_receiver() -> watch::Receiver<bool> {
+    SETUP_READY.get_or_init(|| {
+        let (tx, _) = watch::channel(false);
+        tx
+    }).subscribe()
 }
 
 const AGENT_BOB: &str = "bob";
@@ -40,8 +39,15 @@ async fn test_agent_messaging() {
 
     tokio::join!(
         async {
-            while !is_ready() {
-                sleep(Duration::from_millis(100)).await;
+            let mut rx = get_ready_receiver();
+            let timeout = tokio::time::sleep(Duration::from_secs(30));
+            tokio::select! {
+                _ = async {
+                    while !*rx.borrow_and_update() {
+                        let _ = rx.changed().await;
+                    }
+                } => {},
+                _ = timeout => panic!("Timeout waiting for setup"),
             }
 
             let db = sdb::connection().await.to_owned();
@@ -107,12 +113,21 @@ async fn test_agent_messaging() {
                 
                 // Wait for database to be ready
                 let mut rx = sdb::get_ready_receiver();
-                while !*rx.borrow_and_update() {
-                    let _ = rx.changed().await;
+                let timeout = tokio::time::sleep(Duration::from_secs(30));
+                tokio::select! {
+                    _ = async {
+                        while !*rx.borrow_and_update() {
+                            let _ = rx.changed().await;
+                        }
+                    } => {},
+                    _ = timeout => panic!("Timeout waiting for database to be ready"),
                 }
-                
+
                 s.start(SubsystemBuilder::new("agents", move |s| agents::agents_subsystem(s, names)));
-                set_ready();
+                SETUP_READY.get_or_init(|| {
+                    let (tx, _) = watch::channel(true);
+                    tx
+                }).send(true).unwrap();
             })
             .catch_signals()
             .handle_shutdown_requests(Duration::from_secs(4))
