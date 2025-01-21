@@ -1,7 +1,6 @@
 use crate::sdb_server::SurrealDBContainer;
 use crate::settings::SETTINGS;
 use miette::Result;
-use std::{panic, str};
 use surrealdb::engine::remote::ws::{Client, Ws};
 use surrealdb::opt::auth::Root;
 use surrealdb::Surreal;
@@ -10,8 +9,6 @@ use tokio::time::{sleep, Duration};
 use tokio_graceful_shutdown::SubsystemHandle;
 use tokio::sync::watch;
 use std::sync::OnceLock;
-
-pub const SUBSYS_NAME: &str = "sdb";
 
 static DB_READY: OnceLock<watch::Sender<bool>> = OnceLock::new();
 
@@ -53,7 +50,7 @@ pub async fn sdb_subsystem(subsys: SubsystemHandle) -> Result<()> {
     if SETTINGS.environment == "production" {
         panic!("Production environment not implemented.");
     }
-    tracing::debug!("{} subsystem starting.", SUBSYS_NAME);
+    tracing::debug!("{} subsystem starting.", subsys.name());
     let container = SurrealDBContainer::new().await.map_err(|e| miette::miette!(e.to_string()))?;
     container.start_and_wait().await.map_err(|e| miette::miette!(e.to_string()))?;
     
@@ -62,12 +59,12 @@ pub async fn sdb_subsystem(subsys: SubsystemHandle) -> Result<()> {
         let _ = tx.send(true);
     }
     
-    tracing::info!("{} ready and accepting connections.", SUBSYS_NAME);
+    tracing::info!("{} ready and accepting connections.", subsys.name());
 
     subsys.on_shutdown_requested().await;
-    tracing::debug!("Shutting down {} subsystem ...", SUBSYS_NAME);
+    tracing::debug!("Shutting down {} subsystem ...", subsys.name());
     sleep(Duration::from_secs(2)).await;
     container.stop().await.map_err(|e| miette::miette!(e.to_string()))?;
-    tracing::debug!("{} stopped.", SUBSYS_NAME);
+    tracing::debug!("{} stopped.", subsys.name());
     Ok(())
 }
