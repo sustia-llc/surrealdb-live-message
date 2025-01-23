@@ -21,13 +21,15 @@ pub struct Agent {
 
 pub static REGISTRY: LazyLock<Mutex<Vec<Agent>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
+
 pub fn get_registry() -> &'static Mutex<Vec<Agent>> {
     &REGISTRY
 }
 
 impl Agent {
+
     pub async fn new(name: &str) -> Self {
-        let db = sdb::connection().await.to_owned();
+        let db = sdb::SurrealDBWrapper::connection().await.to_owned();
         let agent: Agent = db
             .create((AGENT_TABLE, name))
             .content(Agent {
@@ -44,7 +46,7 @@ impl Agent {
     }
 
     pub async fn send(&self, to: &str, payload: Payload) -> surrealdb::Result<()> {
-        let db = sdb::connection().await.to_owned();
+        let db = sdb::SurrealDBWrapper::connection().await.to_owned();
 
         let payload = serde_json::to_string(&payload).unwrap();
         let from = self.id.id.to_string();
@@ -55,7 +57,7 @@ impl Agent {
     }
 
     pub async fn listen(&self, shutdown_signal: SubsystemHandle) -> surrealdb::Result<()> {
-        let db = sdb::connection().await.to_owned();
+        let db = sdb::SurrealDBWrapper::connection().await.to_owned();
 
         let name = &self.id.id.to_string();
         let query = format!("LIVE SELECT * FROM message where out = agent:{}", name);
@@ -90,7 +92,7 @@ impl Agent {
                     }
                 }
                 _ = shutdown_signal.on_shutdown_requested() => {
-                    tracing::info!("Shutdown signal received, terminating listen function.");
+                    tracing::info!("Shutdown signal received, terminating listen function for agent {}", name);
                     drop(message_stream);
                     drop(response);
                     db.delete(Resource::from((MESSAGE_TABLE, name))).await.expect("agent message delete failed");
@@ -119,6 +121,7 @@ pub async fn agent_subsystem(name: Arc<String>, subsys: SubsystemHandle) -> Resu
     );
 
     subsys.on_shutdown_requested().await;
+
     listen_subsys.initiate_shutdown();
     let _ = listen_subsys.join().await;
 

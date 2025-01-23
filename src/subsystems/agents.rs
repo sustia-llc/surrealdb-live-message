@@ -6,10 +6,12 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tokio_graceful_shutdown::{NestedSubsystem, SubsystemBuilder, SubsystemHandle};
 
+
 pub async fn agents_subsystem(subsys: SubsystemHandle, agent_names: Vec<String>) -> Result<()> {
     tracing::info!("{} starting.", subsys.name());
     tracing::info!("Starting detached agent subsystems ...");
     let mut agent_subsystems: Vec<NestedSubsystem<Box<dyn Error + Sync + Send>>> = Vec::new();
+
     for name in agent_names {
         let agent_subsystem = subsys.start(
             SubsystemBuilder::new(name.clone(), move |s| agent_subsystem(Arc::new(name), s))

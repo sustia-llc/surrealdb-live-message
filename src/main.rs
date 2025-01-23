@@ -4,7 +4,6 @@ use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
 
 use surrealdb_live_message::logger;
 use surrealdb_live_message::subsystems::{agents, sdb};
-
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
 
@@ -18,7 +17,7 @@ async fn main() -> Result<()> {
         s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
         
         // Wait for database to be ready
-        let mut rx = sdb::get_ready_receiver();
+        let mut rx = sdb::SurrealDBWrapper::get_ready_receiver();
         let timeout = tokio::time::sleep(Duration::from_secs(30));
         tokio::select! {
             _ = async {
