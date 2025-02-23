@@ -82,7 +82,7 @@ async fn test_agent_messaging() {
             let bob_messages: Vec<Message> = response.take(0).unwrap();
             assert_eq!(bob_messages.len(), 1);
 
-            clear_db(&db).await;
+            // clear_db(&db).await;
 
             tracing::debug!("sending SIGINT to itself.");
             signal::kill(Pid::this(), Signal::SIGINT).unwrap();
