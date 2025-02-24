@@ -8,6 +8,24 @@
 ```sh
 # run the integration test
 cargo test --test integration_test
+
+# or run in production mode with your surrealdb cloud endpoint:
+# config/production.toml:
+cat << EOF > config/production.toml
+environment = "production"
+
+[logger]
+level = "info"
+
+[sdb]
+username = "test"
+password = "test"
+namespace = "test"
+database = "test"
+endpoint = "wss://<your surrealdb cloud endpoint>"
+EOF
+
+RUN_MODE=production cargo test --test integration_test
 ```
 ## Run
 ## Terminal 1

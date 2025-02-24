@@ -20,12 +20,12 @@ async fn main() -> Result<()> {
         let mut rx = sdb::SurrealDBWrapper::get_ready_receiver();
         let timeout = tokio::time::sleep(Duration::from_secs(30));
         tokio::select! {
+            _ = timeout => panic!("Timeout waiting for database to be ready"),
             _ = async {
                 while !*rx.borrow_and_update() {
                     let _ = rx.changed().await;
                 }
             } => {},
-            _ = timeout => panic!("Timeout waiting for database to be ready"),
         }
         
         s.start(SubsystemBuilder::new("agents", move |s| agents::agents_subsystem(s, names)));

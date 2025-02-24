@@ -2,7 +2,7 @@ use crate::sdb_server::SurrealDBContainer;
 use crate::settings::SETTINGS;
 use miette::Result;
 use std::sync::OnceLock;
-use surrealdb::engine::remote::ws::{Client, Ws};
+use surrealdb::engine::any;
 use surrealdb::opt::auth::Root;
 use surrealdb::Surreal;
 use tokio::sync::watch;
@@ -30,8 +30,8 @@ impl SurrealDBWrapper {
         }
     }
 
-    pub async fn connection() -> &'static Surreal<Client> {
-        static CONNECTION: OnceCell<Surreal<Client>> = OnceCell::const_new();
+    pub async fn connection() -> &'static Surreal<any::Any> {
+        static CONNECTION: OnceCell<Surreal<any::Any>> = OnceCell::const_new();
 
         CONNECTION
             .get_or_init(|| async {
@@ -41,37 +41,44 @@ impl SurrealDBWrapper {
             .await
     }
 
-    async fn client() -> Surreal<Client> {
-        let db = Surreal::new::<Ws>(format!("{}:{}", SETTINGS.sdb.host, SETTINGS.sdb.port))
+    async fn client() -> Surreal<any::Any> {
+        let db = any::connect(&SETTINGS.sdb.endpoint)
             .await
-            .unwrap();
+            .expect("Failed to connect to SurrealDB via WebSocket");
 
         db.use_ns(&SETTINGS.sdb.namespace)
             .use_db(&SETTINGS.sdb.database)
             .await
-            .unwrap();
+            .expect("Failed to select namespace and database");
+
         let _ = db
             .signin(Root {
                 username: &SETTINGS.sdb.username,
                 password: &SETTINGS.sdb.password,
             })
-            .await;
+            .await
+            .expect("Failed to authenticate with SurrealDB");
         db
     }
 }
 
 pub async fn sdb_subsystem(subsys: SubsystemHandle) -> Result<()> {
-    if SETTINGS.environment == "production" {
-        panic!("Production environment not implemented.");
-    }
     tracing::info!("{} subsystem starting.", subsys.name());
-    let container = SurrealDBContainer::new()
-        .await
-        .map_err(|e| miette::miette!(e.to_string()))?;
-    container
-        .start_and_wait()
-        .await
-        .map_err(|e| miette::miette!(e.to_string()))?;
+    let container = if SETTINGS.environment == "production" {
+        tracing::info!("{} using cloud connection.", subsys.name());
+        let _db = SurrealDBWrapper::connection().await.to_owned();
+        None
+    } else {
+        tracing::info!("{} using local container.", subsys.name());
+        let container = SurrealDBContainer::new()
+            .await
+            .map_err(|e| miette::miette!(e.to_string()))?;
+        container
+            .start_and_wait()
+            .await
+            .map_err(|e| miette::miette!(e.to_string()))?;
+        Some(container)
+    };
 
     // Signal database is ready
     SurrealDBWrapper::set_ready(true);
@@ -81,10 +88,12 @@ pub async fn sdb_subsystem(subsys: SubsystemHandle) -> Result<()> {
     subsys.on_shutdown_requested().await;
     tracing::info!("Shutting down {} subsystem ...", subsys.name());
     sleep(Duration::from_secs(2)).await;
-    container
-        .stop()
-        .await
-        .map_err(|e| miette::miette!(e.to_string()))?;
+    if let Some(container) = container {
+        container
+            .stop()
+            .await
+            .map_err(|e| miette::miette!(e.to_string()))?;
+    }
     tracing::info!("{} stopped.", subsys.name());
     Ok(())
 }

@@ -1,5 +1,4 @@
-use std::env;
-use surrealdb::engine::remote::ws::Client;
+use surrealdb::engine::any;
 use surrealdb::opt::Resource;
 use surrealdb::Surreal;
 use surrealdb_live_message::logger;
@@ -13,7 +12,7 @@ use surrealdb_live_message::event::Event;
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
 
-async fn clear_db(db: &Surreal<Client>) {
+async fn clear_db(db: &Surreal<any::Any>) {
     db.delete(Resource::from(MESSAGE_TABLE)).await.unwrap();
     db.delete(Resource::from(AGENT_TABLE)).await.unwrap();
 }
@@ -23,7 +22,6 @@ async fn test_agent_messaging() {
     use nix::sys::signal::{self, Signal};
     use nix::unistd::Pid;
 
-    env::set_var("RUN_MODE", "test");
     logger::setup();
     let (setup_ready, set_setup_ready) = Event::create();
 
@@ -94,24 +92,25 @@ async fn test_agent_messaging() {
                 s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
 
                 // Wait for database to be ready
-                let timeout = tokio::time::sleep(Duration::from_secs(30));
                 let mut rx = sdb::SurrealDBWrapper::get_ready_receiver();
                 tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => panic!("Timeout waiting for database to be ready"),
                     _ = async {
                         while !*rx.borrow_and_update() {
                             let _ = rx.changed().await;
                         }
                     } => {},
-                    _ = timeout => panic!("Timeout waiting for database to be ready"),
                 }
                 s.start(SubsystemBuilder::new("agents", move |s| agents::agents_subsystem(s, names)));
-                //check the len of the registry
+
                 let registry = get_registry();
                 let timeout = tokio::time::sleep(Duration::from_secs(10));
                 tokio::select! {
                     _ = timeout => panic!("Timeout waiting for agents to initialize"),
                     _ = async {
+                        let mut interval = tokio::time::interval(Duration::from_millis(100));
                         loop {
+                            interval.tick().await;
                             let count = {
                                 let agents = registry.lock().unwrap();
                                 agents.len()
@@ -121,9 +120,10 @@ async fn test_agent_messaging() {
                                 set_setup_ready();
                                 break;
                             }
-                            sleep(Duration::from_millis(100)).await;
                         }
-                    } => {}
+                    } => {
+                        assert_eq!(registry.lock().unwrap().len(), agent_count);
+                    }
                 }
             })
             .catch_signals()
