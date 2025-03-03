@@ -91,9 +91,7 @@ impl SurrealDBContainer {
 
     async fn create_and_start_container(&self) -> Result<(), Box<dyn std::error::Error>> {
         let bind_address = format!("0.0.0.0:{}", SETTINGS.sdb.port);
-        let cmd = vec![
-            "start", "--log", "trace", "-u", &SETTINGS.sdb.username, "-p", &SETTINGS.sdb.password, "-b", bind_address.as_str(), "memory"
-        ];
+        let cmd = ["start", "--log", "trace", "-u", &SETTINGS.sdb.username, "-p", &SETTINGS.sdb.password, "-b", bind_address.as_str(), "memory"];
         
         let port_bindings = {
             let mut port_map = HashMap::new();
