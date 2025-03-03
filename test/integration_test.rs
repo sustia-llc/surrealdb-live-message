@@ -87,8 +87,8 @@ async fn test_agent_messaging() {
         },
         async {
             let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
-            let agent_count = names.len();
-            let result = Toplevel::new(move |s| async move {
+            let result = Toplevel::new(async move |s| {
+                let agent_count = names.len();
                 s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
 
                 // Wait for database to be ready

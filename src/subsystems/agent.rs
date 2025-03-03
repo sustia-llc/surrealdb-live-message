@@ -21,13 +21,11 @@ pub struct Agent {
 
 pub static REGISTRY: LazyLock<Mutex<Vec<Agent>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-
 pub fn get_registry() -> &'static Mutex<Vec<Agent>> {
     &REGISTRY
 }
 
 impl Agent {
-
     pub async fn new(name: &str) -> Self {
         let db = sdb::SurrealDBWrapper::connection().await.to_owned();
         let agent: Agent = db
@@ -110,7 +108,7 @@ pub async fn agent_subsystem(name: Arc<String>, subsys: SubsystemHandle) -> Resu
     let agent = Agent::new(name.as_str()).await;
 
     let listen_subsys = subsys.start(
-        SubsystemBuilder::new(format!("{}-listen", name), |subsys| async move {
+        SubsystemBuilder::new(format!("{}-listen", name), async move |subsys| {
             agent
                 .listen(subsys)
                 .await

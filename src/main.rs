@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
 
     // Setup and execute subsystem tree
     let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
-    Toplevel::new(move |s| async move {
+    Toplevel::new(async |s| {
         s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
         
         // Wait for database to be ready

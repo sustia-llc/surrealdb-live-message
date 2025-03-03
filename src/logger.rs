@@ -1,13 +1,17 @@
 use crate::settings::SETTINGS;
-use std::env;
+use std::str::FromStr;
+use tracing::Level;
 
 pub fn setup() {
-    if env::var_os("RUST_LOG").is_none() {
-        let level = SETTINGS.logger.level.as_str();
-        let env = format!("{level}");
+    let level = match Level::from_str(SETTINGS.logger.level.as_str()) {
+        Ok(level) => level,
+        Err(_) => {
+            eprintln!("Invalid log level: {}, defaulting to INFO", SETTINGS.logger.level);
+            Level::INFO
+        }
+    };
 
-        env::set_var("RUST_LOG", env);
-    }
-
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .init();
 }
