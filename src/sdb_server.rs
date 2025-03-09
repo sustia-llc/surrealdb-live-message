@@ -7,7 +7,7 @@ use bollard::Docker;
 use miette::Result;
 use std::collections::HashMap;
 use std::default::Default;
-use tokio::time::Duration;
+use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 use tokio::sync::oneshot;
 
@@ -50,7 +50,7 @@ impl SurrealDBContainer {
                     }
                 }
                 if attempts > 0 {
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    sleep(Duration::from_millis(1000)).await;
                 }
             }
             // Ensure the channel is closed if we run out of attempts
