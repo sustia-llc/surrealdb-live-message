@@ -25,12 +25,10 @@ async fn test_agent_messaging() {
     logger::setup();
     let (setup_ready, set_setup_ready) = Event::create();
 
-
     tokio::join!(
         async {
             setup_ready.wait().await;
             let db = sdb::SurrealDBWrapper::connection().await.to_owned();
-            clear_db(&db).await;
 
             let registry = get_registry();
             let agents = registry.lock().unwrap();
@@ -80,8 +78,6 @@ async fn test_agent_messaging() {
             let bob_messages: Vec<Message> = response.take(0).unwrap();
             assert_eq!(bob_messages.len(), 1);
 
-            // clear_db(&db).await;
-
             tracing::debug!("sending SIGINT to itself.");
             signal::kill(Pid::this(), Signal::SIGINT).unwrap();
         },
@@ -93,6 +89,7 @@ async fn test_agent_messaging() {
 
                 // Wait for database to be ready
                 let mut rx = sdb::SurrealDBWrapper::get_ready_receiver();
+
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(30)) => panic!("Timeout waiting for database to be ready"),
                     _ = async {
@@ -101,6 +98,9 @@ async fn test_agent_messaging() {
                         }
                     } => {},
                 }
+
+                let db = sdb::SurrealDBWrapper::connection().await.to_owned();
+                clear_db(&db).await;
                 s.start(SubsystemBuilder::new("agents", move |s| agents::agents_subsystem(s, names)));
 
                 let registry = get_registry();
