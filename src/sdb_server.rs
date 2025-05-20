@@ -1,15 +1,17 @@
 use crate::settings::SETTINGS;
-use bollard::container::{Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions};
-use bollard::image::CreateImageOptions;
-use bollard::models::HostConfig;
-use bollard::service::PortBinding;
 use bollard::Docker;
+use bollard::models::ContainerCreateBody;
+use bollard::models::HostConfig;
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, StartContainerOptionsBuilder,
+};
+use bollard::service::PortBinding;
 use miette::Result;
 use std::collections::HashMap;
 use std::default::Default;
-use tokio::time::{sleep, Duration};
-use tokio_stream::StreamExt;
 use tokio::sync::oneshot;
+use tokio::time::{Duration, sleep};
+use tokio_stream::StreamExt;
 
 pub struct SurrealDBContainer {
     docker: Docker,
@@ -24,7 +26,7 @@ impl SurrealDBContainer {
     pub async fn start_and_wait(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.pull_image().await?;
         self.create_and_start_container().await?;
-        
+
         let (tx, rx) = oneshot::channel();
         let url = format!("http://{}:{}/health", SETTINGS.sdb.host, SETTINGS.sdb.port);
         let client = reqwest::Client::builder()
@@ -65,34 +67,45 @@ impl SurrealDBContainer {
             }
             Ok(Err(_)) => Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "health check failed after all attempts"
+                "health check failed after all attempts",
             ))),
             Err(_) => Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "timeout waiting for surrealdb to start"
+                "timeout waiting for surrealdb to start",
             ))),
         }
     }
 
-    async fn pull_image(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let create_image_options: CreateImageOptions<'_, &str> = CreateImageOptions {
-            from_image: SETTINGS.sdb.image.as_str(),
-            tag: SETTINGS.sdb.tag.as_str(),
-            platform: SETTINGS.docker.platform.as_str(),
-            ..Default::default()
-        };
-
-        let mut stream = self.docker.create_image(Some(create_image_options), None, None);
+    async fn pull_image(&self) -> Result<()> {
+        let create_image_options = CreateImageOptionsBuilder::default()
+            .from_image(&SETTINGS.sdb.image)
+            .tag(&SETTINGS.sdb.tag)
+            .platform(&SETTINGS.docker.platform)
+            .build();
+        let mut stream = self
+            .docker
+            .create_image(Some(create_image_options), None, None);
         while let Some(pull_result) = stream.next().await {
-            tracing::trace!("Pulling image: {:?}", pull_result?);
+            tracing::trace!("Pulling image: {:?}", pull_result);
         }
         Ok(())
     }
 
     async fn create_and_start_container(&self) -> Result<(), Box<dyn std::error::Error>> {
         let bind_address = format!("0.0.0.0:{}", SETTINGS.sdb.port);
-        let cmd = ["start", "--log", "trace", "-u", &SETTINGS.sdb.username, "-p", &SETTINGS.sdb.password, "-b", bind_address.as_str(), "memory"];
-        
+        let cmd: Vec<String> = vec![
+            "start".to_string(),
+            "--log".to_string(),
+            "trace".to_string(),
+            "-u".to_string(),
+            SETTINGS.sdb.username.to_string(),
+            "-p".to_string(),
+            SETTINGS.sdb.password.to_string(),
+            "-b".to_string(),
+            bind_address,
+            "memory".to_string(),
+        ];
+
         let port_bindings = {
             let mut port_map = HashMap::new();
             port_map.insert(
@@ -111,14 +124,9 @@ impl SurrealDBContainer {
             ..Default::default()
         };
 
-        let create_container_options = CreateContainerOptions {
-            name: SETTINGS.sdb.container_name.as_str(),
-            platform: Some(SETTINGS.docker.platform.as_str()),
-        };
-
-        let config = Config {
+        let container_body = ContainerCreateBody {
             image: Some(format!("{}:{}", SETTINGS.sdb.image, SETTINGS.sdb.tag)),
-            cmd: Some(cmd.iter().map(|&s| s.to_string()).collect()),
+            cmd: Some(cmd),
             exposed_ports: Some(
                 vec![(format!("{}/tcp", SETTINGS.sdb.port), HashMap::new())]
                     .into_iter()
@@ -128,25 +136,28 @@ impl SurrealDBContainer {
             ..Default::default()
         };
 
-        self.docker
-            .create_container(Some(create_container_options), config)
+        let create_container_options = CreateContainerOptionsBuilder::default()
+            .name(&SETTINGS.sdb.container_name)
+            .platform(&SETTINGS.docker.platform)
+            .build();
+        let container = self
+            .docker
+            .create_container(Some(create_container_options), container_body)
             .await?;
-
-        let start_container_options = StartContainerOptions::<String> {
-            ..Default::default()
-        };
+        let start_container_options = StartContainerOptionsBuilder::default().build();
         self.docker
-            .start_container(
-                SETTINGS.sdb.container_name.as_str(),
-                Some(start_container_options),
-            )
+            .start_container(&container.id, Some(start_container_options))
             .await?;
         Ok(())
     }
 
     pub async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
-        match self.docker
-            .stop_container(SETTINGS.sdb.container_name.as_str(), None)
+        match self
+            .docker
+            .stop_container(
+                SETTINGS.sdb.container_name.as_str(),
+                Some(bollard::query_parameters::StopContainerOptionsBuilder::default().build()),
+            )
             .await
         {
             Ok(result) => {
@@ -157,25 +168,5 @@ impl SurrealDBContainer {
             }
         }
         Ok(())
-    }
-}
-
-impl Drop for SurrealDBContainer {
-    fn drop(&mut self) {
-        let docker = self.docker.clone();
-        tokio::spawn(async move {
-            if let Err(e) = docker
-                .remove_container(
-                    SETTINGS.sdb.container_name.as_str(),
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-            {
-                tracing::warn!("Failed to remove container: {:?}", e);
-            }
-        });
     }
 }
