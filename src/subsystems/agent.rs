@@ -3,13 +3,13 @@ use futures::StreamExt;
 use miette::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, LazyLock, Mutex};
+use surrealdb::Notification;
 use surrealdb::opt::Resource;
 use surrealdb::sql::{Datetime, Thing};
-use surrealdb::Notification;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 
-use crate::message::{Message, Payload, MESSAGE_TABLE};
+use crate::message::{MESSAGE_TABLE, Message, Payload};
 
 pub const AGENT_TABLE: &str = "agent";
 
@@ -48,7 +48,10 @@ impl Agent {
 
         let payload = serde_json::to_string(&payload).unwrap();
         let from = self.id.id.to_string();
-        let query = format!("RELATE agent:{}->message->agent:{} CONTENT {{ created: time::now(), payload: {{{}}} }};", from, to, payload);
+        let query = format!(
+            "RELATE agent:{}->message->agent:{} CONTENT {{ created: time::now(), payload: {{{}}} }};",
+            from, to, payload
+        );
 
         let _ = db.query(&query).await.expect("RELATE failed.");
         Ok(())
@@ -76,7 +79,7 @@ impl Agent {
 
                             match &message.payload {
                                 Payload::Text(text_payload) => {
-                                    tracing::info!("{:?}: Text message: {}", action, text_payload.content);
+                                    tracing::info!("{} received text message: {}", name, text_payload.content);
                                 },
                                 Payload::Image(image_payload) => {
                                     tracing::info!("Image message: {}, caption: {:?}", image_payload.url, image_payload.caption);

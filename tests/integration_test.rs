@@ -1,13 +1,13 @@
+use surrealdb::Surreal;
 use surrealdb::engine::any;
 use surrealdb::opt::Resource;
-use surrealdb::Surreal;
-use surrealdb_live_message::logger;
-use surrealdb_live_message::message::{Message, Payload, TextPayload, MESSAGE_TABLE};
-use surrealdb_live_message::subsystems::agent::{get_registry, AGENT_TABLE};
-use surrealdb_live_message::subsystems::{agents, sdb};
-use tokio::time::{sleep, Duration};
-use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
 use surrealdb_live_message::event::Event;
+use surrealdb_live_message::logger;
+use surrealdb_live_message::message::{MESSAGE_TABLE, Message, Payload, TextPayload};
+use surrealdb_live_message::subsystems::agent::{AGENT_TABLE, get_registry};
+use surrealdb_live_message::subsystems::{agents, sdb};
+use tokio::time::{Duration, sleep};
+use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
 
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
@@ -83,7 +83,7 @@ async fn test_agent_messaging() {
         },
         async {
             let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
-            let result = Toplevel::new(async move |s| {
+            let result = Toplevel::new(async |s| {
                 let agent_count = names.len();
                 s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
 
