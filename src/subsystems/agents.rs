@@ -1,21 +1,38 @@
-use crate::subsystems::agent::agent_subsystem;
+use crate::subsystems::agent::AgentSubsystem;
 use miette::Result;
-use std::error::Error;
 
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
-use tokio_graceful_shutdown::{NestedSubsystem, SubsystemBuilder, SubsystemHandle};
+use tokio::time::{Duration, sleep};
+use tokio_graceful_shutdown::{IntoSubsystem, NestedSubsystem, SubsystemBuilder, SubsystemHandle};
 
+pub struct AgentsSubsystem {
+    pub names: Vec<String>,
+}
 
-pub async fn agents_subsystem(subsys: SubsystemHandle, agent_names: Vec<String>) -> Result<()> {
+impl IntoSubsystem<miette::Report, miette::Report> for AgentsSubsystem {
+    async fn run(self, subsys: &mut SubsystemHandle<miette::Report>) -> Result<()> {
+        self::agents_subsystem(subsys, self.names).await
+    }
+}
+
+pub async fn agents_subsystem(
+    subsys: &mut SubsystemHandle<miette::Report>,
+    agent_names: Vec<String>,
+) -> Result<()> {
     tracing::info!("{} starting.", subsys.name());
     tracing::info!("Starting detached agent subsystems ...");
-    let mut agent_subsystems: Vec<NestedSubsystem<Box<dyn Error + Sync + Send>>> = Vec::new();
+    let mut agent_subsystems: Vec<NestedSubsystem<miette::Report>> = Vec::new();
 
     for name in agent_names {
         let agent_subsystem = subsys.start(
-            SubsystemBuilder::new(name.clone(), move |s| agent_subsystem(Arc::new(name), s))
-                .detached(),
+            SubsystemBuilder::new(
+                name.clone(),
+                AgentSubsystem {
+                    name: Arc::new(name),
+                }
+                .into_subsystem(),
+            )
+            .detached(),
         );
         agent_subsystems.push(agent_subsystem);
     }

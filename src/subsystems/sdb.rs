@@ -2,16 +2,23 @@ use crate::sdb_server::SurrealDBContainer;
 use crate::settings::SETTINGS;
 use miette::Result;
 use std::sync::OnceLock;
+use surrealdb::Surreal;
 use surrealdb::engine::any;
 use surrealdb::opt::auth::Root;
-use surrealdb::Surreal;
-use tokio::sync::watch;
 use tokio::sync::OnceCell;
-use tokio::time::{sleep, Duration};
-use tokio_graceful_shutdown::SubsystemHandle;
+use tokio::sync::watch;
+use tokio::time::{Duration, sleep};
+use tokio_graceful_shutdown::{IntoSubsystem, SubsystemHandle};
 
 static DB_READY: OnceLock<watch::Sender<bool>> = OnceLock::new();
 
+pub struct SdbSubsystem;
+
+impl IntoSubsystem<miette::Report, miette::Report> for SdbSubsystem {
+    async fn run(self, subsys: &mut SubsystemHandle<miette::Report>) -> Result<()> {
+        self::sdb_subsystem(subsys).await
+    }
+}
 pub struct SurrealDBWrapper;
 
 impl SurrealDBWrapper {
@@ -62,7 +69,7 @@ impl SurrealDBWrapper {
     }
 }
 
-pub async fn sdb_subsystem(subsys: SubsystemHandle) -> Result<()> {
+pub async fn sdb_subsystem(subsys: &mut SubsystemHandle<miette::Report>) -> Result<()> {
     tracing::info!("{} subsystem starting.", subsys.name());
     let container = if SETTINGS.environment == "production" {
         tracing::info!("{} using cloud connection.", subsys.name());

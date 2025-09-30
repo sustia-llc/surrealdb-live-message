@@ -1,4 +1,3 @@
-use crate::subsystems::sdb;
 use futures::StreamExt;
 use miette::Result;
 use serde::{Deserialize, Serialize};
@@ -7,11 +6,22 @@ use surrealdb::Notification;
 use surrealdb::opt::Resource;
 use surrealdb::sql::{Datetime, Thing};
 use tokio::time::{Duration, sleep};
-use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
+use tokio_graceful_shutdown::{IntoSubsystem, SubsystemBuilder, SubsystemHandle};
 
 use crate::message::{MESSAGE_TABLE, Message, Payload};
+use crate::subsystems::sdb;
 
 pub const AGENT_TABLE: &str = "agent";
+
+pub struct AgentSubsystem {
+    pub name: Arc<String>,
+}
+
+impl IntoSubsystem<miette::Report, miette::Report> for AgentSubsystem {
+    async fn run(self, subsys: &mut SubsystemHandle<miette::Report>) -> Result<()> {
+        agent_subsystem(self.name, subsys).await
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Agent {
@@ -57,7 +67,10 @@ impl Agent {
         Ok(())
     }
 
-    pub async fn listen(&self, shutdown_signal: SubsystemHandle) -> surrealdb::Result<()> {
+    pub async fn listen(
+        &self,
+        shutdown_signal: &mut SubsystemHandle<miette::Report>,
+    ) -> surrealdb::Result<()> {
         let db = sdb::SurrealDBWrapper::connection().await.to_owned();
 
         let name = &self.id.id.to_string();
@@ -106,18 +119,35 @@ impl Agent {
     }
 }
 
-pub async fn agent_subsystem(name: Arc<String>, subsys: SubsystemHandle) -> Result<()> {
+struct ListenSubsystem {
+    agent: Agent,
+}
+
+impl IntoSubsystem<miette::Report, miette::Report> for ListenSubsystem {
+    async fn run(self, subsys: &mut SubsystemHandle<miette::Report>) -> miette::Result<()> {
+        self.agent
+            .listen(subsys)
+            .await
+            .map_err(|e| miette::miette!(e.to_string()))?;
+        Ok(())
+    }
+}
+
+pub async fn agent_subsystem(
+    name: Arc<String>,
+    subsys: &mut SubsystemHandle<miette::Report>,
+) -> Result<()> {
     tracing::info!("{} starting.", name);
     let agent = Agent::new(name.as_str()).await;
 
     let listen_subsys = subsys.start(
-        SubsystemBuilder::new(format!("{}-listen", name), async move |subsys| {
-            agent
-                .listen(subsys)
-                .await
-                .expect("Failed to listen for new messages");
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        })
+        SubsystemBuilder::new(
+            format!("{}-listen", name),
+            ListenSubsystem {
+                agent: agent.clone(),
+            }
+            .into_subsystem(),
+        )
         .detached(),
     );
 
