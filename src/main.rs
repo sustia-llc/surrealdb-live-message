@@ -1,34 +1,29 @@
 use miette::Result;
 use tokio::time::Duration;
-use tokio_graceful_shutdown::{IntoSubsystem, SubsystemBuilder, SubsystemHandle, Toplevel};
+use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
 
 use surrealdb_live_message::logger;
-use surrealdb_live_message::subsystems::agents::AgentsSubsystem;
-use surrealdb_live_message::subsystems::sdb::{self, SdbSubsystem};
+use surrealdb_live_message::subsystems::{agents, sdb};
 
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
 
 async fn main_subsystem(s: &mut SubsystemHandle<miette::Report>) {
-    s.start(SubsystemBuilder::new("sdb", SdbSubsystem.into_subsystem()));
+    // Start database subsystem
+    s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
 
-    // Wait for database to be ready
-    let mut rx = sdb::SurrealDBWrapper::get_ready_receiver();
-    let timeout = tokio::time::sleep(Duration::from_secs(30));
-    tokio::select! {
-        _ = timeout => panic!("Timeout waiting for database to be ready"),
-        _ = async {
-            while !*rx.borrow_and_update() {
-                let _ = rx.changed().await;
-            }
-        } => {},
+    // Wait for database to be ready with timeout
+    let db_ready_rx = sdb::SurrealDBWrapper::get_ready_receiver();
+    match tokio::time::timeout(Duration::from_secs(30), db_ready_rx).await {
+        Ok(Ok(())) => tracing::info!("Database is ready, starting agents..."),
+        Ok(Err(_)) => panic!("Database ready signal channel closed"),
+        Err(_) => panic!("Timeout waiting for database to be ready"),
     }
 
+    // Initialize agent names and start agents subsystem
     let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
-    s.start(SubsystemBuilder::new(
-        "agents",
-        AgentsSubsystem { names }.into_subsystem(),
-    ));
+    agents::AgentsWrapper::init(names);
+    s.start(SubsystemBuilder::new("agents", agents::agents_subsystem));
 }
 
 #[tokio::main]
@@ -40,5 +35,6 @@ async fn main() -> Result<()> {
         .handle_shutdown_requests(Duration::from_secs(4))
         .await
         .map_err(|e| miette::miette!(e.to_string()))?;
+
     Ok(())
 }

@@ -1,39 +1,49 @@
 use crate::sdb_server::SurrealDBContainer;
 use crate::settings::SETTINGS;
 use miette::Result;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use surrealdb::Surreal;
 use surrealdb::engine::any;
 use surrealdb::opt::auth::Root;
-use tokio::sync::OnceCell;
-use tokio::sync::watch;
+use tokio::sync::{OnceCell, oneshot};
 use tokio::time::{Duration, sleep};
-use tokio_graceful_shutdown::{IntoSubsystem, SubsystemHandle};
+use tokio_graceful_shutdown::SubsystemHandle;
 
-static DB_READY: OnceLock<watch::Sender<bool>> = OnceLock::new();
-
-pub struct SdbSubsystem;
-
-impl IntoSubsystem<miette::Report, miette::Report> for SdbSubsystem {
-    async fn run(self, subsys: &mut SubsystemHandle<miette::Report>) -> Result<()> {
-        self::sdb_subsystem(subsys).await
-    }
+struct ReadyChannel {
+    tx: Option<oneshot::Sender<()>>,
+    rx: Option<oneshot::Receiver<()>>,
 }
+
+static DB_READY: OnceLock<Mutex<ReadyChannel>> = OnceLock::new();
+
 pub struct SurrealDBWrapper;
 
 impl SurrealDBWrapper {
-    pub fn get_ready_receiver() -> watch::Receiver<bool> {
-        DB_READY
-            .get_or_init(|| {
-                let (tx, _) = watch::channel(false);
-                tx
+    fn init_ready_channel() -> &'static Mutex<ReadyChannel> {
+        DB_READY.get_or_init(|| {
+            let (tx, rx) = oneshot::channel();
+            Mutex::new(ReadyChannel {
+                tx: Some(tx),
+                rx: Some(rx),
             })
-            .subscribe()
+        })
     }
 
-    pub fn set_ready(ready: bool) {
-        if let Some(tx) = DB_READY.get() {
-            let _ = tx.send(ready);
+    pub fn get_ready_receiver() -> oneshot::Receiver<()> {
+        let channel = Self::init_ready_channel();
+        channel
+            .lock()
+            .unwrap()
+            .rx
+            .take()
+            .expect("Ready receiver already taken")
+    }
+
+    pub fn set_ready() {
+        let channel = Self::init_ready_channel();
+        if let Some(tx) = channel.lock().unwrap().tx.take() {
+            let _ = tx.send(());
         }
     }
 
@@ -88,7 +98,7 @@ pub async fn sdb_subsystem(subsys: &mut SubsystemHandle<miette::Report>) -> Resu
     };
 
     // Signal database is ready
-    SurrealDBWrapper::set_ready(true);
+    SurrealDBWrapper::set_ready();
 
     tracing::info!("{} ready and accepting connections.", subsys.name());
 

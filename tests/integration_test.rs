@@ -3,11 +3,10 @@ use surrealdb::engine::any;
 use surrealdb::opt::Resource;
 use surrealdb_live_message::logger;
 use surrealdb_live_message::message::{MESSAGE_TABLE, Message, Payload, TextPayload};
-use surrealdb_live_message::subsystems::agent::{AGENT_TABLE, get_registry};
-use surrealdb_live_message::subsystems::agents::AgentsSubsystem;
-use surrealdb_live_message::subsystems::sdb::{self, SdbSubsystem};
+use surrealdb_live_message::subsystems::agents::{AGENT_TABLE, get_registry};
+use surrealdb_live_message::subsystems::{agents, sdb};
 use tokio::time::{Duration, sleep};
-use tokio_graceful_shutdown::{IntoSubsystem, SubsystemBuilder, SubsystemHandle, Toplevel};
+use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
 
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
@@ -18,27 +17,23 @@ async fn clear_db(db: &Surreal<any::Any>) {
 }
 
 async fn test_main_subsystem(s: &mut SubsystemHandle<miette::Report>) {
-    s.start(SubsystemBuilder::new("sdb", SdbSubsystem.into_subsystem()));
+    // Start database subsystem
+    s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
 
-    // Wait for database to be ready
-    let mut rx = sdb::SurrealDBWrapper::get_ready_receiver();
-
-    tokio::select! {
-        _ = tokio::time::sleep(Duration::from_secs(30)) => panic!("Timeout waiting for database to be ready"),
-        _ = async {
-            while !*rx.borrow_and_update() {
-                let _ = rx.changed().await;
-            }
-        } => {},
+    // Wait for database to be ready with timeout
+    let db_ready_rx = sdb::SurrealDBWrapper::get_ready_receiver();
+    match tokio::time::timeout(Duration::from_secs(30), db_ready_rx).await {
+        Ok(Ok(())) => tracing::info!("Database is ready, starting agents..."),
+        Ok(Err(_)) => panic!("Database ready signal channel closed"),
+        Err(_) => panic!("Timeout waiting for database to be ready"),
     }
 
+    // Initialize agent names and start agents subsystem
     let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
     let db = sdb::SurrealDBWrapper::connection().await.to_owned();
     clear_db(&db).await;
-    s.start(SubsystemBuilder::new(
-        "agents",
-        AgentsSubsystem { names }.into_subsystem(),
-    ));
+    agents::AgentsWrapper::init(names);
+    s.start(SubsystemBuilder::new("agents", agents::agents_subsystem));
 }
 
 #[tokio::test]

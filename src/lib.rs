@@ -1,5 +1,4 @@
 pub mod subsystems {
-    pub mod agent;
     pub mod agents;
     pub mod sdb;
 }
