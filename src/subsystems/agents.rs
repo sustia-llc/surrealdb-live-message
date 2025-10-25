@@ -1,27 +1,16 @@
+use anyhow::Result;
 use futures::StreamExt;
-use miette::Result;
 use serde::{Deserialize, Serialize};
-use std::sync::{LazyLock, Mutex, OnceLock};
 use surrealdb::Notification;
 use surrealdb::opt::Resource;
 use surrealdb::sql::{Datetime, Thing};
 use tokio::time::{Duration, sleep};
-use tokio_graceful_shutdown::{IntoSubsystem, NestedSubsystem, SubsystemBuilder, SubsystemHandle};
+use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 
 use crate::message::{MESSAGE_TABLE, Message, Payload};
 use crate::subsystems::sdb;
 
 pub const AGENT_TABLE: &str = "agent";
-
-// Static storage for agent names
-static AGENT_NAMES: OnceLock<Vec<String>> = OnceLock::new();
-
-// Agent registry
-pub static REGISTRY: LazyLock<Mutex<Vec<Agent>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-
-pub fn get_registry() -> &'static Mutex<Vec<Agent>> {
-    &REGISTRY
-}
 
 // ============================================================================
 // Agent Data Structure
@@ -47,8 +36,6 @@ impl Agent {
             .await
             .unwrap()
             .expect("Failed to create agent.");
-        let mut registry = REGISTRY.lock().unwrap();
-        registry.push(agent.clone());
 
         agent
     }
@@ -68,145 +55,108 @@ impl Agent {
     }
 
     /// Run the agent subsystem - manages the agent and its listener
-    pub async fn run_subsystem(self, subsys: &mut SubsystemHandle<miette::Report>) -> Result<()> {
-        tracing::info!("{} starting.", self.name);
+    pub async fn run_subsystem(self, subsys: &mut SubsystemHandle) -> Result<()> {
+        let agent_name = self.name.clone();
+        tracing::info!("{} starting.", agent_name);
 
-        // Start listen subsystem
-        let listen_subsys = subsys.start(
-            SubsystemBuilder::new(
-                format!("{}-listen", self.name),
-                ListenSubsystem {
-                    agent: self.clone(),
+        // Start listen subsystem - it will be automatically managed by the parent
+        let listen_name = format!("{}-listen", agent_name);
+        let agent_for_listen = self.clone();
+        subsys.start(
+            SubsystemBuilder::new(listen_name, {
+                async move |subsys: &mut SubsystemHandle| {
+                    agent_listen_subsystem(agent_for_listen, subsys).await
                 }
-                .into_subsystem(),
-            )
-            .detached(),
+            }),
         );
 
         subsys.on_shutdown_requested().await;
-
-        listen_subsys.initiate_shutdown();
-        let _ = listen_subsys.join().await;
-
-        tracing::info!("{} shutting down ...", self.name);
+        tracing::info!("{} shutting down ...", agent_name);
         sleep(Duration::from_millis(200)).await;
-        tracing::info!("{} stopped.", self.name);
+        tracing::info!("{} stopped.", agent_name);
         Ok(())
     }
+}
 
-    /// Run the listen subsystem - handles incoming messages
-    async fn run_listen_subsystem(
-        self,
-        subsys: &mut SubsystemHandle<miette::Report>,
-    ) -> Result<()> {
-        let db = sdb::SurrealDBWrapper::connection().await.to_owned();
+/// Listen subsystem for an agent - handles incoming messages
+async fn agent_listen_subsystem(agent: Agent, subsys: &mut SubsystemHandle) -> Result<()> {
+    tracing::info!("{} listen subsystem starting.", agent.name);
+    let db = sdb::SurrealDBWrapper::connection().await.to_owned();
 
-        let query = format!("LIVE SELECT * FROM message where out = agent:{}", self.name);
-        let mut response = db.query(&query).await.expect("LIVE SELECT failed.");
-        let mut message_stream = response
-            .stream::<Notification<Message>>(0)
-            .map_err(|e| miette::miette!(e.to_string()))?;
+    let query = format!("LIVE SELECT * FROM message where out = agent:{}", agent.name);
+    let mut response = db.query(&query).await.expect("LIVE SELECT failed.");
+    let mut message_stream = response
+        .stream::<Notification<Message>>(0)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
-        loop {
-            tokio::select! {
-                Some(result) = message_stream.next() => {
-                    match result {
-                        Ok(notification) => {
-                            let action = notification.action;
-                            let message: Message = notification.data;
-                            if action == surrealdb::Action::Delete {
-                                tracing::debug!("Message deleted: {:?}", message);
-                                continue;
-                            }
-
-                            match &message.payload {
-                                Payload::Text(text_payload) => {
-                                    tracing::info!("{} received text message: {}", self.name, text_payload.content);
-                                },
-                                Payload::Image(image_payload) => {
-                                    tracing::info!("Image message: {}, caption: {:?}", image_payload.url, image_payload.caption);
-                                },
-                                Payload::Video(video_payload) => {
-                                    tracing::info!("Video message: {}, duration: {} seconds", video_payload.url, video_payload.duration);
-                                },
-                            }
+    loop {
+        tokio::select! {
+            Some(result) = message_stream.next() => {
+                match result {
+                    Ok(notification) => {
+                        let action = notification.action;
+                        let message: Message = notification.data;
+                        if action == surrealdb::Action::Delete {
+                            tracing::debug!("Message deleted: {:?}", message);
+                            continue;
                         }
-                        Err(error) => tracing::error!("{}", error),
+
+                        match &message.payload {
+                            Payload::Text(text_payload) => {
+                                tracing::info!("{} received text message: {}", agent.name, text_payload.content);
+                            },
+                            Payload::Image(image_payload) => {
+                                tracing::info!("Image message: {}, caption: {:?}", image_payload.url, image_payload.caption);
+                            },
+                            Payload::Video(video_payload) => {
+                                tracing::info!("Video message: {}, duration: {} seconds", video_payload.url, video_payload.duration);
+                            },
+                        }
                     }
-                }
-                _ = subsys.on_shutdown_requested() => {
-                    tracing::info!("Shutdown signal received, terminating listen function for agent {}", self.name);
-                    drop(message_stream);
-                    drop(response);
-                    db.delete(Resource::from((MESSAGE_TABLE, self.name.as_str())))
-                        .await
-                        .expect("agent message delete failed");
-                    // TODO: verify live query is killed
-                    break;
+                    Err(error) => tracing::error!("{}", error),
                 }
             }
+            _ = subsys.on_shutdown_requested() => {
+                tracing::info!("Shutdown signal received, terminating listen function for agent {}", agent.name);
+                drop(message_stream);
+                drop(response);
+                db.delete(Resource::from((MESSAGE_TABLE, agent.name.as_str())))
+                    .await
+                    .expect("agent message delete failed");
+                // TODO: verify live query is killed
+                break;
+            }
         }
-        Ok(())
     }
-}
-
-struct ListenSubsystem {
-    agent: Agent,
-}
-
-impl IntoSubsystem<miette::Report, miette::Report> for ListenSubsystem {
-    async fn run(self, subsys: &mut SubsystemHandle<miette::Report>) -> Result<()> {
-        self.agent.run_listen_subsystem(subsys).await
-    }
-}
-
-impl IntoSubsystem<miette::Report, miette::Report> for Agent {
-    async fn run(self, subsys: &mut SubsystemHandle<miette::Report>) -> Result<()> {
-        self.run_subsystem(subsys).await
-    }
-}
-
-pub struct AgentsWrapper;
-
-impl AgentsWrapper {
-    /// Initialize agent names storage (call once at startup)
-    pub fn init(names: Vec<String>) {
-        AGENT_NAMES
-            .set(names)
-            .expect("Agent names already initialized");
-    }
-
-    /// Get stored agent names
-    fn get_names() -> &'static Vec<String> {
-        AGENT_NAMES.get().expect("Agent names not initialized")
-    }
-}
-/// Main agents subsystem - manages all agents
-pub async fn agents_subsystem(subsys: &mut SubsystemHandle<miette::Report>) -> Result<()> {
-    tracing::info!("{} starting.", subsys.name());
-    tracing::info!("Starting detached agent subsystems ...");
-
-    let names = AgentsWrapper::get_names();
-    let mut agent_subsystems: Vec<NestedSubsystem<miette::Report>> = Vec::new();
-
-    for name in names {
-        let agent = Agent::new(name).await;
-        let agent_subsys =
-            subsys.start(SubsystemBuilder::new(name.clone(), agent.into_subsystem()).detached());
-        agent_subsystems.push(agent_subsys);
-    }
-
-    subsys.on_shutdown_requested().await;
-
-    tracing::info!("Initiating agents shutdown ...");
-    for agent_subsystem in agent_subsystems.iter() {
-        agent_subsystem.initiate_shutdown();
-        agent_subsystem.join().await?;
-    }
-    tracing::info!("All agents finished ...");
-
-    sleep(Duration::from_millis(200)).await;
-    tracing::info!("{} stopped.", subsys.name());
-
     Ok(())
+}
+
+/// Create an agents subsystem with the given agent names
+pub fn agents_subsystem_with_names(
+    names: Vec<String>,
+) -> impl FnOnce(&mut SubsystemHandle) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    move |subsys: &mut SubsystemHandle| {
+        Box::pin(async move {
+            tracing::info!("{} starting.", subsys.name());
+            tracing::info!("Starting detached agent subsystems ...");
+
+            for name in names {
+                let agent = Agent::new(&name).await;
+                subsys.start(
+                    SubsystemBuilder::new(name.clone(), {
+                        async move |subsys: &mut SubsystemHandle| {
+                            agent.run_subsystem(subsys).await
+                        }
+                    }),
+                );
+            }
+
+            subsys.on_shutdown_requested().await;
+            tracing::info!("Agents subsystem shutting down ...");
+            sleep(Duration::from_millis(200)).await;
+            tracing::info!("{} stopped.", subsys.name());
+
+            Ok(())
+        })
+    }
 }

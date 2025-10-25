@@ -1,4 +1,4 @@
-use miette::Result;
+use anyhow::Result;
 use tokio::time::Duration;
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
 
@@ -8,7 +8,7 @@ use surrealdb_live_message::subsystems::{agents, sdb};
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
 
-async fn main_subsystem(s: &mut SubsystemHandle<miette::Report>) {
+async fn main_subsystem(s: &mut SubsystemHandle) {
     // Start database subsystem
     s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
 
@@ -20,21 +20,21 @@ async fn main_subsystem(s: &mut SubsystemHandle<miette::Report>) {
         Err(_) => panic!("Timeout waiting for database to be ready"),
     }
 
-    // Initialize agent names and start agents subsystem
+    // Start agents subsystem with single-step initialization
     let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
-    agents::AgentsWrapper::init(names);
-    s.start(SubsystemBuilder::new("agents", agents::agents_subsystem));
+    s.start(SubsystemBuilder::new(
+        "agents",
+        agents::agents_subsystem_with_names(names),
+    ));
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     logger::setup();
 
-    Toplevel::<miette::Report>::new(main_subsystem)
+    Toplevel::new(main_subsystem)
         .catch_signals()
         .handle_shutdown_requests(Duration::from_secs(4))
         .await
-        .map_err(|e| miette::miette!(e.to_string()))?;
-
-    Ok(())
+        .map_err(Into::into)
 }

@@ -6,7 +6,7 @@ use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, StartContainerOptionsBuilder,
 };
 use bollard::service::PortBinding;
-use miette::Result;
+use anyhow::Result;
 use std::collections::HashMap;
 use std::default::Default;
 use tokio::sync::oneshot;
@@ -18,14 +18,17 @@ pub struct SurrealDBContainer {
 }
 
 impl SurrealDBContainer {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new() -> Result<Self> {
         let docker = Docker::connect_with_unix_defaults()?;
         Ok(Self { docker })
     }
 
-    pub async fn start_and_wait(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start_and_wait(&self) -> Result<()> {
+        tracing::info!("Pulling Docker image...");
         self.pull_image().await?;
+        tracing::info!("Creating and starting container...");
         self.create_and_start_container().await?;
+        tracing::info!("Container started, waiting for health check...");
 
         let (tx, rx) = oneshot::channel();
         let url = format!("http://{}:{}/health", SETTINGS.sdb.host, SETTINGS.sdb.port);
@@ -62,17 +65,13 @@ impl SurrealDBContainer {
         // Wait for ready signal or timeout
         match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(())) => {
+                // Give the WebSocket endpoint a moment to be fully ready
+                sleep(Duration::from_millis(500)).await;
                 tracing::info!("SurrealDB is ready and accepting connections");
                 Ok(())
             }
-            Ok(Err(_)) => Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "health check failed after all attempts",
-            ))),
-            Err(_) => Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "timeout waiting for surrealdb to start",
-            ))),
+            Ok(Err(_)) => Err(anyhow::anyhow!("health check failed after all attempts")),
+            Err(_) => Err(anyhow::anyhow!("timeout waiting for surrealdb to start")),
         }
     }
 
@@ -91,7 +90,7 @@ impl SurrealDBContainer {
         Ok(())
     }
 
-    async fn create_and_start_container(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn create_and_start_container(&self) -> Result<()> {
         let bind_address = format!("0.0.0.0:{}", SETTINGS.sdb.port);
         let cmd: Vec<String> = vec![
             "start".to_string(),

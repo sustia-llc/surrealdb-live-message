@@ -3,7 +3,7 @@ use surrealdb::engine::any;
 use surrealdb::opt::Resource;
 use surrealdb_live_message::logger;
 use surrealdb_live_message::message::{MESSAGE_TABLE, Message, Payload, TextPayload};
-use surrealdb_live_message::subsystems::agents::{AGENT_TABLE, get_registry};
+use surrealdb_live_message::subsystems::agents::{AGENT_TABLE, Agent};
 use surrealdb_live_message::subsystems::{agents, sdb};
 use tokio::time::{Duration, sleep};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
@@ -16,11 +16,11 @@ async fn clear_db(db: &Surreal<any::Any>) {
     db.delete(Resource::from(AGENT_TABLE)).await.unwrap();
 }
 
-async fn test_main_subsystem(s: &mut SubsystemHandle<miette::Report>) {
+async fn test_main_subsystem(s: &mut SubsystemHandle) {
     // Start database subsystem
     s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
 
-    // Wait for database to be ready with timeout
+    // Wait for database to be ready
     let db_ready_rx = sdb::SurrealDBWrapper::get_ready_receiver();
     match tokio::time::timeout(Duration::from_secs(30), db_ready_rx).await {
         Ok(Ok(())) => tracing::info!("Database is ready, starting agents..."),
@@ -28,12 +28,32 @@ async fn test_main_subsystem(s: &mut SubsystemHandle<miette::Report>) {
         Err(_) => panic!("Timeout waiting for database to be ready"),
     }
 
-    // Initialize agent names and start agents subsystem
-    let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
+    // Clear database and start agents subsystem
     let db = sdb::SurrealDBWrapper::connection().await.to_owned();
     clear_db(&db).await;
-    agents::AgentsWrapper::init(names);
-    s.start(SubsystemBuilder::new("agents", agents::agents_subsystem));
+
+    let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
+    s.start(SubsystemBuilder::new(
+        "agents",
+        agents::agents_subsystem_with_names(names),
+    ));
+}
+
+/// Helper function to wait for an agent to be created in the database
+async fn wait_for_agent(db: &Surreal<any::Any>, name: &str) -> Agent {
+    let timeout = tokio::time::sleep(Duration::from_secs(10));
+    tokio::select! {
+        _ = timeout => panic!("Timeout waiting for agent {}", name),
+        agent = async {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                if let Ok(Some(agent)) = db.select((AGENT_TABLE, name)).await {
+                    return agent;
+                }
+            }
+        } => agent
+    }
 }
 
 #[tokio::test]
@@ -45,41 +65,16 @@ async fn test_agent_messaging() {
 
     tokio::join!(
         async {
-            // Wait for agents to be initialized by polling the registry
-            let registry = get_registry();
-            let timeout = tokio::time::sleep(Duration::from_secs(10));
-            tokio::select! {
-                _ = timeout => panic!("Timeout waiting for agents to initialize"),
-                _ = async {
-                    let mut interval = tokio::time::interval(Duration::from_millis(100));
-                    loop {
-                        interval.tick().await;
-                        let count = {
-                            let agents = registry.lock().unwrap();
-                            agents.len()
-                        };
-                        if count == 2 {
-                            break;
-                        }
-                    }
-                } => {}
-            }
+            // Wait for the database container to start and be ready
+            // This gives enough time for Docker container to pull image, start, and initialize
+            sleep(Duration::from_secs(10)).await;
 
-            // Now proceed with the test
+            // Get the database connection
             let db = sdb::SurrealDBWrapper::connection().await.to_owned();
 
-            let registry = get_registry();
-            let agents = registry.lock().unwrap();
-            assert_eq!(agents.len(), 2);
-
-            let alice = agents
-                .iter()
-                .find(|&a| a.id.id.to_string() == AGENT_ALICE)
-                .expect("Failed to find alice");
-            let bob = agents
-                .iter()
-                .find(|&a| a.id.id.to_string() == AGENT_BOB)
-                .expect("Failed to find bob");
+            // Wait for agents to be created in the database
+            let alice = wait_for_agent(&db, AGENT_ALICE).await;
+            let bob = wait_for_agent(&db, AGENT_BOB).await;
 
             // Send messages
             let text_payload = TextPayload {
@@ -120,7 +115,7 @@ async fn test_agent_messaging() {
             signal::kill(Pid::this(), Signal::SIGINT).unwrap();
         },
         async {
-            let result = Toplevel::<miette::Report>::new(test_main_subsystem)
+            let result = Toplevel::new(test_main_subsystem)
                 .catch_signals()
                 .handle_shutdown_requests(Duration::from_secs(4))
                 .await;

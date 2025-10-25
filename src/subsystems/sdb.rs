@@ -1,6 +1,6 @@
 use crate::sdb_server::SurrealDBContainer;
 use crate::settings::SETTINGS;
-use miette::Result;
+use anyhow::Result;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use surrealdb::Surreal;
@@ -79,23 +79,26 @@ impl SurrealDBWrapper {
     }
 }
 
-pub async fn sdb_subsystem(subsys: &mut SubsystemHandle<miette::Report>) -> Result<()> {
+pub async fn sdb_subsystem(subsys: &mut SubsystemHandle) -> Result<()> {
     tracing::info!("{} subsystem starting.", subsys.name());
     let container = if SETTINGS.environment == "production" {
         tracing::info!("{} using cloud connection.", subsys.name());
-        let _db = SurrealDBWrapper::connection().await.to_owned();
         None
     } else {
         tracing::info!("{} using local container.", subsys.name());
         let container = SurrealDBContainer::new()
             .await
-            .map_err(|e| miette::miette!(e.to_string()))?;
+            .map_err(anyhow::Error::from)
+            .expect("Failed to create SurrealDB container");
         container
             .start_and_wait()
             .await
-            .map_err(|e| miette::miette!(e.to_string()))?;
+            .expect("Failed to start and wait for container");
         Some(container)
     };
+
+    // Establish the initial connection (works for both production and local)
+    let _db = SurrealDBWrapper::connection().await.to_owned();
 
     // Signal database is ready
     SurrealDBWrapper::set_ready();
@@ -109,7 +112,7 @@ pub async fn sdb_subsystem(subsys: &mut SubsystemHandle<miette::Report>) -> Resu
         container
             .stop()
             .await
-            .map_err(|e| miette::miette!(e.to_string()))?;
+            .expect("Failed to stop SurrealDB container");
     }
     tracing::info!("{} stopped.", subsys.name());
     Ok(())
