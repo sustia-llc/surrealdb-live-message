@@ -2,3 +2,4 @@
 config/production*
 README.local.md
 TODO.md
+.claude

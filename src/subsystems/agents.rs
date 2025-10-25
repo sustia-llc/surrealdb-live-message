@@ -138,7 +138,7 @@ pub fn agents_subsystem_with_names(
     move |subsys: &mut SubsystemHandle| {
         Box::pin(async move {
             tracing::info!("{} starting.", subsys.name());
-            tracing::info!("Starting detached agent subsystems ...");
+            tracing::info!("Starting agent subsystems ...");
 
             for name in names {
                 let agent = Agent::new(&name).await;
