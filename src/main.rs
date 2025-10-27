@@ -13,10 +13,12 @@ async fn main_subsystem(s: &mut SubsystemHandle) {
     s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
 
     // Wait for database to be ready with timeout
-    let db_ready_rx = sdb::SurrealDBWrapper::get_ready_receiver();
-    match tokio::time::timeout(Duration::from_secs(30), db_ready_rx).await {
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        sdb::SurrealDBWrapper::wait_until_ready()
+    ).await {
         Ok(Ok(())) => tracing::info!("Database is ready, starting agents..."),
-        Ok(Err(_)) => panic!("Database ready signal channel closed"),
+        Ok(Err(e)) => panic!("Database ready signal failed: {}", e),
         Err(_) => panic!("Timeout waiting for database to be ready"),
     }
 

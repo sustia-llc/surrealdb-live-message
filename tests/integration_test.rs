@@ -21,10 +21,12 @@ async fn test_main_subsystem(s: &mut SubsystemHandle) {
     s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
 
     // Wait for database to be ready
-    let db_ready_rx = sdb::SurrealDBWrapper::get_ready_receiver();
-    match tokio::time::timeout(Duration::from_secs(30), db_ready_rx).await {
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        sdb::SurrealDBWrapper::wait_until_ready()
+    ).await {
         Ok(Ok(())) => tracing::info!("Database is ready, starting agents..."),
-        Ok(Err(_)) => panic!("Database ready signal channel closed"),
+        Ok(Err(e)) => panic!("Database ready signal failed: {}", e),
         Err(_) => panic!("Timeout waiting for database to be ready"),
     }
 
@@ -65,9 +67,10 @@ async fn test_agent_messaging() {
 
     tokio::join!(
         async {
-            // Wait for the database container to start and be ready
-            // This gives enough time for Docker container to pull image, start, and initialize
-            sleep(Duration::from_secs(10)).await;
+            // Wait for the database to be ready (can be called from multiple places)
+            sdb::SurrealDBWrapper::wait_until_ready()
+                .await
+                .expect("Failed to wait for database");
 
             // Get the database connection
             let db = sdb::SurrealDBWrapper::connection().await.to_owned();

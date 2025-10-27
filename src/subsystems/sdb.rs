@@ -1,50 +1,43 @@
 use crate::sdb_server::SurrealDBContainer;
 use crate::settings::SETTINGS;
 use anyhow::Result;
-use std::sync::Mutex;
 use std::sync::OnceLock;
 use surrealdb::Surreal;
 use surrealdb::engine::any;
 use surrealdb::opt::auth::Root;
-use tokio::sync::{OnceCell, oneshot};
+use tokio::sync::{OnceCell, watch};
 use tokio::time::{Duration, sleep};
 use tokio_graceful_shutdown::SubsystemHandle;
 
-struct ReadyChannel {
-    tx: Option<oneshot::Sender<()>>,
-    rx: Option<oneshot::Receiver<()>>,
-}
-
-static DB_READY: OnceLock<Mutex<ReadyChannel>> = OnceLock::new();
+static DB_READY: OnceLock<watch::Sender<bool>> = OnceLock::new();
 
 pub struct SurrealDBWrapper;
 
 impl SurrealDBWrapper {
-    fn init_ready_channel() -> &'static Mutex<ReadyChannel> {
+    fn init_ready_channel() -> &'static watch::Sender<bool> {
         DB_READY.get_or_init(|| {
-            let (tx, rx) = oneshot::channel();
-            Mutex::new(ReadyChannel {
-                tx: Some(tx),
-                rx: Some(rx),
-            })
+            let (tx, _rx) = watch::channel(false);
+            tx
         })
     }
 
-    pub fn get_ready_receiver() -> oneshot::Receiver<()> {
-        let channel = Self::init_ready_channel();
-        channel
-            .lock()
-            .unwrap()
-            .rx
-            .take()
-            .expect("Ready receiver already taken")
+    fn get_ready_receiver() -> watch::Receiver<bool> {
+        Self::init_ready_channel().subscribe()
     }
 
-    pub fn set_ready() {
-        let channel = Self::init_ready_channel();
-        if let Some(tx) = channel.lock().unwrap().tx.take() {
-            let _ = tx.send(());
-        }
+    /// Wait for the database to be ready (blocking async function).
+    /// This can be called from multiple places concurrently.
+    pub async fn wait_until_ready() -> Result<()> {
+        let mut rx = Self::get_ready_receiver();
+        rx.wait_for(|&ready| ready)
+            .await
+            .map_err(|_| anyhow::anyhow!("Database ready channel closed"))?;
+        Ok(())
+    }
+
+    fn set_ready() {
+        let tx = Self::init_ready_channel();
+        let _ = tx.send(true);
     }
 
     pub async fn connection() -> &'static Surreal<any::Any> {
