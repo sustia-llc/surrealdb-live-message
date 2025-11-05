@@ -31,8 +31,8 @@ async fn test_main_subsystem(s: &mut SubsystemHandle) {
     }
 
     // Clear database and start agents subsystem
-    let db = sdb::SurrealDBWrapper::connection().await.to_owned();
-    clear_db(&db).await;
+    let db = sdb::SurrealDBWrapper::connection().await;
+    clear_db(db).await;
 
     let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
     s.start(SubsystemBuilder::new(
@@ -73,7 +73,7 @@ async fn test_agent_messaging() {
                 .expect("Failed to wait for database");
 
             // Get the database connection
-            let db = sdb::SurrealDBWrapper::connection().await.to_owned();
+            let db = sdb::SurrealDBWrapper::connection().await;
 
             // Wait for agents to be created in the database
             let alice = wait_for_agent(&db, AGENT_ALICE).await;

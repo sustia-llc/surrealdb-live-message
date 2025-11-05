@@ -63,8 +63,8 @@ impl SurrealDBWrapper {
 
         let _ = db
             .signin(Root {
-                username: &SETTINGS.sdb.username,
-                password: &SETTINGS.sdb.password,
+                username: SETTINGS.sdb.username.clone(),
+                password: SETTINGS.sdb.password.clone(),
             })
             .await
             .expect("Failed to authenticate with SurrealDB");

@@ -2,8 +2,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use surrealdb::Notification;
-use surrealdb::opt::Resource;
-use surrealdb::sql::{Datetime, Thing};
+use surrealdb_types::{Action, Datetime, RecordId, SurrealValue};
 use tokio::time::{Duration, sleep};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 
@@ -16,41 +15,48 @@ pub const AGENT_TABLE: &str = "agent";
 // Agent Data Structure
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, SurrealValue)]
 pub struct Agent {
-    pub id: Thing,
+    pub id: RecordId,
     pub name: String,
     created: Datetime,
 }
 
 impl Agent {
-    pub async fn new(name: &str) -> Self {
-        let db = sdb::SurrealDBWrapper::connection().await.to_owned();
+    pub async fn new(name: &str) -> Result<Self> {
+        let db = sdb::SurrealDBWrapper::connection().await;
+
         let agent: Agent = db
             .create((AGENT_TABLE, name))
             .content(Agent {
-                id: Thing::from((AGENT_TABLE, name)),
+                id: RecordId::new(AGENT_TABLE, name),
                 name: name.to_string(),
                 created: Datetime::default(),
             })
             .await
-            .unwrap()
-            .expect("Failed to create agent.");
+            .map_err(|e| anyhow::anyhow!("Failed to create agent: {}", e))?
+            .ok_or_else(|| anyhow::anyhow!("Failed to create agent: no data returned"))?;
 
-        agent
+        Ok(agent)
     }
 
-    pub async fn send(&self, to: &str, payload: Payload) -> surrealdb::Result<()> {
-        let db = sdb::SurrealDBWrapper::connection().await.to_owned();
+    pub async fn send(&self, to: &str, payload: Payload) -> Result<()> {
+        let db = sdb::SurrealDBWrapper::connection().await;
 
-        let payload = serde_json::to_string(&payload).unwrap();
-        let from = self.id.id.to_string();
-        let query = format!(
-            "RELATE agent:{}->message->agent:{} CONTENT {{ created: time::now(), payload: {{{}}} }};",
-            from, to, payload
-        );
+        // Use RecordId directly instead of string formatting
+        let from_id = self.id.clone();
+        let to_id = RecordId::new(AGENT_TABLE, to);
 
-        let _ = db.query(&query).await.expect("RELATE failed.");
+        // Create the message as a relationship using typed approach
+        let query = "RELATE $from->message->$to CONTENT { created: time::now(), payload: $payload };";
+
+        db.query(query)
+            .bind(("from", from_id))
+            .bind(("to", to_id))
+            .bind(("payload", payload))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create message relationship: {}", e))?;
+
         Ok(())
     }
 
@@ -81,13 +87,20 @@ impl Agent {
 /// Listen subsystem for an agent - handles incoming messages
 async fn agent_listen_subsystem(agent: Agent, subsys: &mut SubsystemHandle) -> Result<()> {
     tracing::info!("{} listen subsystem starting.", agent.name);
-    let db = sdb::SurrealDBWrapper::connection().await.to_owned();
+    let db = sdb::SurrealDBWrapper::connection().await;
 
-    let query = format!("LIVE SELECT * FROM message where out = agent:{}", agent.name);
-    let mut response = db.query(&query).await.expect("LIVE SELECT failed.");
+    // Create live query
+    let _agent_id = RecordId::new(AGENT_TABLE, agent.name.clone());
+    let query = format!("LIVE SELECT * FROM message WHERE out = agent:{}", agent.name);
+
+    let mut response = db
+        .query(&query)
+        .await
+        .map_err(|e| anyhow::anyhow!("LIVE SELECT failed: {}", e))?;
+
     let mut message_stream = response
         .stream::<Notification<Message>>(0)
-        .map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create message stream: {}", e))?;
 
     loop {
         tokio::select! {
@@ -96,7 +109,7 @@ async fn agent_listen_subsystem(agent: Agent, subsys: &mut SubsystemHandle) -> R
                     Ok(notification) => {
                         let action = notification.action;
                         let message: Message = notification.data;
-                        if action == surrealdb::Action::Delete {
+                        if action == Action::Delete {
                             tracing::debug!("Message deleted: {:?}", message);
                             continue;
                         }
@@ -113,17 +126,21 @@ async fn agent_listen_subsystem(agent: Agent, subsys: &mut SubsystemHandle) -> R
                             },
                         }
                     }
-                    Err(error) => tracing::error!("{}", error),
+                    Err(error) => tracing::error!("Stream error: {}", error),
                 }
             }
             _ = subsys.on_shutdown_requested() => {
                 tracing::info!("Shutdown signal received, terminating listen function for agent {}", agent.name);
+
+                // Clean up: Drop the stream which will automatically cleanup the live query
                 drop(message_stream);
-                drop(response);
-                db.delete(Resource::from((MESSAGE_TABLE, agent.name.as_str())))
-                    .await
-                    .expect("agent message delete failed");
-                // TODO: verify live query is killed
+
+                // Clean up: Delete agent messages
+                let message_id = RecordId::new(MESSAGE_TABLE, agent.name.clone());
+                if let Err(e) = db.delete::<Option<Message>>(message_id).await {
+                    tracing::error!("Failed to delete agent messages: {}", e);
+                }
+
                 break;
             }
         }
@@ -141,7 +158,10 @@ pub fn agents_subsystem_with_names(
             tracing::info!("Starting agent subsystems ...");
 
             for name in names {
-                let agent = Agent::new(&name).await;
+                let agent = Agent::new(&name)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to create agent '{}': {}", name, e))?;
+
                 subsys.start(
                     SubsystemBuilder::new(name.clone(), {
                         async move |subsys: &mut SubsystemHandle| {
