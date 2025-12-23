@@ -1,4 +1,5 @@
 use crate::settings::SETTINGS;
+use anyhow::Result;
 use bollard::Docker;
 use bollard::models::ContainerCreateBody;
 use bollard::models::HostConfig;
@@ -6,7 +7,6 @@ use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, StartContainerOptionsBuilder,
 };
 use bollard::service::PortBinding;
-use anyhow::Result;
 use std::collections::HashMap;
 use std::default::Default;
 use tokio::sync::oneshot;

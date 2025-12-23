@@ -11,9 +11,11 @@ use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
 
-async fn clear_db(db: &Surreal<any::Any>) {
-    db.delete(Resource::from(MESSAGE_TABLE)).await.unwrap();
-    db.delete(Resource::from(AGENT_TABLE)).await.unwrap();
+async fn init_db(db: &Surreal<any::Any>) {
+    let _ = db.delete(Resource::from(MESSAGE_TABLE)).await;
+    let _ = db.delete(Resource::from(AGENT_TABLE)).await;
+    let _ = db.create(Resource::from(MESSAGE_TABLE)).await;
+    let _ = db.create(Resource::from(AGENT_TABLE)).await;
 }
 
 async fn test_main_subsystem(s: &mut SubsystemHandle) {
@@ -23,8 +25,10 @@ async fn test_main_subsystem(s: &mut SubsystemHandle) {
     // Wait for database to be ready
     match tokio::time::timeout(
         Duration::from_secs(30),
-        sdb::SurrealDBWrapper::wait_until_ready()
-    ).await {
+        sdb::SurrealDBWrapper::wait_until_ready(),
+    )
+    .await
+    {
         Ok(Ok(())) => tracing::info!("Database is ready, starting agents..."),
         Ok(Err(e)) => panic!("Database ready signal failed: {}", e),
         Err(_) => panic!("Timeout waiting for database to be ready"),
@@ -32,7 +36,7 @@ async fn test_main_subsystem(s: &mut SubsystemHandle) {
 
     // Clear database and start agents subsystem
     let db = sdb::SurrealDBWrapper::connection().await;
-    clear_db(db).await;
+    init_db(db).await;
 
     let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
     s.start(SubsystemBuilder::new(
