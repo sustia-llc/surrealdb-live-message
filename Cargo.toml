@@ -6,27 +6,27 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1.48.0", features = ["full", "macros", "rt-multi-thread"] }
-tokio-stream = "0.1.17"
-surrealdb = { version = "3.0.0-beta.1", features = ["kv-mem"] }
-surrealdb-types = "3.0.0-beta.1"
-futures = "0.3.31"
+tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+tokio-stream = "0.1"
+surrealdb = { version = "3.0.4", features = ["kv-mem"] }
+surrealdb-types = "3.0.4"
+futures = "0.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-anyhow = "1.0.100"
+anyhow = "1.0"
 tracing = "0.1.4"
-tracing-subscriber = "0.3.22"
+tracing-subscriber = "0.3"
 tokio-graceful-shutdown = "0.19.2"
-config = "0.15.19"
-bollard = "0.19.4"
-reqwest = { version = "0.12.26", default-features = false, features = [
+config = "0.15"
+bollard = "0.20"
+reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "gzip",
 ] }
 
 [dev-dependencies]
 [target.'cfg(unix)'.dev-dependencies]
-nix = { version = "0.30.1", default-features = false, features = ["signal"] }
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 futures = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

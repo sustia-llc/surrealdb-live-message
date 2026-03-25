@@ -126,11 +126,7 @@ impl SurrealDBContainer {
         let container_body = ContainerCreateBody {
             image: Some(format!("{}:{}", SETTINGS.sdb.image, SETTINGS.sdb.tag)),
             cmd: Some(cmd),
-            exposed_ports: Some(
-                vec![(format!("{}/tcp", SETTINGS.sdb.port), HashMap::new())]
-                    .into_iter()
-                    .collect(),
-            ),
+            exposed_ports: Some(vec![format!("{}/tcp", SETTINGS.sdb.port)]),
             host_config: Some(host_config),
             ..Default::default()
         };
