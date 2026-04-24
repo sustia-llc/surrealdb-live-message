@@ -6,7 +6,7 @@ use surrealdb_live_message::logger;
 use surrealdb_live_message::message::{MESSAGE_TABLE, Message};
 use surrealdb_live_message::subsystems::agents::{AGENT_TABLE, Coalition};
 use surrealdb_live_message::subsystems::sdb::{self, SurrealDBWrapper};
-use surrealdb_types::SurrealValue;
+use surrealdb_types::{RecordId, SurrealValue};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::{sync::CancellationToken, sync::DropGuard, task::TaskTracker};
 
@@ -113,7 +113,7 @@ async fn test_agent_messaging() {
     // *outgoing* messages from alice (i.e., alice's sends, containing her
     // payload). Likewise for bob.
     let mut response = db
-        .query("SELECT * FROM message WHERE in = agent:alice")
+        .query("SELECT *, in, out FROM message WHERE in = agent:alice")
         .await
         .unwrap();
     let alice_outgoing: Vec<Message<ChatMessage>> = response.take(0).unwrap();
@@ -124,9 +124,20 @@ async fn test_agent_messaging() {
             content: "Hello from Alice!".to_string(),
         }
     );
+    // Full edge-pointer assertion — locks in the `#[surreal(rename = "in")]`
+    // + explicit `SELECT *, in, out` projection combo that makes `r#in`
+    // deserialize correctly.
+    assert_eq!(
+        alice_outgoing[0].r#in,
+        Some(RecordId::new(AGENT_TABLE, AGENT_ALICE))
+    );
+    assert_eq!(
+        alice_outgoing[0].out,
+        Some(RecordId::new(AGENT_TABLE, AGENT_BOB))
+    );
 
     let mut response = db
-        .query("SELECT * FROM message WHERE in = agent:bob")
+        .query("SELECT *, in, out FROM message WHERE in = agent:bob")
         .await
         .unwrap();
     let bob_outgoing: Vec<Message<ChatMessage>> = response.take(0).unwrap();
@@ -136,6 +147,14 @@ async fn test_agent_messaging() {
         ChatMessage {
             content: "Hello from Bob!".to_string(),
         }
+    );
+    assert_eq!(
+        bob_outgoing[0].r#in,
+        Some(RecordId::new(AGENT_TABLE, AGENT_BOB))
+    );
+    assert_eq!(
+        bob_outgoing[0].out,
+        Some(RecordId::new(AGENT_TABLE, AGENT_ALICE))
     );
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.

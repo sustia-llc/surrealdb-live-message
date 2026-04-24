@@ -5,7 +5,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use surrealdb::Notification;
 use surrealdb_types::{Action, Datetime, RecordId, SurrealValue};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, oneshot};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Instrument;
 
@@ -70,18 +70,29 @@ impl Agent {
     /// Listen loop — subscribes to LIVE SELECT on messages addressed to this
     /// agent and drains the stream until `token` cancels.
     ///
+    /// `ready_tx` fires after the LIVE query is registered with the server
+    /// but before the first notification is polled. Callers (e.g.
+    /// `Coalition::new`) await this so `Agent::send` calls can't race the
+    /// subscription.
+    ///
     /// Library-side lifecycle primitive. No `SubsystemHandle`, no signal
     /// handling. See `rust-practical:async-lifecycle` skill in rust-v2
     /// v4.1.0.
-    async fn listen_loop<T>(self, token: CancellationToken) -> Result<()>
+    async fn listen_loop<T>(
+        self,
+        token: CancellationToken,
+        ready_tx: oneshot::Sender<()>,
+    ) -> Result<()>
     where
         T: SurrealValue + Send + Sync + Unpin + 'static,
     {
         tracing::info!("listen_loop starting for {}", self.name);
         let db = sdb::SurrealDBWrapper::connection().await;
 
+        // Explicit field projection — `LIVE SELECT *` on edges doesn't
+        // always include `in`/`out` in the notification payload.
         let query = format!(
-            "LIVE SELECT * FROM message WHERE out = agent:{}",
+            "LIVE SELECT *, in, out FROM message WHERE out = agent:{}",
             self.name
         );
         let mut response = db
@@ -91,6 +102,11 @@ impl Agent {
         let mut stream = response
             .stream::<Notification<Message<T>>>(0)
             .map_err(|e| anyhow::anyhow!("Failed to create message stream: {}", e))?;
+
+        // Signal the caller that this agent's subscription is live. Send()
+        // calls issued after Coalition::new returns are now guaranteed to
+        // be captured by this stream.
+        let _ = ready_tx.send(());
 
         loop {
             tokio::select! {
@@ -151,13 +167,28 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         let task_tracker = TaskTracker::new();
         let cancellation_token = CancellationToken::new();
 
+        let mut ready_rxs = Vec::with_capacity(names.len());
         for name in names {
             let agent = Agent::new(&name).await?;
             agents.write().await.insert(name.clone(), agent.clone());
 
             let token = cancellation_token.child_token();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            ready_rxs.push((name.clone(), ready_rx));
+
             let span = tracing::info_span!("agent", name = %name);
-            task_tracker.spawn(agent.listen_loop::<T>(token).instrument(span));
+            task_tracker
+                .spawn(agent.listen_loop::<T>(token, ready_tx).instrument(span));
+        }
+
+        // Wait until every listen_loop has confirmed its LIVE query is
+        // registered with the server. Without this handshake, Coalition::new
+        // could return before subscriptions exist and the first Agent::send
+        // calls would be lost.
+        for (name, rx) in ready_rxs {
+            rx.await.map_err(|_| {
+                anyhow::anyhow!("listen_loop for {} dropped before ready signal", name)
+            })?;
         }
 
         Ok(Self {
