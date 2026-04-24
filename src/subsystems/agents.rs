@@ -1,18 +1,21 @@
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+
 use anyhow::Result;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use surrealdb::Notification;
 use surrealdb_types::{Action, Datetime, RecordId, SurrealValue};
-use tokio::time::{Duration, sleep};
-use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
+use tokio::sync::RwLock;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::Instrument;
 
-use crate::message::{MESSAGE_TABLE, Message, Payload};
+use crate::message::{MESSAGE_TABLE, Message};
 use crate::subsystems::sdb;
 
 pub const AGENT_TABLE: &str = "agent";
 
 // ============================================================================
-// Agent Data Structure
+// Agent
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize, Clone, SurrealValue)]
@@ -23,6 +26,7 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Create (or reuse) an agent record in the `agent` table.
     pub async fn new(name: &str) -> Result<Self> {
         let db = sdb::SurrealDBWrapper::connection().await;
 
@@ -40,15 +44,18 @@ impl Agent {
         Ok(agent)
     }
 
-    pub async fn send(&self, to: &str, payload: Payload) -> Result<()> {
+    /// Send a typed payload to another agent by creating a RELATE edge in the
+    /// `message` table.
+    pub async fn send<T>(&self, to: &str, payload: T) -> Result<()>
+    where
+        T: SurrealValue + Send + Sync + Unpin + 'static,
+    {
         let db = sdb::SurrealDBWrapper::connection().await;
-
-        // Use RecordId directly instead of string formatting
         let from_id = self.id.clone();
         let to_id = RecordId::new(AGENT_TABLE, to);
 
-        // Create the message as a relationship using typed approach
-        let query = "RELATE $from->message->$to CONTENT { created: time::now(), payload: $payload };";
+        let query =
+            "RELATE $from->message->$to CONTENT { created: time::now(), payload: $payload };";
 
         db.query(query)
             .bind(("from", from_id))
@@ -60,123 +67,122 @@ impl Agent {
         Ok(())
     }
 
-    /// Run the agent subsystem - manages the agent and its listener
-    pub async fn run_subsystem(self, subsys: &mut SubsystemHandle) -> Result<()> {
-        let agent_name = self.name.clone();
-        tracing::info!("{} starting.", agent_name);
+    /// Listen loop — subscribes to LIVE SELECT on messages addressed to this
+    /// agent and drains the stream until `token` cancels.
+    ///
+    /// Library-side lifecycle primitive. No `SubsystemHandle`, no signal
+    /// handling. See `rust-practical:async-lifecycle` skill in rust-v2
+    /// v4.1.0.
+    async fn listen_loop<T>(self, token: CancellationToken) -> Result<()>
+    where
+        T: SurrealValue + Send + Sync + Unpin + 'static,
+    {
+        tracing::info!("listen_loop starting for {}", self.name);
+        let db = sdb::SurrealDBWrapper::connection().await;
 
-        // Start listen subsystem - it will be automatically managed by the parent
-        let listen_name = format!("{}-listen", agent_name);
-        let agent_for_listen = self.clone();
-        subsys.start(
-            SubsystemBuilder::new(listen_name, {
-                async move |subsys: &mut SubsystemHandle| {
-                    agent_listen_subsystem(agent_for_listen, subsys).await
-                }
-            }),
+        let query = format!(
+            "LIVE SELECT * FROM message WHERE out = agent:{}",
+            self.name
         );
+        let mut response = db
+            .query(&query)
+            .await
+            .map_err(|e| anyhow::anyhow!("LIVE SELECT failed: {}", e))?;
+        let mut stream = response
+            .stream::<Notification<Message<T>>>(0)
+            .map_err(|e| anyhow::anyhow!("Failed to create message stream: {}", e))?;
 
-        subsys.on_shutdown_requested().await;
-        tracing::info!("{} shutting down ...", agent_name);
-        sleep(Duration::from_millis(200)).await;
-        tracing::info!("{} stopped.", agent_name);
+        loop {
+            tokio::select! {
+                Some(result) = stream.next() => {
+                    match result {
+                        Ok(notification) => {
+                            let action = notification.action;
+                            if action == Action::Delete {
+                                continue;
+                            }
+                            let message = notification.data;
+                            tracing::info!(
+                                target = %self.name,
+                                from = ?message.r#in,
+                                "message received"
+                            );
+                        }
+                        Err(error) => tracing::error!("stream error: {}", error),
+                    }
+                }
+                _ = token.cancelled() => {
+                    tracing::info!("listen_loop for {} received shutdown", self.name);
+                    drop(stream);
+                    // Best-effort cleanup of this agent's message edges.
+                    let message_id = RecordId::new(MESSAGE_TABLE, self.name.clone());
+                    if let Err(e) = db.delete::<Option<Message<T>>>(message_id).await {
+                        tracing::warn!("failed to delete agent messages on shutdown: {}", e);
+                    }
+                    break;
+                }
+            }
+        }
         Ok(())
     }
 }
 
-/// Listen subsystem for an agent - handles incoming messages
-async fn agent_listen_subsystem(agent: Agent, subsys: &mut SubsystemHandle) -> Result<()> {
-    tracing::info!("{} listen subsystem starting.", agent.name);
-    let db = sdb::SurrealDBWrapper::connection().await;
+// ============================================================================
+// Coalition<T>
+// ============================================================================
 
-    // Create live query
-    let _agent_id = RecordId::new(AGENT_TABLE, agent.name.clone());
-    let query = format!("LIVE SELECT * FROM message WHERE out = agent:{}", agent.name);
-
-    let mut response = db
-        .query(&query)
-        .await
-        .map_err(|e| anyhow::anyhow!("LIVE SELECT failed: {}", e))?;
-
-    let mut message_stream = response
-        .stream::<Notification<Message>>(0)
-        .map_err(|e| anyhow::anyhow!("Failed to create message stream: {}", e))?;
-
-    loop {
-        tokio::select! {
-            Some(result) = message_stream.next() => {
-                match result {
-                    Ok(notification) => {
-                        let action = notification.action;
-                        let message: Message = notification.data;
-                        if action == Action::Delete {
-                            tracing::debug!("Message deleted: {:?}", message);
-                            continue;
-                        }
-
-                        match &message.payload {
-                            Payload::Text(text_payload) => {
-                                tracing::info!("{} received text message: {}", agent.name, text_payload.content);
-                            },
-                            Payload::Image(image_payload) => {
-                                tracing::info!("Image message: {}, caption: {:?}", image_payload.url, image_payload.caption);
-                            },
-                            Payload::Video(video_payload) => {
-                                tracing::info!("Video message: {}, duration: {} seconds", video_payload.url, video_payload.duration);
-                            },
-                        }
-                    }
-                    Err(error) => tracing::error!("Stream error: {}", error),
-                }
-            }
-            _ = subsys.on_shutdown_requested() => {
-                tracing::info!("Shutdown signal received, terminating listen function for agent {}", agent.name);
-
-                // Clean up: Drop the stream which will automatically cleanup the live query
-                drop(message_stream);
-
-                // Clean up: Delete agent messages
-                let message_id = RecordId::new(MESSAGE_TABLE, agent.name.clone());
-                if let Err(e) = db.delete::<Option<Message>>(message_id).await {
-                    tracing::error!("Failed to delete agent messages: {}", e);
-                }
-
-                break;
-            }
-        }
-    }
-    Ok(())
+/// A scoped group of agents all exchanging payloads of type `T`.
+///
+/// Library-first lifecycle — exposes `cancellation_token()` so callers wire
+/// their own top-level shutdown, and `shutdown().await` for the
+/// cancel-close-drain three-step. See `rust-practical:async-lifecycle` skill.
+pub struct Coalition<T: SurrealValue + Send + Sync + Unpin + 'static> {
+    agents: Arc<RwLock<HashMap<String, Agent>>>,
+    task_tracker: TaskTracker,
+    cancellation_token: CancellationToken,
+    _payload: PhantomData<T>,
 }
 
-/// Create an agents subsystem with the given agent names
-pub fn agents_subsystem_with_names(
-    names: Vec<String>,
-) -> impl FnOnce(&mut SubsystemHandle) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-    move |subsys: &mut SubsystemHandle| {
-        Box::pin(async move {
-            tracing::info!("{} starting.", subsys.name());
-            tracing::info!("Starting agent subsystems ...");
+impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
+    /// Create `N` agents and spawn their listen loops under an internal
+    /// `TaskTracker`, each with its own `child_token()`.
+    pub async fn new(names: Vec<String>) -> Result<Self> {
+        let agents = Arc::new(RwLock::new(HashMap::new()));
+        let task_tracker = TaskTracker::new();
+        let cancellation_token = CancellationToken::new();
 
-            for name in names {
-                let agent = Agent::new(&name)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to create agent '{}': {}", name, e))?;
+        for name in names {
+            let agent = Agent::new(&name).await?;
+            agents.write().await.insert(name.clone(), agent.clone());
 
-                subsys.start(
-                    SubsystemBuilder::new(name.clone(), {
-                        async move |subsys: &mut SubsystemHandle| {
-                            agent.run_subsystem(subsys).await
-                        }
-                    }),
-                );
-            }
+            let token = cancellation_token.child_token();
+            let span = tracing::info_span!("agent", name = %name);
+            task_tracker.spawn(agent.listen_loop::<T>(token).instrument(span));
+        }
 
-            subsys.on_shutdown_requested().await;
-            tracing::info!("Agents subsystem shutting down ...");
-            sleep(Duration::from_millis(200)).await;
-            tracing::info!("{} stopped.", subsys.name());
-
-            Ok(())
+        Ok(Self {
+            agents,
+            task_tracker,
+            cancellation_token,
+            _payload: PhantomData,
         })
+    }
+
+    /// Look up an agent by name for send calls.
+    pub async fn agent(&self, name: &str) -> Option<Agent> {
+        self.agents.read().await.get(name).cloned()
+    }
+
+    /// Root cancellation token — downstream binaries wire top-level shutdown
+    /// onto this.
+    pub fn cancellation_token(&self) -> &CancellationToken {
+        &self.cancellation_token
+    }
+
+    /// Three-step shutdown: cancel → close → drain.
+    pub async fn shutdown(&self) {
+        self.cancellation_token.cancel();
+        self.task_tracker.close();
+        self.task_tracker.wait().await;
     }
 }

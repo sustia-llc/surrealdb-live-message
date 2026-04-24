@@ -1,15 +1,23 @@
+use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::any;
 use surrealdb::opt::Resource;
 use surrealdb_live_message::logger;
-use surrealdb_live_message::message::{MESSAGE_TABLE, Message, Payload, TextPayload};
-use surrealdb_live_message::subsystems::agents::{AGENT_TABLE, Agent};
-use surrealdb_live_message::subsystems::{agents, sdb};
-use tokio::time::{Duration, sleep};
-use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
+use surrealdb_live_message::message::{MESSAGE_TABLE, Message};
+use surrealdb_live_message::subsystems::agents::{AGENT_TABLE, Coalition};
+use surrealdb_live_message::subsystems::sdb::{self, SurrealDBWrapper};
+use surrealdb_types::SurrealValue;
+use tokio::time::{Duration, sleep, timeout};
+use tokio_util::{sync::CancellationToken, sync::DropGuard, task::TaskTracker};
 
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
+
+/// Test payload — user-defined type, not a library concern.
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue, PartialEq)]
+struct ChatMessage {
+    content: String,
+}
 
 async fn init_db(db: &Surreal<any::Any>) {
     let _ = db.delete(Resource::from(MESSAGE_TABLE)).await;
@@ -18,115 +26,121 @@ async fn init_db(db: &Surreal<any::Any>) {
     let _ = db.create(Resource::from(AGENT_TABLE)).await;
 }
 
-async fn test_main_subsystem(s: &mut SubsystemHandle) {
-    // Start database subsystem
-    s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
+/// Library-first integration test.
+///
+/// Exercises the exact shape from `rust-practical:async-lifecycle`:
+/// - root `CancellationToken` owned by the test harness
+/// - `sdb_task` spawned with a `child_token()`
+/// - `Coalition<T>` manages its own internal TaskTracker; the test calls
+///   `coalition.shutdown().await` when assertions are done
+/// - no `tokio-graceful-shutdown`, no `Toplevel`, no `SIGINT` self-kill,
+///   no `tokio::join!` over parallel futures
+#[tokio::test]
+async fn test_agent_messaging() {
+    logger::setup();
 
-    // Wait for database to be ready
-    match tokio::time::timeout(
-        Duration::from_secs(30),
-        sdb::SurrealDBWrapper::wait_until_ready(),
-    )
-    .await
-    {
-        Ok(Ok(())) => tracing::info!("Database is ready, starting agents..."),
-        Ok(Err(e)) => panic!("Database ready signal failed: {}", e),
-        Err(_) => panic!("Timeout waiting for database to be ready"),
-    }
+    // Harness-level cancellation — one root token drives everything.
+    let harness_token = CancellationToken::new();
+    let harness_tracker = TaskTracker::new();
 
-    // Clear database and start agents subsystem
+    // Panic-safe cleanup: if any assertion below panics, Drop runs on
+    // _drop_guard which cancels the harness token, which cascades to the
+    // sdb_task via child_token() → container shutdown → docker auto_remove.
+    // Without this guard, a panic skips the explicit shutdown at the end of
+    // the test and leaves the container running for the next invocation.
+    let _drop_guard: DropGuard = harness_token.clone().drop_guard();
+
+    // 1) Spawn sdb lifecycle.
+    let sdb_token = harness_token.child_token();
+    harness_tracker.spawn(async move {
+        if let Err(e) = sdb::sdb_task(sdb_token).await {
+            tracing::error!("sdb_task failed in test: {}", e);
+        }
+    });
+
+    // 2) Wait for the DB to come up (bounded — fail fast rather than hang).
+    timeout(Duration::from_secs(30), SurrealDBWrapper::wait_until_ready())
+        .await
+        .expect("timeout waiting for sdb")
+        .expect("sdb ready signal failed");
+
     let db = sdb::SurrealDBWrapper::connection().await;
     init_db(db).await;
 
-    let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
-    s.start(SubsystemBuilder::new(
-        "agents",
-        agents::agents_subsystem_with_names(names),
-    ));
-}
+    // 3) Build the coalition. It owns its own lifecycle internally.
+    let coalition = Coalition::<ChatMessage>::new(vec![
+        AGENT_ALICE.to_string(),
+        AGENT_BOB.to_string(),
+    ])
+    .await
+    .expect("coalition creation");
 
-/// Helper function to wait for an agent to be created in the database
-async fn wait_for_agent(db: &Surreal<any::Any>, name: &str) -> Agent {
-    let timeout = tokio::time::sleep(Duration::from_secs(10));
-    tokio::select! {
-        _ = timeout => panic!("Timeout waiting for agent {}", name),
-        agent = async {
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
-            loop {
-                interval.tick().await;
-                if let Ok(Some(agent)) = db.select((AGENT_TABLE, name)).await {
-                    return agent;
-                }
-            }
-        } => agent
-    }
-}
+    // 4) Resolve handles and exchange typed messages.
+    let alice = coalition
+        .agent(AGENT_ALICE)
+        .await
+        .expect("alice in coalition");
+    let bob = coalition
+        .agent(AGENT_BOB)
+        .await
+        .expect("bob in coalition");
 
-#[tokio::test]
-async fn test_agent_messaging() {
-    use nix::sys::signal::{self, Signal};
-    use nix::unistd::Pid;
-
-    logger::setup();
-
-    tokio::join!(
-        async {
-            // Wait for the database to be ready (can be called from multiple places)
-            sdb::SurrealDBWrapper::wait_until_ready()
-                .await
-                .expect("Failed to wait for database");
-
-            // Get the database connection
-            let db = sdb::SurrealDBWrapper::connection().await;
-
-            // Wait for agents to be created in the database
-            let alice = wait_for_agent(&db, AGENT_ALICE).await;
-            let bob = wait_for_agent(&db, AGENT_BOB).await;
-
-            // Send messages
-            let text_payload = TextPayload {
+    alice
+        .send(
+            AGENT_BOB,
+            ChatMessage {
                 content: "Hello from Alice!".to_string(),
-            };
-            let payload = Payload::Text(text_payload);
-            alice
-                .send(AGENT_BOB, payload)
-                .await
-                .expect("Failed to send message");
+            },
+        )
+        .await
+        .expect("alice → bob send");
 
-            let text_payload = TextPayload {
-                content: "Hello from Bob!".to_string(),
-            };
-            let payload = Payload::Text(text_payload);
-            bob.send(AGENT_ALICE, payload)
-                .await
-                .expect("Failed to send message");
-
-            sleep(Duration::from_secs(1)).await; // Wait for messages to be processed
-
-            // Verify messages
-            let mut response = db
-                .query("SELECT * FROM message WHERE in = agent:alice")
-                .await
-                .unwrap();
-            let alice_messages: Vec<Message> = response.take(0).unwrap();
-            assert_eq!(alice_messages.len(), 1);
-
-            let mut response = db
-                .query("SELECT * FROM message WHERE in = agent:bob")
-                .await
-                .unwrap();
-            let bob_messages: Vec<Message> = response.take(0).unwrap();
-            assert_eq!(bob_messages.len(), 1);
-
-            tracing::debug!("sending SIGINT to itself.");
-            signal::kill(Pid::this(), Signal::SIGINT).unwrap();
+    bob.send(
+        AGENT_ALICE,
+        ChatMessage {
+            content: "Hello from Bob!".to_string(),
         },
-        async {
-            let result = Toplevel::new(test_main_subsystem)
-                .catch_signals()
-                .handle_shutdown_requests(Duration::from_secs(4))
-                .await;
-            assert!(result.is_ok());
-        },
+    )
+    .await
+    .expect("bob → alice send");
+
+    // Live-query delivery latency — deliberately bounded.
+    sleep(Duration::from_secs(1)).await;
+
+    // 5) Assert on the graph edges.
+    // RELATE direction: `alice -> message -> bob` creates an edge where
+    // `in = alice` and `out = bob`. So `in = agent:alice` filters for
+    // *outgoing* messages from alice (i.e., alice's sends, containing her
+    // payload). Likewise for bob.
+    let mut response = db
+        .query("SELECT * FROM message WHERE in = agent:alice")
+        .await
+        .unwrap();
+    let alice_outgoing: Vec<Message<ChatMessage>> = response.take(0).unwrap();
+    assert_eq!(alice_outgoing.len(), 1);
+    assert_eq!(
+        alice_outgoing[0].payload,
+        ChatMessage {
+            content: "Hello from Alice!".to_string(),
+        }
     );
+
+    let mut response = db
+        .query("SELECT * FROM message WHERE in = agent:bob")
+        .await
+        .unwrap();
+    let bob_outgoing: Vec<Message<ChatMessage>> = response.take(0).unwrap();
+    assert_eq!(bob_outgoing.len(), 1);
+    assert_eq!(
+        bob_outgoing[0].payload,
+        ChatMessage {
+            content: "Hello from Bob!".to_string(),
+        }
+    );
+
+    // 6) Shutdown — coalition first (agent drain), then the sdb task.
+    coalition.shutdown().await;
+    harness_token.cancel();
+    harness_tracker.close();
+    harness_tracker.wait().await;
 }

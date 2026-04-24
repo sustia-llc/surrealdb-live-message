@@ -26,6 +26,9 @@ impl SurrealDBContainer {
     pub async fn start_and_wait(&self) -> Result<()> {
         tracing::info!("Pulling Docker image...");
         self.pull_image().await?;
+        // Remove any stale container from a prior crashed run. Idempotent:
+        // silently succeeds if no container with that name exists.
+        self.remove_if_exists().await;
         tracing::info!("Creating and starting container...");
         self.create_and_start_container().await?;
         tracing::info!("Container started, waiting for health check...");
@@ -144,6 +147,27 @@ impl SurrealDBContainer {
             .start_container(&container.id, Some(start_container_options))
             .await?;
         Ok(())
+    }
+
+    /// Force-remove any container using our configured name. Called at startup
+    /// to recover from a crashed previous run whose `auto_remove` didn't fire.
+    async fn remove_if_exists(&self) {
+        let opts = bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+            .force(true)
+            .build();
+        match self
+            .docker
+            .remove_container(SETTINGS.sdb.container_name.as_str(), Some(opts))
+            .await
+        {
+            Ok(()) => tracing::info!("Removed stale container {}", SETTINGS.sdb.container_name),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // No stale container — happy path.
+            }
+            Err(e) => tracing::warn!("Stale container removal failed: {:?}", e),
+        }
     }
 
     pub async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {

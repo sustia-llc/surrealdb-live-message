@@ -1,42 +1,58 @@
 use anyhow::Result;
-use tokio::time::Duration;
-use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
+use serde::{Deserialize, Serialize};
+use surrealdb_types::SurrealValue;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use surrealdb_live_message::logger;
-use surrealdb_live_message::subsystems::{agents, sdb};
+use surrealdb_live_message::subsystems::agents::Coalition;
+use surrealdb_live_message::subsystems::sdb::{self, SurrealDBWrapper};
 
 const AGENT_BOB: &str = "bob";
 const AGENT_ALICE: &str = "alice";
 
-async fn main_subsystem(s: &mut SubsystemHandle) {
-    // Start database subsystem
-    s.start(SubsystemBuilder::new("sdb", sdb::sdb_subsystem));
-
-    // Wait for database to be ready with timeout
-    match tokio::time::timeout(
-        Duration::from_secs(30),
-        sdb::SurrealDBWrapper::wait_until_ready()
-    ).await {
-        Ok(Ok(())) => tracing::info!("Database is ready, starting agents..."),
-        Ok(Err(e)) => panic!("Database ready signal failed: {}", e),
-        Err(_) => panic!("Timeout waiting for database to be ready"),
-    }
-
-    // Start agents subsystem with single-step initialization
-    let names = vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()];
-    s.start(SubsystemBuilder::new(
-        "agents",
-        agents::agents_subsystem_with_names(names),
-    ));
+/// Example daemon payload type. The coalition is parameterised over this.
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[allow(dead_code)]
+pub struct DaemonPayload {
+    pub kind: String,
+    pub body: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     logger::setup();
 
-    Toplevel::new(main_subsystem)
-        .catch_signals()
-        .handle_shutdown_requests(Duration::from_secs(4))
-        .await
-        .map_err(Into::into)
+    // Root cancellation token — everything hangs off this.
+    let token = CancellationToken::new();
+    let tracker = TaskTracker::new();
+
+    // Spawn SurrealDB lifecycle as an independent task with a child token.
+    let sdb_token = token.child_token();
+    tracker.spawn(async move {
+        if let Err(e) = sdb::sdb_task(sdb_token).await {
+            tracing::error!("sdb_task failed: {}", e);
+        }
+    });
+
+    // Wait until the database is ready before we build the coalition.
+    SurrealDBWrapper::wait_until_ready().await?;
+
+    // Spin up the coalition. Uses its own internal TaskTracker +
+    // CancellationToken — the daemon does not need to know.
+    let coalition =
+        Coalition::<DaemonPayload>::new(vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()])
+            .await?;
+
+    // Pattern 1 from `rust-practical:async-lifecycle`: bare ctrl-c.
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("ctrl-c received, shutting down.");
+
+    // Shut the coalition first (drains agent listen loops) then the database.
+    coalition.shutdown().await;
+    token.cancel();
+    tracker.close();
+    tracker.wait().await;
+
+    tracing::info!("daemon stopped cleanly.");
+    Ok(())
 }

@@ -7,7 +7,7 @@ use surrealdb::engine::any;
 use surrealdb::opt::auth::Root;
 use tokio::sync::{OnceCell, watch};
 use tokio::time::{Duration, sleep};
-use tokio_graceful_shutdown::SubsystemHandle;
+use tokio_util::sync::CancellationToken;
 
 static DB_READY: OnceLock<watch::Sender<bool>> = OnceLock::new();
 
@@ -72,13 +72,21 @@ impl SurrealDBWrapper {
     }
 }
 
-pub async fn sdb_subsystem(subsys: &mut SubsystemHandle) -> Result<()> {
-    tracing::info!("{} subsystem starting.", subsys.name());
+/// Spawn the SurrealDB lifecycle as a library-first async task.
+///
+/// Takes a `CancellationToken` rather than a `SubsystemHandle`. Callers wire
+/// their own top-level shutdown (`tokio::signal::ctrl_c`, parent
+/// CancellationToken, test harness, etc.) and cancel the token when ready.
+///
+/// On cancel: drains for 2s to let outstanding queries complete, then stops
+/// the local container (if present).
+pub async fn sdb_task(token: CancellationToken) -> Result<()> {
+    tracing::info!("sdb task starting.");
     let container = if SETTINGS.environment == "production" {
-        tracing::info!("{} using cloud connection.", subsys.name());
+        tracing::info!("sdb using cloud connection.");
         None
     } else {
-        tracing::info!("{} using local container.", subsys.name());
+        tracing::info!("sdb using local container.");
         let container = SurrealDBContainer::new()
             .await
             .map_err(anyhow::Error::from)
@@ -96,10 +104,10 @@ pub async fn sdb_subsystem(subsys: &mut SubsystemHandle) -> Result<()> {
     // Signal database is ready
     SurrealDBWrapper::set_ready();
 
-    tracing::info!("{} ready and accepting connections.", subsys.name());
+    tracing::info!("sdb ready and accepting connections.");
 
-    subsys.on_shutdown_requested().await;
-    tracing::info!("Shutting down {} subsystem ...", subsys.name());
+    token.cancelled().await;
+    tracing::info!("sdb shutting down ...");
     sleep(Duration::from_secs(2)).await;
     if let Some(container) = container {
         container
@@ -107,6 +115,6 @@ pub async fn sdb_subsystem(subsys: &mut SubsystemHandle) -> Result<()> {
             .await
             .expect("Failed to stop SurrealDB container");
     }
-    tracing::info!("{} stopped.", subsys.name());
+    tracing::info!("sdb stopped.");
     Ok(())
 }
