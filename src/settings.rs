@@ -13,7 +13,7 @@ pub struct Logger {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Docker {
-    pub platform: String,
+    pub platform: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

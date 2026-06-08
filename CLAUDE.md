@@ -27,5 +27,5 @@ These were diagnosed fixes; tests lock them in. See docstrings in `src/message.r
 
 ## Conventions
 
-- Error handling uses **`anyhow`** (`anyhow::Result`, `anyhow::anyhow!`, `?`) — not `thiserror`. No `unwrap()` in library code; `.expect()` only at fatal startup points.
+- Library code returns a typed **`thiserror`** enum — `crate::error::Error` / `crate::error::Result`. `anyhow` is used **only** in `src/main.rs` and `tests/` (its `?` absorbs `Error` via the blanket `From`). No `unwrap()` in library code; `.expect()` only at fatal startup points (`sdb::client`, `sdb_task`).
 - Workflow: commit **direct to `main`** (no PR gate). Track TODOs in `TODO.md`.

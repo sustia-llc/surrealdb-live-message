@@ -1,5 +1,5 @@
+use crate::error::{Error, Result};
 use crate::settings::SETTINGS;
-use anyhow::Result;
 use bollard::Docker;
 use bollard::models::ContainerCreateBody;
 use bollard::models::HostConfig;
@@ -73,17 +73,19 @@ impl SurrealDBContainer {
                 tracing::info!("SurrealDB is ready and accepting connections");
                 Ok(())
             }
-            Ok(Err(_)) => Err(anyhow::anyhow!("health check failed after all attempts")),
-            Err(_) => Err(anyhow::anyhow!("timeout waiting for surrealdb to start")),
+            Ok(Err(_)) => Err(Error::HealthCheck),
+            Err(_) => Err(Error::StartupTimeout),
         }
     }
 
     async fn pull_image(&self) -> Result<()> {
-        let create_image_options = CreateImageOptionsBuilder::default()
+        let mut builder = CreateImageOptionsBuilder::default()
             .from_image(&SETTINGS.sdb.image)
-            .tag(&SETTINGS.sdb.tag)
-            .platform(&SETTINGS.docker.platform)
-            .build();
+            .tag(&SETTINGS.sdb.tag);
+        if let Some(p) = &SETTINGS.docker.platform {
+            builder = builder.platform(p);
+        }
+        let create_image_options = builder.build();
         let mut stream = self
             .docker
             .create_image(Some(create_image_options), None, None);
@@ -134,10 +136,12 @@ impl SurrealDBContainer {
             ..Default::default()
         };
 
-        let create_container_options = CreateContainerOptionsBuilder::default()
-            .name(&SETTINGS.sdb.container_name)
-            .platform(&SETTINGS.docker.platform)
-            .build();
+        let mut builder =
+            CreateContainerOptionsBuilder::default().name(&SETTINGS.sdb.container_name);
+        if let Some(p) = &SETTINGS.docker.platform {
+            builder = builder.platform(p);
+        }
+        let create_container_options = builder.build();
         let container = self
             .docker
             .create_container(Some(create_container_options), container_body)
@@ -170,7 +174,7 @@ impl SurrealDBContainer {
         }
     }
 
-    pub async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn stop(&self) -> Result<()> {
         match self
             .docker
             .stop_container(

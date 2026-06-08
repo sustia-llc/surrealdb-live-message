@@ -1,18 +1,24 @@
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
-use anyhow::Result;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use surrealdb::Notification;
 use surrealdb_types::{Action, Datetime, RecordId, SurrealValue};
 use tokio::sync::{RwLock, oneshot};
+use tokio::time::{Duration, timeout};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Instrument;
 
+use crate::error::{Error, Result};
 use crate::message::{MESSAGE_TABLE, Message};
 use crate::subsystems::sdb;
 
 pub const AGENT_TABLE: &str = "agent";
+
+/// Maximum time `Coalition::new` waits for each `listen_loop` to signal that
+/// its LIVE query is registered before giving up. Guards against a DB that
+/// stalls during LIVE registration (so the sender is neither sent nor dropped).
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // Agent
@@ -38,8 +44,13 @@ impl Agent {
                 created: Datetime::default(),
             })
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create agent: {}", e))?
-            .ok_or_else(|| anyhow::anyhow!("Failed to create agent: no data returned"))?;
+            .map_err(|source| Error::AgentCreate {
+                agent: name.to_string(),
+                source,
+            })?
+            .ok_or_else(|| Error::AgentCreateEmpty {
+                agent: name.to_string(),
+            })?;
 
         Ok(agent)
     }
@@ -62,7 +73,10 @@ impl Agent {
             .bind(("to", to_id))
             .bind(("payload", payload))
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create message relationship: {}", e))?;
+            .map_err(|source| Error::Send {
+                to: to.to_string(),
+                source,
+            })?;
 
         Ok(())
     }
@@ -95,13 +109,16 @@ impl Agent {
             "LIVE SELECT *, in, out FROM message WHERE out = agent:{}",
             self.name
         );
-        let mut response = db
-            .query(&query)
-            .await
-            .map_err(|e| anyhow::anyhow!("LIVE SELECT failed: {}", e))?;
+        let mut response = db.query(&query).await.map_err(|source| Error::LiveQuery {
+            agent: self.name.clone(),
+            source,
+        })?;
         let mut stream = response
             .stream::<Notification<Message<T>>>(0)
-            .map_err(|e| anyhow::anyhow!("Failed to create message stream: {}", e))?;
+            .map_err(|source| Error::Stream {
+                agent: self.name.clone(),
+                source,
+            })?;
 
         // Signal the caller that this agent's subscription is live. Send()
         // calls issued after Coalition::new returns are now guaranteed to
@@ -162,6 +179,10 @@ pub struct Coalition<T: SurrealValue + Send + Sync + Unpin + 'static> {
 impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// Create `N` agents and spawn their listen loops under an internal
     /// `TaskTracker`, each with its own `child_token()`.
+    ///
+    /// Waits for every `listen_loop` to confirm its LIVE query is registered
+    /// before returning. Each wait is bounded by [`READY_TIMEOUT`]; a stalled
+    /// or dropped listen loop yields an error instead of hanging.
     pub async fn new(names: Vec<String>) -> Result<Self> {
         let agents = Arc::new(RwLock::new(HashMap::new()));
         let task_tracker = TaskTracker::new();
@@ -183,11 +204,23 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         // Wait until every listen_loop has confirmed its LIVE query is
         // registered with the server. Without this handshake, Coalition::new
         // could return before subscriptions exist and the first Agent::send
-        // calls would be lost.
+        // calls would be lost. Each await is bounded by READY_TIMEOUT so an
+        // unresponsive DB stalling LIVE registration (sender neither sent nor
+        // dropped) cannot hang Coalition::new forever.
         for (name, rx) in ready_rxs {
-            rx.await.map_err(|_| {
-                anyhow::anyhow!("listen_loop for {} dropped before ready signal", name)
-            })?;
+            let err = match timeout(READY_TIMEOUT, rx).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) => Error::ListenLoopDropped { agent: name },
+                Err(_) => Error::ReadyTimeout {
+                    agent: name,
+                    timeout: READY_TIMEOUT,
+                },
+            };
+            // Handshake failed: cancel the already-spawned listen_loops so they
+            // shut down cleanly instead of running on detached (dropping the
+            // token here would NOT cancel the child tokens they hold).
+            cancellation_token.cancel();
+            return Err(err);
         }
 
         Ok(Self {

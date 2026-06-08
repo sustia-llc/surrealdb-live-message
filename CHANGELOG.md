@@ -11,6 +11,15 @@ The crate has not yet had a tagged release; everything below is pre-`0.1.0` work
 
 ### Added
 
+- Typed public error enum `crate::error::Error` (`thiserror`) replacing `anyhow`
+  in library code — callers can match on `ReadyTimeout`, `ListenLoopDropped`,
+  `AgentCreate`, `Send`, `LiveQuery`, `Schema`, etc. `anyhow` stays in the binary
+  example and tests.
+- Explicit schema defined once at connect: `agent` SCHEMAFULL; `message`
+  `TYPE RELATION IN agent OUT agent` SCHEMALESS with a typed `created` and a
+  flexible generic `payload`. Idempotent via `IF NOT EXISTS`.
+- `READY_TIMEOUT` (10s) bound on the `Coalition::new` readiness handshake; on
+  failure the root token is cancelled so spawned listen-loops don't orphan.
 - Library-first lifecycle: `Coalition<T>` exposes `cancellation_token()` and
   `shutdown().await` so downstream binaries wire their own top-level shutdown.
 - Readiness handshake in `Coalition::new` — awaits every agent's LIVE-query
@@ -23,6 +32,9 @@ The crate has not yet had a tagged release; everything below is pre-`0.1.0` work
 
 ### Changed
 
+- `docker.platform` is now `Option<String>`; unset → Docker host-native platform
+  (fixes ARM hosts). Pin via `DOCKER__PLATFORM` or config. `config/default.toml`
+  no longer hardcodes `linux/x86_64`.
 - Bumped `surrealdb`/`surrealdb-types` to 3.1.3 and `bollard` to 0.21.
 
 ### Fixed

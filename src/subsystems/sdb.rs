@@ -1,6 +1,6 @@
+use crate::error::{Error, Result};
 use crate::sdb_server::SurrealDBContainer;
 use crate::settings::SETTINGS;
-use anyhow::Result;
 use std::sync::OnceLock;
 use surrealdb::Surreal;
 use surrealdb::engine::any;
@@ -31,7 +31,7 @@ impl SurrealDBWrapper {
         let mut rx = Self::get_ready_receiver();
         rx.wait_for(|&ready| ready)
             .await
-            .map_err(|_| anyhow::anyhow!("Database ready channel closed"))?;
+            .map_err(|_| Error::ReadyChannelClosed)?;
         Ok(())
     }
 
@@ -54,11 +54,13 @@ impl SurrealDBWrapper {
     async fn client() -> Surreal<any::Any> {
         let db = any::connect(&SETTINGS.sdb.endpoint)
             .await
+            .map_err(Error::Connect)
             .expect("Failed to connect to SurrealDB via WebSocket");
 
         db.use_ns(&SETTINGS.sdb.namespace)
             .use_db(&SETTINGS.sdb.database)
             .await
+            .map_err(Error::UseNsDb)
             .expect("Failed to select namespace and database");
 
         let _ = db
@@ -67,8 +69,53 @@ impl SurrealDBWrapper {
                 password: SETTINGS.sdb.password.clone(),
             })
             .await
+            .map_err(Error::Auth)
             .expect("Failed to authenticate with SurrealDB");
+
+        // Define schema exactly once, after signin and before any agent/message
+        // ops. Every caller reaches the database through `connection()`, which
+        // runs `client()` exactly once via its `OnceCell`, so this also runs
+        // exactly once. `IF NOT EXISTS` on every statement keeps repeated
+        // startups (e.g. reconnects against a persistent store) idempotent.
+        Self::define_schema(&db)
+            .await
+            .expect("Failed to define SurrealDB schema");
+
         db
+    }
+
+    /// Define the `agent` and `message` schema idempotently.
+    ///
+    /// `agent` is SCHEMAFULL: it only ever holds `name`/`created`, so locking
+    /// the shape catches typos and stray fields.
+    ///
+    /// `message` is a graph edge (`TYPE RELATION IN agent OUT agent`) and is
+    /// deliberately **SCHEMALESS**. The endpoint constraint is enforced by the
+    /// table type regardless of schema mode, and we type `created`, but the
+    /// `payload` field is generic over the caller's `T` (each `Coalition<T>`
+    /// uses a different payload). SCHEMALESS lets any `payload` shape round-trip
+    /// untouched. SCHEMAFULL was rejected here: a generic payload would require
+    /// `FLEXIBLE`, which in 3.1.3 is restricted to types containing `object`
+    /// (`FLEXIBLE TYPE any` errors), and an un-flexible `TYPE any` adds no value
+    /// while risking dropped fields. SCHEMALESS enforces the endpoints + typed
+    /// `created` without ever constraining `payload`.
+    async fn define_schema(db: &Surreal<any::Any>) -> Result<()> {
+        let schema = "
+            DEFINE TABLE IF NOT EXISTS agent SCHEMAFULL;
+            DEFINE FIELD IF NOT EXISTS name ON agent TYPE string;
+            DEFINE FIELD IF NOT EXISTS created ON agent TYPE datetime;
+
+            DEFINE TABLE IF NOT EXISTS message TYPE RELATION IN agent OUT agent SCHEMALESS;
+            DEFINE FIELD IF NOT EXISTS created ON message TYPE datetime;
+        ";
+
+        db.query(schema)
+            .await
+            .map_err(Error::Schema)?
+            .check()
+            .map_err(Error::Schema)?;
+
+        Ok(())
     }
 }
 

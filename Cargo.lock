@@ -4497,6 +4497,7 @@ dependencies = [
  "serde_json",
  "surrealdb",
  "surrealdb-types",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",

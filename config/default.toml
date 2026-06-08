@@ -4,7 +4,9 @@ environment = "development"
 level = "info"
 
 [docker]
-platform = "linux/x86_64"
+# platform is unset — Docker uses the host's native platform.
+# To pin a specific platform set DOCKER__PLATFORM env var or add:
+#   platform = "linux/amd64"
 
 [sdb]
 host = "127.0.0.1"
