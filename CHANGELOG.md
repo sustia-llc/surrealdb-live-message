@@ -11,6 +11,10 @@ The crate has not yet had a tagged release; everything below is pre-`0.1.0` work
 
 ### Added
 
+- Two production top-level-shutdown examples: `examples/production_shutdown.rs`
+  (hand-rolled `tokio::signal::unix` SIGINT+SIGTERM, startup-race supervision,
+  timeout-bounded drain) and `examples/graceful_shutdown.rs`
+  (`tokio-graceful-shutdown` framework wrap, dev-dependency only).
 - Typed public error enum `crate::error::Error` (`thiserror`) replacing `anyhow`
   in library code — callers can match on `ReadyTimeout`, `ListenLoopDropped`,
   `AgentCreate`, `Send`, `LiveQuery`, `Schema`, etc. `anyhow` stays in the binary

@@ -81,6 +81,28 @@ RELATE agent:alice->message->agent:bob
 SELECT *, in, out FROM message;
 ```
 
+## Examples
+
+`cargo run` (above) is the minimal demo — bare `ctrl_c`. For production-grade
+top-level cancellation, two runnable examples drive the library's
+`CancellationToken` + `TaskTracker` surface. Both handle **SIGINT *and*
+SIGTERM** (the signal `docker stop`/Kubernetes/systemd send), race DB readiness
+against a startup failure/timeout so they can't hang, and bound the graceful
+drain so they can't block forever — draining the coalition before stopping the
+database container.
+
+```sh
+# Hand-rolled tokio driver — zero extra dependencies.
+cargo run --example production_shutdown
+
+# Same guarantees via the tokio-graceful-shutdown framework (dev-dependency,
+# binary-only — never pulled into the library).
+cargo run --example graceful_shutdown
+```
+
+Stop either with `Ctrl-C` or `kill -TERM <pid>`; both teardown cleanly and
+remove the SurrealDB container. (Docker required.)
+
 ## Patterns Demonstrated
 
 This repo is the reference implementation for three transferable patterns, each documented in a corresponding cc-polymath skill:
