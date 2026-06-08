@@ -9,22 +9,22 @@ edition = "2024"
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
-surrealdb = { version = "3.1.2", features = ["kv-mem"] }
-surrealdb-types = "3.1.2"
+surrealdb = { version = "3.1.3", features = ["kv-mem"] }
+surrealdb-types = "3.1.3"
 futures = "0.3"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = "1.0"
 anyhow = "1.0"
 tracing = "0.1.4"
 tracing-subscriber = "0.3"
 config = "0.15"
-bollard = "0.20"
+bollard = "0.21"
 reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "gzip",
 ] }
 
 [dev-dependencies]
-futures = "0.3.31"
+futures = "0.3"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = "1.0"
