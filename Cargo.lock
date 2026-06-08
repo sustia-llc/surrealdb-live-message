@@ -514,6 +514,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
 
 [[package]]
+name = "branches"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f11502672c5570f77f6bdf573332483f8475bab6a7fda00f1fae8ddb5a6245c0"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -575,6 +584,12 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "cacheguard"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2dbbe48daefc2575b7dfdc8227f4724582080ae48b0482191f6eb91e4cd2f405"
 
 [[package]]
 name = "castaway"
@@ -2316,6 +2331,17 @@ dependencies = [
  "signature",
  "simple_asn1",
  "zeroize",
+]
+
+[[package]]
+name = "kanal"
+version = "0.2.0-beta1"
+source = "git+https://github.com/fereidani/kanal?rev=9a4b98d570258410fa07c5329e3c4499533b1e92#9a4b98d570258410fa07c5329e3c4499533b1e92"
+dependencies = [
+ "branches",
+ "cacheguard",
+ "futures-core",
+ "lock_api",
 ]
 
 [[package]]
@@ -4523,6 +4549,7 @@ dependencies = [
  "bollard",
  "config",
  "futures",
+ "kanal",
  "reqwest",
  "serde",
  "serde_json",

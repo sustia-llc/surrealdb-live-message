@@ -145,6 +145,17 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to build coalition")?;
 
+    // Untracked best-effort inbox drainer — consumes the delivery bus and logs
+    // each delivery. Stops on its own when the bus closes (all agents shut down
+    // → recv returns Err).
+    let inbox = coalition.inbox();
+    tokio::spawn(async move {
+        // Ends when the bus closes (all agents shut down → recv returns Err).
+        while let Ok(d) = inbox.recv().await {
+            tracing::info!(recipient = %d.recipient, payload = ?d.message.payload, "delivered");
+        }
+    });
+
     // Optional: have alice send one message to bob so the run does something
     // visible in the logs even on an immediate Ctrl-C.
     if let Some(alice) = coalition.agent("alice").await {

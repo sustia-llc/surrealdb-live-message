@@ -4,10 +4,10 @@ use surrealdb::engine::any;
 use surrealdb::opt::Resource;
 use surrealdb_live_message::logger;
 use surrealdb_live_message::message::{MESSAGE_TABLE, Message};
-use surrealdb_live_message::subsystems::agents::{AGENT_TABLE, Coalition};
+use surrealdb_live_message::subsystems::agents::{AGENT_TABLE, Coalition, Delivery};
 use surrealdb_live_message::subsystems::sdb::{self, SurrealDBWrapper};
 use surrealdb_types::{RecordId, SurrealValue};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, timeout};
 use tokio_util::{sync::CancellationToken, sync::DropGuard, task::TaskTracker};
 
 const AGENT_BOB: &str = "bob";
@@ -83,6 +83,10 @@ async fn test_agent_messaging() {
         .expect("alice in coalition");
     let bob = coalition.agent(AGENT_BOB).await.expect("bob in coalition");
 
+    // Grab a receiver on the delivery bus BEFORE sending so no delivery is
+    // missed.
+    let inbox = coalition.inbox();
+
     alice
         .send(
             AGENT_BOB,
@@ -102,8 +106,40 @@ async fn test_agent_messaging() {
     .await
     .expect("bob → alice send");
 
-    // Live-query delivery latency — deliberately bounded.
-    sleep(Duration::from_secs(1)).await;
+    // Drain exactly 2 deliveries off the shared MPMC bus, keyed by recipient.
+    // Each recv is bounded by a timeout so a missed delivery fails fast rather
+    // than hanging the test.
+    let mut deliveries: std::collections::HashMap<String, Delivery<ChatMessage>> =
+        std::collections::HashMap::new();
+    for _ in 0..2 {
+        let d = timeout(Duration::from_secs(5), inbox.recv())
+            .await
+            .expect("inbox delivery timed out")
+            .expect("inbox bus closed unexpectedly");
+        deliveries.insert(d.recipient.clone(), d);
+    }
+    let to_bob = deliveries.get(AGENT_BOB).expect("delivery to bob");
+    assert_eq!(
+        to_bob.message.payload,
+        ChatMessage {
+            content: "Hello from Alice!".to_string()
+        }
+    );
+    assert_eq!(
+        to_bob.message.r#in,
+        Some(RecordId::new(AGENT_TABLE, AGENT_ALICE))
+    );
+    let to_alice = deliveries.get(AGENT_ALICE).expect("delivery to alice");
+    assert_eq!(
+        to_alice.message.payload,
+        ChatMessage {
+            content: "Hello from Bob!".to_string()
+        }
+    );
+    assert_eq!(
+        to_alice.message.r#in,
+        Some(RecordId::new(AGENT_TABLE, AGENT_BOB))
+    );
 
     // 5) Assert on the graph edges.
     // RELATE direction: `alice -> message -> bob` creates an edge where

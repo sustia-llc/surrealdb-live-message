@@ -1,6 +1,7 @@
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 use futures::StreamExt;
+use kanal::{AsyncReceiver, AsyncSender};
 use serde::{Deserialize, Serialize};
 use surrealdb::Notification;
 use surrealdb_types::{Action, Datetime, RecordId, SurrealValue};
@@ -19,6 +20,19 @@ pub const AGENT_TABLE: &str = "agent";
 /// its LIVE query is registered before giving up. Guards against a DB that
 /// stalls during LIVE registration (so the sender is neither sent nor dropped).
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Capacity of the shared MPMC delivery bus connecting agent listen loops to
+/// downstream consumers via [`Coalition::inbox`].
+const INBOX_CAPACITY: usize = 256;
+
+/// An inbound message delivered to an agent's listen loop, forwarded onto the
+/// coalition's shared kanal bus. `recipient` is the agent that received it;
+/// `message.r#in` is the sender.
+#[derive(Debug)]
+pub struct Delivery<T: SurrealValue> {
+    pub recipient: String,
+    pub message: Message<T>,
+}
 
 // ============================================================================
 // Agent
@@ -96,6 +110,7 @@ impl Agent {
         self,
         token: CancellationToken,
         ready_tx: oneshot::Sender<()>,
+        inbox_tx: AsyncSender<Delivery<T>>,
     ) -> Result<()>
     where
         T: SurrealValue + Send + Sync + Unpin + 'static,
@@ -140,6 +155,12 @@ impl Agent {
                                 from = ?message.r#in,
                                 "message received"
                             );
+                            if let Err(e) = inbox_tx
+                                .send(Delivery { recipient: self.name.clone(), message })
+                                .await
+                            {
+                                tracing::debug!("inbox bus closed for {}: {}", self.name, e);
+                            }
                         }
                         Err(error) => tracing::error!("stream error: {}", error),
                     }
@@ -173,6 +194,7 @@ pub struct Coalition<T: SurrealValue + Send + Sync + Unpin + 'static> {
     agents: Arc<RwLock<HashMap<String, Agent>>>,
     task_tracker: TaskTracker,
     cancellation_token: CancellationToken,
+    inbox: AsyncReceiver<Delivery<T>>,
     _payload: PhantomData<T>,
 }
 
@@ -188,6 +210,12 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         let task_tracker = TaskTracker::new();
         let cancellation_token = CancellationToken::new();
 
+        // Shared MPMC delivery bus. Each agent's listen_loop holds a clone of
+        // the sender; the receiver lives on the Coalition and is handed out via
+        // inbox(). Dropping our own sender below leaves only agent-held senders,
+        // so the bus closes once all agents shut down.
+        let (inbox_tx, inbox_rx) = kanal::bounded_async::<Delivery<T>>(INBOX_CAPACITY);
+
         let mut ready_rxs = Vec::with_capacity(names.len());
         for name in names {
             let agent = Agent::new(&name).await?;
@@ -198,8 +226,16 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
             ready_rxs.push((name.clone(), ready_rx));
 
             let span = tracing::info_span!("agent", name = %name);
-            task_tracker.spawn(agent.listen_loop::<T>(token, ready_tx).instrument(span));
+            task_tracker.spawn(
+                agent
+                    .listen_loop::<T>(token, ready_tx, inbox_tx.clone())
+                    .instrument(span),
+            );
         }
+
+        // Drop our sender so only agent-held senders remain; the bus then closes
+        // (recv returns Err) once every agent's listen_loop has shut down.
+        drop(inbox_tx);
 
         // Wait until every listen_loop has confirmed its LIVE query is
         // registered with the server. Without this handshake, Coalition::new
@@ -227,6 +263,7 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
             agents,
             task_tracker,
             cancellation_token,
+            inbox: inbox_rx,
             _payload: PhantomData,
         })
     }
@@ -240,6 +277,13 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// onto this.
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
+    }
+
+    /// A receiver on the shared MPMC delivery bus. Clone freely — multiple
+    /// workers can pull concurrently (kanal MPMC). `recv()` returns `Err` once
+    /// all agents have shut down and the bus closes.
+    pub fn inbox(&self) -> AsyncReceiver<Delivery<T>> {
+        self.inbox.clone()
     }
 
     /// Three-step shutdown: cancel → close → drain.

@@ -11,6 +11,12 @@ The crate has not yet had a tagged release; everything below is pre-`0.1.0` work
 
 ### Added
 
+- Message-delivery bus: agent `listen_loop`s forward each received message onto
+  a shared kanal MPMC channel as `Delivery<T> { recipient, message }`. Consume
+  via `coalition.inbox()` (clone for multiple workers; bridge sync/async with
+  kanal's `as_sync`/`as_async`). Bus closes when all agents shut down. The
+  integration test now asserts the **delivery path** (notification reaching the
+  agent), not just the written graph edges.
 - Two production top-level-shutdown examples: `examples/production_shutdown.rs`
   (hand-rolled `tokio::signal::unix` SIGINT+SIGTERM, startup-race supervision,
   timeout-bounded drain) and `examples/graceful_shutdown.rs`
