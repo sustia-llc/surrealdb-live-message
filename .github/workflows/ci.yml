@@ -14,7 +14,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Honors rust-toolchain.toml (channel 1.96.0 + rustfmt + clippy).
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -29,7 +29,7 @@ jobs:
     # ubuntu-latest runners ship a running Docker daemon; the integration test
     # pulls surrealdb/surrealdb:v3.1.2 and manages its own container via bollard.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
