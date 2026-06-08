@@ -177,8 +177,7 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
             ready_rxs.push((name.clone(), ready_rx));
 
             let span = tracing::info_span!("agent", name = %name);
-            task_tracker
-                .spawn(agent.listen_loop::<T>(token, ready_tx).instrument(span));
+            task_tracker.spawn(agent.listen_loop::<T>(token, ready_tx).instrument(span));
         }
 
         // Wait until every listen_loop has confirmed its LIVE query is

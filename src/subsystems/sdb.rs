@@ -89,7 +89,6 @@ pub async fn sdb_task(token: CancellationToken) -> Result<()> {
         tracing::info!("sdb using local container.");
         let container = SurrealDBContainer::new()
             .await
-            .map_err(anyhow::Error::from)
             .expect("Failed to create SurrealDB container");
         container
             .start_and_wait()

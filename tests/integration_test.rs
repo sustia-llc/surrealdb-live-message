@@ -59,31 +59,29 @@ async fn test_agent_messaging() {
     });
 
     // 2) Wait for the DB to come up (bounded — fail fast rather than hang).
-    timeout(Duration::from_secs(30), SurrealDBWrapper::wait_until_ready())
-        .await
-        .expect("timeout waiting for sdb")
-        .expect("sdb ready signal failed");
+    timeout(
+        Duration::from_secs(30),
+        SurrealDBWrapper::wait_until_ready(),
+    )
+    .await
+    .expect("timeout waiting for sdb")
+    .expect("sdb ready signal failed");
 
     let db = sdb::SurrealDBWrapper::connection().await;
     init_db(db).await;
 
     // 3) Build the coalition. It owns its own lifecycle internally.
-    let coalition = Coalition::<ChatMessage>::new(vec![
-        AGENT_ALICE.to_string(),
-        AGENT_BOB.to_string(),
-    ])
-    .await
-    .expect("coalition creation");
+    let coalition =
+        Coalition::<ChatMessage>::new(vec![AGENT_ALICE.to_string(), AGENT_BOB.to_string()])
+            .await
+            .expect("coalition creation");
 
     // 4) Resolve handles and exchange typed messages.
     let alice = coalition
         .agent(AGENT_ALICE)
         .await
         .expect("alice in coalition");
-    let bob = coalition
-        .agent(AGENT_BOB)
-        .await
-        .expect("bob in coalition");
+    let bob = coalition.agent(AGENT_BOB).await.expect("bob in coalition");
 
     alice
         .send(
