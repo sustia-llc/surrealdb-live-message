@@ -23,7 +23,8 @@ These were diagnosed fixes; tests lock them in. See docstrings in `src/message.r
 ## Lifecycle / shutdown contract
 
 - The library **never self-cancels**. `Coalition` owns a root `CancellationToken`, spawns listen-loops on `child_token()`, and exposes `cancellation_token()` + `shutdown().await`. Callers wire top-level shutdown (e.g. bare `tokio::signal::ctrl_c`) outside the library. Don't add signal handling or `tokio-graceful-shutdown` inside the lib.
-- `Coalition::new` performs a **readiness handshake**: it awaits every listen-loop's LIVE-query registration before returning, so the first `Agent::send` is guaranteed observed. A listen-loop panicking before it signals ready would hang `new` — preserve the ready-signal path.
+- `Coalition::new` performs a **readiness handshake**: it awaits every listen-loop's LIVE-query registration (bounded by `READY_TIMEOUT`, cancels the root token on failure) before returning, so the first `Agent::send` is guaranteed observed. Preserve the ready-signal path.
+- **Production top-level shutdown** lives in `examples/` (not `main.rs`, which is the minimal `ctrl_c` demo). Three requirements bare `ctrl_c` misses: handle **SIGTERM** (not just SIGINT), race startup readiness against sdb-task failure + a timeout (else `wait_until_ready` hangs), and bound the drain — **order: `coalition.shutdown()` first, then cancel the sdb token** (agents delete edges while the DB is still up). `examples/production_shutdown.rs` = hand-rolled (zero-dep, single subsystem); `examples/graceful_shutdown.rs` = `tokio-graceful-shutdown` (multi-subsystem supervision + failure propagation). Coalition's token is independent of the daemon root, so `coalition.shutdown()` must be called explicitly.
 
 ## Conventions
 
