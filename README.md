@@ -83,25 +83,51 @@ SELECT *, in, out FROM message;
 
 ## Examples
 
-`cargo run` (above) is the minimal demo — bare `ctrl_c`. For production-grade
-top-level cancellation, two runnable examples drive the library's
-`CancellationToken` + `TaskTracker` surface. Both handle **SIGINT *and*
-SIGTERM** (the signal `docker stop`/Kubernetes/systemd send), race DB readiness
-against a startup failure/timeout so they can't hang, and bound the graceful
-drain so they can't block forever — draining the coalition before stopping the
-database container.
+`cargo run` (above) is the minimal demo — bare `ctrl_c`. Six runnable examples
+live in `examples/` (each needs Docker; each spins up and tears down its own
+SurrealDB container).
+
+### Messaging
+
+These exercise the `Coalition<T>` / `inbox()` surface and self-terminate — run
+each to completion:
 
 ```sh
-# Hand-rolled tokio driver — zero extra dependencies.
+# Request/response round-trip: alice → bob → alice, both legs observed off
+# inbox(). The sender name rides in the payload so the recipient can reply
+# without parsing the edge's `in` RecordId.
+cargo run --example messaging
+
+# N-agent fan-out: hub broadcasts to four workers; the consumer asserts each
+# recipient received exactly once (kanal MPMC under N producers).
+cargo run --example fanout
+
+# MPMC worker pool: M async workers clone inbox() and compete for a burst,
+# plus a blocking handler bridged via inbox().to_sync() on spawn_blocking.
+cargo run --example worker_pool
+```
+
+### Lifecycle / shutdown
+
+Three examples drive the library's `CancellationToken` + `TaskTracker` surface
+for production-grade top-level cancellation. All handle **SIGINT *and*
+SIGTERM** (the signal `docker stop`/Kubernetes/systemd send), and drain the
+coalition before stopping the database container. Stop each with `Ctrl-C` or
+`kill -TERM <pid>`.
+
+```sh
+# Hand-rolled tokio driver — zero extra dependencies. Races DB readiness
+# against startup failure/timeout and bounds the drain so it can't hang.
 cargo run --example production_shutdown
 
 # Same guarantees via the tokio-graceful-shutdown framework (dev-dependency,
 # binary-only — never pulled into the library).
 cargo run --example graceful_shutdown
-```
 
-Stop either with `Ctrl-C` or `kill -TERM <pid>`; both teardown cleanly and
-remove the SurrealDB container. (Docker required.)
+# Pattern 2: drive coalition.shutdown() from a parent CancellationToken; the
+# sdb token is kept independent so the DB outlives the coalition drain.
+cargo run --example parent_token
+```
 
 ## Patterns Demonstrated
 
@@ -110,7 +136,7 @@ This repo is the reference implementation for three transferable patterns, each 
 - **Library-first async lifecycle** (`rust-v2:async-lifecycle`) — expose `CancellationToken` + `TaskTracker`, not `SubsystemHandle`; let callers wire their top-level shutdown. Readiness handshake in `Coalition::new` for subscription-registering spawns. `DropGuard` in the integration test for panic-safe container teardown.
 - **`#[surreal(rename)]` for raw-identifier fields** (`surrealdb:repository-patterns`) — the `SurrealValue` derive ignores `#[serde(rename)]`. Fields like `r#in` must carry `#[surreal(rename = "in")]` or round-trip as `None`.
 - **Explicit edge-pointer projection in LIVE SELECT** (`surrealdb:live-queries`) — `LIVE SELECT *` on `RELATE`-created edges omits `in`/`out` from notifications. Must be `LIVE SELECT *, in, out FROM message WHERE ...`.
-- **Sync/async delivery bus** — each agent forwards received live-query messages onto a shared [kanal](https://github.com/fereidani/kanal) MPMC channel as `Delivery<T> { recipient, message }`. Consume with `coalition.inbox()`; clone for multiple workers, or bridge to a synchronous agent handler via kanal's `as_sync()`. This is the seam a framework hangs agent logic off of.
+- **Sync/async delivery bus** — each agent forwards received live-query messages onto a shared [kanal](https://github.com/fereidani/kanal) MPMC channel as `Delivery<T> { recipient, message }`. Consume with `coalition.inbox()`; clone for multiple workers, or bridge to a synchronous agent handler via kanal's `to_sync()` / `as_sync()` (see `examples/worker_pool.rs`). This is the seam a framework hangs agent logic off of.
 
 ## Documentation
 
