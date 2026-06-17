@@ -11,6 +11,23 @@ The crate has not yet had a tagged release; everything below is pre-`0.1.0` work
 
 ### Added
 
+- Four runnable messaging examples covering the `Coalition<T>` / `inbox()`
+  surface: `examples/messaging.rs` (request/response round-trip),
+  `examples/fanout.rs` (N-agent broadcast, each delivery once),
+  `examples/worker_pool.rs` (M async `inbox()` clones competing + a sync handler
+  bridged via `inbox().to_sync()`), and `examples/parent_token.rs` (drive
+  `coalition.shutdown()` from a parent `CancellationToken`).
+- `Coalition::new_with_ready_timeout(names, Duration)` — caller-chosen
+  readiness-handshake timeout; `new` delegates with the default `READY_TIMEOUT`.
+  Makes the `ReadyTimeout` path deterministically testable.
+- `Agent::new` validates agent names (non-empty, ASCII alphanumeric or
+  underscore) → `Error::InvalidAgentName`, rejecting malformed names before any
+  DB work.
+- `Error::UnknownRecipient` and `Error::InvalidAgentName` variants.
+- Expanded integration coverage (consolidated into the single-container test):
+  unknown-recipient rejection, schema enforcement (non-`agent` endpoint /
+  non-datetime `created`), handshake-race delivery, N-agent fan-out, bus
+  backpressure + close semantics, `ReadyTimeout`, and `InvalidAgentName`.
 - Message-delivery bus: agent `listen_loop`s forward each received message onto
   a shared kanal MPMC channel as `Delivery<T> { recipient, message }`. Consume
   via `coalition.inbox()` (clone for multiple workers; bridge sync/async with
@@ -42,10 +59,20 @@ The crate has not yet had a tagged release; everything below is pre-`0.1.0` work
 
 ### Changed
 
+- `Agent::send` now rejects a recipient with no `agent` record
+  (`Error::UnknownRecipient`) instead of creating a `RELATE` edge with a dangling
+  `out` pointer. Adds one existence-check round-trip per send.
 - `docker.platform` is now `Option<String>`; unset → Docker host-native platform
   (fixes ARM hosts). Pin via `DOCKER__PLATFORM` or config. `config/default.toml`
   no longer hardcodes `linux/x86_64`.
 - Bumped `surrealdb`/`surrealdb-types` to 3.1.3 and `bollard` to 0.21.
+
+### Security
+
+- `Agent::listen_loop` binds the agent name as a `$owner` query parameter rather
+  than string-interpolating `agent:{name}` into the LIVE SELECT, closing a
+  query-injection seam. Combined with `Agent::new` name validation, malformed or
+  hostile names can no longer reach the query string.
 
 ### Fixed
 

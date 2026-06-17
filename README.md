@@ -132,12 +132,13 @@ cargo run --example parent_token
 
 ## Patterns Demonstrated
 
-This repo is the reference implementation for three transferable patterns, each documented in a corresponding cc-polymath skill:
+This repo is the reference implementation for several transferable patterns, each documented in a corresponding cc-polymath skill:
 
 - **Library-first async lifecycle** (`rust-v2:async-lifecycle`) — expose `CancellationToken` + `TaskTracker`, not `SubsystemHandle`; let callers wire their top-level shutdown. Readiness handshake in `Coalition::new` for subscription-registering spawns. `DropGuard` in the integration test for panic-safe container teardown.
 - **`#[surreal(rename)]` for raw-identifier fields** (`surrealdb:repository-patterns`) — the `SurrealValue` derive ignores `#[serde(rename)]`. Fields like `r#in` must carry `#[surreal(rename = "in")]` or round-trip as `None`.
 - **Explicit edge-pointer projection in LIVE SELECT** (`surrealdb:live-queries`) — `LIVE SELECT *` on `RELATE`-created edges omits `in`/`out` from notifications. Must be `LIVE SELECT *, in, out FROM message WHERE ...`.
 - **Sync/async delivery bus** — each agent forwards received live-query messages onto a shared [kanal](https://github.com/fereidani/kanal) MPMC channel as `Delivery<T> { recipient, message }`. Consume with `coalition.inbox()`; clone for multiple workers, or bridge to a synchronous agent handler via kanal's `to_sync()` / `as_sync()` (see `examples/worker_pool.rs`). This is the seam a framework hangs agent logic off of.
+- **Validate at the boundary, parameterize at the query** (`surrealdb:graph-operations`) — agent names are validated in `Agent::new` (`InvalidAgentName`) and bound into the LIVE query as `$owner` rather than interpolated, so a name can never alter the SQL. `Agent::send` checks the recipient exists (`UnknownRecipient`) instead of writing a dangling edge.
 
 ## Documentation
 
