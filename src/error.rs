@@ -33,12 +33,21 @@ pub enum Error {
     #[error("creating agent '{agent}' returned no record")]
     AgentCreateEmpty { agent: String },
 
+    #[error(
+        "invalid agent name '{name}': must be a non-empty record-id key \
+         (ASCII alphanumeric or underscore)"
+    )]
+    InvalidAgentName { name: String },
+
     #[error("failed to send message to '{to}'")]
     Send {
         to: String,
         #[source]
         source: surrealdb::Error,
     },
+
+    #[error("recipient agent '{to}' does not exist")]
+    UnknownRecipient { to: String },
 
     #[error("LIVE SELECT registration failed for agent '{agent}'")]
     LiveQuery {

@@ -7,8 +7,9 @@ As of the 2026-04 library-first refactor, the library exposes a `Coalition<T: Su
 ## Architecture
 
 - **`Message<T: SurrealValue>`** — payload-generic edge record. `T` is the caller's typed payload.
-- **`Agent::send<T>(to, payload)`** — issues a typed `RELATE $from -> message -> $to CONTENT { ... }`.
-- **`Agent::listen_loop<T>(token, ready_tx)`** — `LIVE SELECT *, in, out FROM message WHERE out = agent:{name}`, drives `Notification<Message<T>>` until `token.cancelled()`.
+- **`Agent::new(name)`** — validates `name` (non-empty, ASCII alphanumeric or `_`; rejects with `Error::InvalidAgentName`) before creating the `agent` record.
+- **`Agent::send<T>(to, payload)`** — issues a typed `RELATE $from -> message -> $to CONTENT { ... }`. Rejects unknown recipients (`Error::UnknownRecipient`) instead of creating a dangling `out` edge.
+- **`Agent::listen_loop<T>(token, ready_tx)`** — `LIVE SELECT *, in, out FROM message WHERE out = $owner` (owner bound as a parameter, never string-interpolated), drives `Notification<Message<T>>` until `token.cancelled()`.
 - **`Coalition<T>`** — registry + `TaskTracker` + root `CancellationToken` + per-spawn `child_token()`. `new()` performs a oneshot readiness handshake with every listen loop before returning, so the first `Agent::send` after `Coalition::new()` is guaranteed to be observed.
 - **`sdb_task(token)`** — SurrealDB container/connection lifecycle as a plain async task.
 

@@ -206,7 +206,7 @@ async fn test_agent_messaging() {
     scenario_handshake_race().await;
     scenario_fanout().await;
     scenario_backpressure().await;
-    scenario_listen_loop_dropped().await;
+    scenario_invalid_agent_name().await;
     scenario_ready_timeout().await;
     scenario_bus_close().await;
 
@@ -217,12 +217,11 @@ async fn test_agent_messaging() {
     harness_tracker.wait().await;
 }
 
-/// **Send to unknown agent.** `Agent::send` to a name with no `agent` record
-/// currently *succeeds*: the `RELATE` creates an edge whose `out` dangles at a
-/// non-existent agent, and no `agent` record is auto-created. This locks in the
-/// documented current behavior (see `TODO.md` — whether to reject is open).
+/// **Send to unknown agent is rejected.** `Agent::send` to a name with no
+/// `agent` record returns [`Error::UnknownRecipient`] and creates no edge,
+/// rather than a `RELATE` with a dangling `out`.
 async fn scenario_unknown_agent(db: &Surreal<any::Any>, alice: &Agent) {
-    alice
+    match alice
         .send(
             "ghost",
             ChatMessage {
@@ -230,26 +229,23 @@ async fn scenario_unknown_agent(db: &Surreal<any::Any>, alice: &Agent) {
             },
         )
         .await
-        .expect("send to unknown agent currently succeeds");
+    {
+        Ok(()) => panic!("send to an unknown agent must be rejected"),
+        Err(e) => assert!(
+            matches!(e, Error::UnknownRecipient { .. }),
+            "expected UnknownRecipient, got {e:?}"
+        ),
+    }
 
-    // The dangling edge exists, pointing `out` at the non-existent agent.
+    // No edge was created.
     let mut resp = db
         .query("SELECT *, in, out FROM message WHERE in = agent:alice AND out = agent:ghost")
         .await
         .unwrap();
     let edges: Vec<Message<ChatMessage>> = resp.take(0).unwrap();
-    assert_eq!(edges.len(), 1, "dangling edge to unknown agent should exist");
-    assert_eq!(edges[0].out, Some(RecordId::new(AGENT_TABLE, "ghost")));
-
-    // No `agent` record was auto-created for the unknown recipient.
-    let mut resp = db
-        .query("SELECT VALUE id FROM agent WHERE id = agent:ghost")
-        .await
-        .unwrap();
-    let ids: Vec<RecordId> = resp.take(0).unwrap();
     assert!(
-        ids.is_empty(),
-        "no agent record should be created for an unknown recipient"
+        edges.is_empty(),
+        "no edge should be created for a rejected send"
     );
 }
 
@@ -428,17 +424,19 @@ async fn scenario_ready_timeout() {
     }
 }
 
-/// **Typed-error path: `ListenLoopDropped`.** A name that the typed `RecordId`
-/// API stores fine but that breaks the interpolated `LIVE SELECT` (a space ⇒
-/// `agent:ghost rider` is a parse error). The listen loop errors *before*
-/// signalling ready, dropping its ready sender, which `Coalition::new` surfaces
-/// as `ListenLoopDropped` rather than hanging until `ReadyTimeout`.
-async fn scenario_listen_loop_dropped() {
+/// **Invalid agent name is rejected.** `Agent::new` (via `Coalition::new`)
+/// validates names up front, so a name that isn't a safe record-id key (a space
+/// here) fails with [`Error::InvalidAgentName`] before any DB work.
+///
+/// (This guard plus the parameter-bound LIVE query is why `ListenLoopDropped`
+/// no longer has a cheap trigger — like `AgentCreateEmpty`, it is now only
+/// reachable via fault injection.)
+async fn scenario_invalid_agent_name() {
     match Coalition::<ChatMessage>::new(vec!["ghost rider".to_string()]).await {
-        Ok(_) => panic!("a malformed agent name should fail coalition startup"),
+        Ok(_) => panic!("a malformed agent name should be rejected"),
         Err(e) => assert!(
-            matches!(e, Error::ListenLoopDropped { .. }),
-            "expected ListenLoopDropped, got {e:?}"
+            matches!(e, Error::InvalidAgentName { .. }),
+            "expected InvalidAgentName, got {e:?}"
         ),
     }
 }

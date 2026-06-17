@@ -47,7 +47,19 @@ pub struct Agent {
 
 impl Agent {
     /// Create (or reuse) an agent record in the `agent` table.
+    ///
+    /// Validates `name` first: it becomes a SurrealDB record-id key *and* is
+    /// bound into LIVE queries, so it is restricted to a safe character set
+    /// (non-empty, ASCII alphanumeric or underscore). Rejecting at the boundary
+    /// keeps malformed names out of the system rather than relying on downstream
+    /// escaping.
     pub async fn new(name: &str) -> Result<Self> {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(Error::InvalidAgentName {
+                name: name.to_string(),
+            });
+        }
+
         let db = sdb::SurrealDBWrapper::connection().await;
 
         let agent: Agent = db
@@ -75,6 +87,10 @@ impl Agent {
 
     /// Send a typed payload to another agent by creating a RELATE edge in the
     /// `message` table.
+    ///
+    /// Rejects unknown recipients: if no `agent` record exists for `to`, returns
+    /// [`Error::UnknownRecipient`] instead of creating an edge with a dangling
+    /// `out` pointer.
     pub async fn send<T>(&self, to: &str, payload: T) -> Result<()>
     where
         T: SurrealValue + Send + Sync + Unpin + 'static,
@@ -82,6 +98,20 @@ impl Agent {
         let db = sdb::SurrealDBWrapper::connection().await;
         let from_id = self.id.clone();
         let to_id = RecordId::new(AGENT_TABLE, to);
+
+        // Reject sends to a recipient that has no `agent` record. Without this,
+        // RELATE silently creates an edge whose `out` dangles at a non-existent
+        // agent.
+        let recipient: Option<Agent> =
+            db.select(to_id.clone())
+                .await
+                .map_err(|source| Error::Send {
+                    to: to.to_string(),
+                    source,
+                })?;
+        if recipient.is_none() {
+            return Err(Error::UnknownRecipient { to: to.to_string() });
+        }
 
         let query =
             "RELATE $from->message->$to CONTENT { created: time::now(), payload: $payload };";
@@ -123,15 +153,19 @@ impl Agent {
         let db = sdb::SurrealDBWrapper::connection().await;
 
         // Explicit field projection — `LIVE SELECT *` on edges doesn't
-        // always include `in`/`out` in the notification payload.
-        let query = format!(
-            "LIVE SELECT *, in, out FROM message WHERE out = agent:{}",
-            self.name
-        );
-        let mut response = db.query(&query).await.map_err(|source| Error::LiveQuery {
-            agent: self.name.clone(),
-            source,
-        })?;
+        // always include `in`/`out` in the notification payload. The owner is
+        // bound as a parameter (not string-interpolated) so the agent name can
+        // never alter the query.
+        let owner = RecordId::new(AGENT_TABLE, self.name.clone());
+        let query = "LIVE SELECT *, in, out FROM message WHERE out = $owner";
+        let mut response = db
+            .query(query)
+            .bind(("owner", owner))
+            .await
+            .map_err(|source| Error::LiveQuery {
+                agent: self.name.clone(),
+                source,
+            })?;
         let mut stream = response
             .stream::<Notification<Message<T>>>(0)
             .map_err(|source| Error::Stream {
