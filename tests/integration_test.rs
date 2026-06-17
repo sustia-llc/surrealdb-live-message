@@ -205,7 +205,9 @@ async fn test_agent_messaging() {
     scenario_schema_enforcement(db).await;
     scenario_handshake_race().await;
     scenario_fanout().await;
+    scenario_backpressure().await;
     scenario_listen_loop_dropped().await;
+    scenario_ready_timeout().await;
     scenario_bus_close().await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
@@ -354,6 +356,76 @@ async fn scenario_fanout() {
     }
 
     coalition.shutdown().await;
+}
+
+/// **Bus backpressure.** Flood a single sink with more messages than the bus
+/// capacity (256) while a deliberately-slow consumer drains concurrently. The
+/// bounded bus must apply backpressure on the listen loop rather than dropping —
+/// every message survives. The consumer runs *concurrently* (not after the
+/// flood) so the SDK's live-query notification buffer can't overflow and stall
+/// the shared connection.
+async fn scenario_backpressure() {
+    const N: usize = 300; // > INBOX_CAPACITY (256)
+
+    let coalition = Coalition::<ChatMessage>::new(vec!["src".to_string(), "sink".to_string()])
+        .await
+        .expect("coalition creation");
+    let inbox = coalition.inbox();
+
+    let drainer = tokio::spawn(async move {
+        let mut count = 0usize;
+        while count < N {
+            match timeout(Duration::from_secs(15), inbox.recv()).await {
+                Ok(Ok(d)) => {
+                    assert_eq!(d.recipient, "sink");
+                    count += 1;
+                    // Slow consumer — lets the producer outrun us so the bounded
+                    // bus actually fills and backpressure engages on the loop.
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                _ => break, // bus closed early or drain stalled
+            }
+        }
+        count
+    });
+
+    let src = coalition.agent("src").await.expect("src in coalition");
+    for i in 0..N {
+        src.send(
+            "sink",
+            ChatMessage {
+                content: format!("m{i}"),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("flood send {i}: {e}"));
+    }
+
+    let count = drainer.await.expect("drainer task");
+    assert_eq!(
+        count, N,
+        "every flooded message must survive backpressure (no drops)"
+    );
+
+    coalition.shutdown().await;
+}
+
+/// **Typed-error path: `ReadyTimeout`.** A near-zero handshake window elapses
+/// before any listen loop can register its LIVE query, so the readiness
+/// handshake surfaces `ReadyTimeout` (via the `new_with_ready_timeout` seam).
+async fn scenario_ready_timeout() {
+    match Coalition::<ChatMessage>::new_with_ready_timeout(
+        vec!["frank".to_string()],
+        Duration::from_nanos(1),
+    )
+    .await
+    {
+        Ok(_) => panic!("a near-zero ready timeout should fail coalition startup"),
+        Err(e) => assert!(
+            matches!(e, Error::ReadyTimeout { .. }),
+            "expected ReadyTimeout, got {e:?}"
+        ),
+    }
 }
 
 /// **Typed-error path: `ListenLoopDropped`.** A name that the typed `RecordId`

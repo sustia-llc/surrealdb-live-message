@@ -62,6 +62,10 @@ impl Agent {
                 agent: name.to_string(),
                 source,
             })?
+            // Defensive: on a healthy DB `create().content()` returns `Some` on
+            // success or `Err` on a duplicate id, never `Ok(None)`. This branch
+            // is therefore not reachable without a fault-injected connection,
+            // and is intentionally left without a dedicated trigger test.
             .ok_or_else(|| Error::AgentCreateEmpty {
                 agent: name.to_string(),
             })?;
@@ -206,6 +210,20 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// before returning. Each wait is bounded by [`READY_TIMEOUT`]; a stalled
     /// or dropped listen loop yields an error instead of hanging.
     pub async fn new(names: Vec<String>) -> Result<Self> {
+        Self::new_with_ready_timeout(names, READY_TIMEOUT).await
+    }
+
+    /// Like [`Coalition::new`] but with a caller-chosen readiness-handshake
+    /// timeout instead of the default [`READY_TIMEOUT`].
+    ///
+    /// Exposed mainly so the handshake's [`Error::ReadyTimeout`] path is
+    /// exercisable deterministically (pass a near-zero `ready_timeout` so it
+    /// elapses before any listen loop can register). Production callers should
+    /// prefer [`Coalition::new`].
+    pub async fn new_with_ready_timeout(
+        names: Vec<String>,
+        ready_timeout: Duration,
+    ) -> Result<Self> {
         let agents = Arc::new(RwLock::new(HashMap::new()));
         let task_tracker = TaskTracker::new();
         let cancellation_token = CancellationToken::new();
@@ -244,12 +262,12 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         // unresponsive DB stalling LIVE registration (sender neither sent nor
         // dropped) cannot hang Coalition::new forever.
         for (name, rx) in ready_rxs {
-            let err = match timeout(READY_TIMEOUT, rx).await {
+            let err = match timeout(ready_timeout, rx).await {
                 Ok(Ok(())) => continue,
                 Ok(Err(_)) => Error::ListenLoopDropped { agent: name },
                 Err(_) => Error::ReadyTimeout {
                     agent: name,
-                    timeout: READY_TIMEOUT,
+                    timeout: ready_timeout,
                 },
             };
             // Handshake failed: cancel the already-spawned listen_loops so they
