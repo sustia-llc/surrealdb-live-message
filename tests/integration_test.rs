@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::any;
 use surrealdb::opt::Resource;
+use surrealdb_live_message::error::Error;
 use surrealdb_live_message::logger;
 use surrealdb_live_message::message::{MESSAGE_TABLE, Message};
-use surrealdb_live_message::subsystems::agents::{AGENT_TABLE, Coalition, Delivery};
+use surrealdb_live_message::subsystems::agents::{AGENT_TABLE, Agent, Coalition, Delivery};
 use surrealdb_live_message::subsystems::sdb::{self, SurrealDBWrapper};
 use surrealdb_types::{RecordId, SurrealValue};
 use tokio::time::{Duration, timeout};
@@ -191,9 +192,197 @@ async fn test_agent_messaging() {
         Some(RecordId::new(AGENT_TABLE, AGENT_ALICE))
     );
 
+    // ------------------------------------------------------------------
+    // Additional scenarios.
+    //
+    // Run sequentially against the SAME container: `sdb.rs` holds a single
+    // process-global `CONNECTION` OnceCell and `sdb_server.rs` pins a fixed
+    // container name + port, so parallel `#[tokio::test]` fns would collide.
+    // Consolidating keeps one container and a deterministic order (matches the
+    // `rust-v2:testing` "quality over quantity" guidance).
+    // ------------------------------------------------------------------
+    scenario_unknown_agent(db, &alice).await;
+    scenario_schema_enforcement(db).await;
+    scenario_handshake_race().await;
+    scenario_fanout().await;
+    scenario_listen_loop_dropped().await;
+    scenario_bus_close().await;
+
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
     coalition.shutdown().await;
     harness_token.cancel();
     harness_tracker.close();
     harness_tracker.wait().await;
+}
+
+/// **Send to unknown agent.** `Agent::send` to a name with no `agent` record
+/// currently *succeeds*: the `RELATE` creates an edge whose `out` dangles at a
+/// non-existent agent, and no `agent` record is auto-created. This locks in the
+/// documented current behavior (see `TODO.md` — whether to reject is open).
+async fn scenario_unknown_agent(db: &Surreal<any::Any>, alice: &Agent) {
+    alice
+        .send(
+            "ghost",
+            ChatMessage {
+                content: "into the void".to_string(),
+            },
+        )
+        .await
+        .expect("send to unknown agent currently succeeds");
+
+    // The dangling edge exists, pointing `out` at the non-existent agent.
+    let mut resp = db
+        .query("SELECT *, in, out FROM message WHERE in = agent:alice AND out = agent:ghost")
+        .await
+        .unwrap();
+    let edges: Vec<Message<ChatMessage>> = resp.take(0).unwrap();
+    assert_eq!(edges.len(), 1, "dangling edge to unknown agent should exist");
+    assert_eq!(edges[0].out, Some(RecordId::new(AGENT_TABLE, "ghost")));
+
+    // No `agent` record was auto-created for the unknown recipient.
+    let mut resp = db
+        .query("SELECT VALUE id FROM agent WHERE id = agent:ghost")
+        .await
+        .unwrap();
+    let ids: Vec<RecordId> = resp.take(0).unwrap();
+    assert!(
+        ids.is_empty(),
+        "no agent record should be created for an unknown recipient"
+    );
+}
+
+/// **Schema enforcement.** `message TYPE RELATION IN agent OUT agent` must
+/// reject a non-`agent` endpoint, and `created TYPE datetime` must reject a
+/// non-datetime value.
+async fn scenario_schema_enforcement(db: &Surreal<any::Any>) {
+    // `in` endpoint is from table `thing`, not `agent` → rejected.
+    let res = db
+        .query("RELATE thing:x->message->agent:alice CONTENT { created: time::now(), payload: {} }")
+        .await;
+    let rejected = match res {
+        Ok(r) => r.check().is_err(),
+        Err(_) => true,
+    };
+    assert!(
+        rejected,
+        "RELATE with a non-agent `in` endpoint must be rejected"
+    );
+
+    // `created` is not a datetime → rejected.
+    let res = db
+        .query(
+            "RELATE agent:alice->message->agent:bob \
+             CONTENT { created: 'not-a-datetime', payload: {} }",
+        )
+        .await;
+    let rejected = match res {
+        Ok(r) => r.check().is_err(),
+        Err(_) => true,
+    };
+    assert!(rejected, "non-datetime `created` must be rejected");
+}
+
+/// **Delivery races the handshake.** Send *immediately* after `Coalition::new`
+/// returns — no sleep. The readiness handshake must guarantee the recipient's
+/// subscription is already live, so the first message is never lost.
+async fn scenario_handshake_race() {
+    let coalition = Coalition::<ChatMessage>::new(vec!["carol".to_string(), "dave".to_string()])
+        .await
+        .expect("coalition creation");
+    let inbox = coalition.inbox();
+    let carol = coalition.agent("carol").await.expect("carol in coalition");
+
+    carol
+        .send(
+            "dave",
+            ChatMessage {
+                content: "race".to_string(),
+            },
+        )
+        .await
+        .expect("carol → dave send");
+
+    let d = timeout(Duration::from_secs(5), inbox.recv())
+        .await
+        .expect("delivery timed out — handshake failed to prevent a lost first message")
+        .expect("inbox bus closed unexpectedly");
+    assert_eq!(d.recipient, "dave");
+    assert_eq!(
+        d.message.payload,
+        ChatMessage {
+            content: "race".to_string()
+        }
+    );
+
+    coalition.shutdown().await;
+}
+
+/// **N-agent fan-out.** One sender to many recipients; assert every recipient's
+/// delivery lands on the shared MPMC bus exactly once.
+async fn scenario_fanout() {
+    const WORKERS: [&str; 4] = ["w1", "w2", "w3", "w4"];
+    let mut names = vec!["hub".to_string()];
+    names.extend(WORKERS.iter().map(|w| w.to_string()));
+
+    let coalition = Coalition::<ChatMessage>::new(names)
+        .await
+        .expect("coalition creation");
+    let inbox = coalition.inbox();
+    let hub = coalition.agent("hub").await.expect("hub in coalition");
+
+    for w in WORKERS {
+        hub.send(
+            w,
+            ChatMessage {
+                content: format!("hi {w}"),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("hub → {w} send: {e}"));
+    }
+
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for _ in 0..WORKERS.len() {
+        let d = timeout(Duration::from_secs(5), inbox.recv())
+            .await
+            .expect("fan-out delivery timed out")
+            .expect("inbox bus closed unexpectedly");
+        *seen.entry(d.recipient).or_default() += 1;
+    }
+    for w in WORKERS {
+        assert_eq!(seen.get(w), Some(&1), "worker {w} should receive exactly once");
+    }
+
+    coalition.shutdown().await;
+}
+
+/// **Typed-error path: `ListenLoopDropped`.** A name that the typed `RecordId`
+/// API stores fine but that breaks the interpolated `LIVE SELECT` (a space ⇒
+/// `agent:ghost rider` is a parse error). The listen loop errors *before*
+/// signalling ready, dropping its ready sender, which `Coalition::new` surfaces
+/// as `ListenLoopDropped` rather than hanging until `ReadyTimeout`.
+async fn scenario_listen_loop_dropped() {
+    match Coalition::<ChatMessage>::new(vec!["ghost rider".to_string()]).await {
+        Ok(_) => panic!("a malformed agent name should fail coalition startup"),
+        Err(e) => assert!(
+            matches!(e, Error::ListenLoopDropped { .. }),
+            "expected ListenLoopDropped, got {e:?}"
+        ),
+    }
+}
+
+/// **Bus close semantics.** After every agent shuts down, the last bus sender
+/// drops and `inbox().recv()` returns `Err`.
+async fn scenario_bus_close() {
+    let coalition = Coalition::<ChatMessage>::new(vec!["erin".to_string()])
+        .await
+        .expect("coalition creation");
+    let inbox = coalition.inbox();
+
+    coalition.shutdown().await;
+
+    let closed = timeout(Duration::from_secs(5), inbox.recv())
+        .await
+        .expect("recv did not resolve after shutdown");
+    assert!(closed.is_err(), "inbox bus must be closed after shutdown");
 }
