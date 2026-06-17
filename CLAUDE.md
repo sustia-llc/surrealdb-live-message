@@ -8,7 +8,9 @@ messaging over SurrealDB graph edges + LIVE queries, with `src/main.rs` as a bin
 ## Build & Test
 
 - Integration tests require **Docker** — `sdb_server.rs` spins up a SurrealDB container via `bollard`.
-- Run: `cargo test --test integration_test` (the only test; no unit tests).
+- Run: `cargo test --test integration_test` (the Docker-backed integration test).
+- Deterministic unit tests (no Docker) live in `src/subsystems/agents.rs` (the
+  `await_ready` handshake-error seam): `cargo test --lib`.
 - Against the production cloud endpoint instead of a local container: `RUN_MODE=production cargo test --test integration_test`.
 - Config layers (via the `config` crate): `config/default.toml` → `config/{RUN_MODE}.toml` → env vars (`__` separator). `RUN_MODE` defaults to `development`.
 

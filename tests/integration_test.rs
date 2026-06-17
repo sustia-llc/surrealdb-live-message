@@ -207,7 +207,6 @@ async fn test_agent_messaging() {
     scenario_fanout().await;
     scenario_backpressure().await;
     scenario_invalid_agent_name().await;
-    scenario_ready_timeout().await;
     scenario_bus_close().await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
@@ -404,24 +403,6 @@ async fn scenario_backpressure() {
     );
 
     coalition.shutdown().await;
-}
-
-/// **Typed-error path: `ReadyTimeout`.** A near-zero handshake window elapses
-/// before any listen loop can register its LIVE query, so the readiness
-/// handshake surfaces `ReadyTimeout` (via the `new_with_ready_timeout` seam).
-async fn scenario_ready_timeout() {
-    match Coalition::<ChatMessage>::new_with_ready_timeout(
-        vec!["frank".to_string()],
-        Duration::from_nanos(1),
-    )
-    .await
-    {
-        Ok(_) => panic!("a near-zero ready timeout should fail coalition startup"),
-        Err(e) => assert!(
-            matches!(e, Error::ReadyTimeout { .. }),
-            "expected ReadyTimeout, got {e:?}"
-        ),
-    }
 }
 
 /// **Invalid agent name is rejected.** `Agent::new` (via `Coalition::new`)

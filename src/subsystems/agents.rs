@@ -11,7 +11,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Instrument;
 
 use crate::error::{Error, Result};
-use crate::message::{MESSAGE_TABLE, Message};
+use crate::message::Message;
 use crate::subsystems::sdb;
 
 pub const AGENT_TABLE: &str = "agent";
@@ -180,9 +180,37 @@ impl Agent {
 
         loop {
             tokio::select! {
-                Some(result) = stream.next() => {
-                    match result {
-                        Ok(notification) => {
+                // `biased`: give cancellation strict priority over message
+                // processing so a high-rate stream can't starve shutdown.
+                biased;
+                _ = token.cancelled() => {
+                    tracing::info!("listen_loop for {} received shutdown", self.name);
+                    drop(stream);
+                    // Best-effort cleanup of this agent's message edges. RELATE
+                    // assigns random edge ids, so delete by endpoint (in/out)
+                    // rather than by a name-keyed id (which matches nothing).
+                    // Bounded by a timeout so a wedged DB can't hang shutdown.
+                    let owner = RecordId::new(AGENT_TABLE, self.name.clone());
+                    let cleanup = async {
+                        db.query("DELETE message WHERE in = $owner OR out = $owner")
+                            .bind(("owner", owner))
+                            .await
+                    };
+                    match timeout(Duration::from_secs(2), cleanup).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!("failed to delete agent messages on shutdown: {}", e)
+                        }
+                        Err(_) => tracing::warn!(
+                            "timed out deleting agent messages on shutdown for {}",
+                            self.name
+                        ),
+                    }
+                    break;
+                }
+                maybe = stream.next() => {
+                    match maybe {
+                        Some(Ok(notification)) => {
                             let action = notification.action;
                             if action == Action::Delete {
                                 continue;
@@ -200,18 +228,16 @@ impl Agent {
                                 tracing::debug!("inbox bus closed for {}: {}", self.name, e);
                             }
                         }
-                        Err(error) => tracing::error!("stream error: {}", error),
+                        Some(Err(error)) => tracing::error!("stream error: {}", error),
+                        // Stream ended on its own (server KILLed the LIVE query,
+                        // connection dropped). Exit cleanly so this task returns
+                        // and drops its `inbox_tx` clone — otherwise the agent
+                        // would go silent yet keep the bus open until cancel.
+                        None => {
+                            tracing::info!("live stream ended for {}, listen_loop exiting", self.name);
+                            break;
+                        }
                     }
-                }
-                _ = token.cancelled() => {
-                    tracing::info!("listen_loop for {} received shutdown", self.name);
-                    drop(stream);
-                    // Best-effort cleanup of this agent's message edges.
-                    let message_id = RecordId::new(MESSAGE_TABLE, self.name.clone());
-                    if let Err(e) = db.delete::<Option<Message<T>>>(message_id).await {
-                        tracing::warn!("failed to delete agent messages on shutdown: {}", e);
-                    }
-                    break;
                 }
             }
         }
@@ -248,12 +274,14 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     }
 
     /// Like [`Coalition::new`] but with a caller-chosen readiness-handshake
-    /// timeout instead of the default [`READY_TIMEOUT`].
+    /// timeout instead of the default [`READY_TIMEOUT`]. Production callers
+    /// should prefer [`Coalition::new`]; the explicit timeout is mainly useful
+    /// for tuning startup against a slow DB.
     ///
-    /// Exposed mainly so the handshake's [`Error::ReadyTimeout`] path is
-    /// exercisable deterministically (pass a near-zero `ready_timeout` so it
-    /// elapses before any listen loop can register). Production callers should
-    /// prefer [`Coalition::new`].
+    /// The per-agent handshake await is factored into [`await_ready`], which is
+    /// unit-tested deterministically (a never-sent receiver → [`Error::ReadyTimeout`],
+    /// a dropped sender → [`Error::ListenLoopDropped`]) without racing a real
+    /// LIVE-query registration.
     pub async fn new_with_ready_timeout(
         names: Vec<String>,
         ready_timeout: Duration,
@@ -296,18 +324,18 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         // unresponsive DB stalling LIVE registration (sender neither sent nor
         // dropped) cannot hang Coalition::new forever.
         for (name, rx) in ready_rxs {
-            let err = match timeout(ready_timeout, rx).await {
-                Ok(Ok(())) => continue,
-                Ok(Err(_)) => Error::ListenLoopDropped { agent: name },
-                Err(_) => Error::ReadyTimeout {
-                    agent: name,
-                    timeout: ready_timeout,
-                },
+            let Err(err) = await_ready(name, rx, ready_timeout).await else {
+                continue;
             };
-            // Handshake failed: cancel the already-spawned listen_loops so they
-            // shut down cleanly instead of running on detached (dropping the
-            // token here would NOT cancel the child tokens they hold).
+            // Handshake failed: cancel the already-spawned listen_loops, then
+            // drain them (close + wait) before returning — the same
+            // cancel→close→wait as shutdown(). Cancel alone would leave the
+            // tasks running detached (TaskTracker's Drop neither aborts nor
+            // awaits), racing the caller; and dropping the token here would NOT
+            // cancel the child tokens they hold.
             cancellation_token.cancel();
+            task_tracker.close();
+            task_tracker.wait().await;
             return Err(err);
         }
 
@@ -343,5 +371,77 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         self.cancellation_token.cancel();
         self.task_tracker.close();
         self.task_tracker.wait().await;
+    }
+}
+
+/// Await one listen-loop's readiness signal, bounded by `ready_timeout`, mapping
+/// the three outcomes onto the typed handshake errors:
+///
+/// - signal received → `Ok(())`
+/// - sender dropped before signalling → [`Error::ListenLoopDropped`]
+/// - timeout elapsed first → [`Error::ReadyTimeout`]
+///
+/// Pure async logic over a `oneshot` — no DB — so the two error paths are
+/// unit-testable deterministically (see the tests below). The integration test
+/// can't exercise `ReadyTimeout` reliably: [`tokio::time::timeout`] polls the
+/// inner future before the timer, so a real LIVE-query registration that wins
+/// the same park cycle resolves the receiver and yields `Ok` regardless of how
+/// small the timeout is.
+async fn await_ready(
+    name: String,
+    rx: oneshot::Receiver<()>,
+    ready_timeout: Duration,
+) -> Result<()> {
+    match timeout(ready_timeout, rx).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(Error::ListenLoopDropped { agent: name }),
+        Err(_) => Err(Error::ReadyTimeout {
+            agent: name,
+            timeout: ready_timeout,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A never-sent receiver deterministically yields [`Error::ReadyTimeout`]:
+    /// the receiver never resolves, so the (small, real) timeout always wins.
+    #[tokio::test]
+    async fn await_ready_times_out() {
+        let (_tx, rx) = oneshot::channel();
+        let err = await_ready("frank".to_string(), rx, Duration::from_millis(10))
+            .await
+            .expect_err("a never-sent ready signal must time out");
+        assert!(
+            matches!(err, Error::ReadyTimeout { ref agent, .. } if agent == "frank"),
+            "expected ReadyTimeout for 'frank', got {err:?}"
+        );
+    }
+
+    /// A dropped sender deterministically yields [`Error::ListenLoopDropped`]:
+    /// the receiver resolves to `Err(RecvError)` before the timeout.
+    #[tokio::test]
+    async fn await_ready_detects_dropped_loop() {
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        let err = await_ready("frank".to_string(), rx, Duration::from_secs(30))
+            .await
+            .expect_err("a dropped sender must surface ListenLoopDropped");
+        assert!(
+            matches!(err, Error::ListenLoopDropped { ref agent } if agent == "frank"),
+            "expected ListenLoopDropped for 'frank', got {err:?}"
+        );
+    }
+
+    /// A pre-sent signal resolves to `Ok(())` — the happy path of the seam.
+    #[tokio::test]
+    async fn await_ready_succeeds_when_signalled() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(()).expect("send ready");
+        await_ready("frank".to_string(), rx, Duration::from_secs(30))
+            .await
+            .expect("a signalled ready must succeed");
     }
 }

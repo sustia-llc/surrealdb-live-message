@@ -95,7 +95,7 @@ impl SurrealDBWrapper {
     /// `payload` field is generic over the caller's `T` (each `Coalition<T>`
     /// uses a different payload). SCHEMALESS lets any `payload` shape round-trip
     /// untouched. SCHEMAFULL was rejected here: a generic payload would require
-    /// `FLEXIBLE`, which in 3.1.3 is restricted to types containing `object`
+    /// `FLEXIBLE`, which as of 3.1.4 is restricted to types containing `object`
     /// (`FLEXIBLE TYPE any` errors), and an un-flexible `TYPE any` adds no value
     /// while risking dropped fields. SCHEMALESS enforces the endpoints + typed
     /// `created` without ever constraining `payload`.

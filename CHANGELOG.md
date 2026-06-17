@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The crate has not yet had a tagged release; everything below is pre-`0.1.0` work.
+## [0.1.0] - 2026-06-17
 
 ### Added
 
@@ -19,7 +19,9 @@ The crate has not yet had a tagged release; everything below is pre-`0.1.0` work
   `coalition.shutdown()` from a parent `CancellationToken`).
 - `Coalition::new_with_ready_timeout(names, Duration)` — caller-chosen
   readiness-handshake timeout; `new` delegates with the default `READY_TIMEOUT`.
-  Makes the `ReadyTimeout` path deterministically testable.
+- `await_ready` helper extracting the per-agent handshake await, with
+  deterministic DB-free unit tests for the `ReadyTimeout` and `ListenLoopDropped`
+  paths (`cargo test --lib`).
 - `Agent::new` validates agent names (non-empty, ASCII alphanumeric or
   underscore) → `Error::InvalidAgentName`, rejecting malformed names before any
   DB work.
@@ -27,7 +29,7 @@ The crate has not yet had a tagged release; everything below is pre-`0.1.0` work
 - Expanded integration coverage (consolidated into the single-container test):
   unknown-recipient rejection, schema enforcement (non-`agent` endpoint /
   non-datetime `created`), handshake-race delivery, N-agent fan-out, bus
-  backpressure + close semantics, `ReadyTimeout`, and `InvalidAgentName`.
+  backpressure + close semantics, and `InvalidAgentName`.
 - Message-delivery bus: agent `listen_loop`s forward each received message onto
   a shared kanal MPMC channel as `Delivery<T> { recipient, message }`. Consume
   via `coalition.inbox()` (clone for multiple workers; bridge sync/async with
@@ -65,7 +67,18 @@ The crate has not yet had a tagged release; everything below is pre-`0.1.0` work
 - `docker.platform` is now `Option<String>`; unset → Docker host-native platform
   (fixes ARM hosts). Pin via `DOCKER__PLATFORM` or config. `config/default.toml`
   no longer hardcodes `linux/x86_64`.
-- Bumped `surrealdb`/`surrealdb-types` to 3.1.3 and `bollard` to 0.21.
+- Bumped `surrealdb`/`surrealdb-types` to 3.1.4 (server image `tag` in
+  `config/default.toml` → `v3.1.4`) and `bollard` to 0.21. The 3.1.4 release is
+  server-only (no client/wire changes affecting this crate).
+- `Agent::listen_loop`'s `select!` handles stream-end explicitly: `biased;` gives
+  shutdown priority, and a live-stream that ends on its own now breaks the loop
+  cleanly so the agent drops its bus sender instead of going silent until cancel.
+- Shutdown edge-cleanup deletes by endpoint
+  (`DELETE message WHERE in = $owner OR out = $owner`) — the previous name-keyed
+  id never matched RELATE's random edge ids — bounded by a 2s timeout so a wedged
+  DB can't hang `shutdown()`.
+- The handshake-failure path now drains spawned listen-loops (`cancel → close →
+  wait`) before returning the error, leaving no detached tasks.
 
 ### Security
 
@@ -81,3 +94,7 @@ The crate has not yet had a tagged release; everything below is pre-`0.1.0` work
 - LIVE subscription projects edge pointers explicitly
   (`LIVE SELECT *, in, out FROM message ...`); plain `LIVE SELECT *` omits `in`/`out`.
 - Subscription race resolved by the readiness handshake (see Added).
+- Flaky `ReadyTimeout` integration scenario replaced with deterministic unit tests
+  against `await_ready`: `tokio::time::timeout` polls the inner future before the
+  timer, so racing a real LIVE-query registration could resolve the receiver and
+  return `Ok` regardless of how small the window is (failed ~1/3 of runs).
