@@ -86,9 +86,22 @@ SELECT *, in, out FROM message;
 
 ## Examples
 
-`cargo run` (above) is the minimal demo — bare `ctrl_c`. Six runnable examples
+`cargo run` (above) is the minimal demo — bare `ctrl_c`. Seven runnable examples
 live in `examples/` (each needs Docker; each spins up and tears down its own
 SurrealDB container).
+
+### Durability
+
+The headline of the two-tier durable bus — a message sent to an agent while it
+is **fully shut down** is replayed on restart, where plain at-most-once LIVE
+would lose it:
+
+```sh
+# Round 1: bring alice + bob up, then shut the coalition down (bob offline).
+# While offline, alice sends bob a message. Round 2: restart — bob resumes from
+# his persisted versionstamp cursor and the CHANGEFEED catch-up replays it.
+cargo run --example durable_restart
+```
 
 ### Messaging
 
