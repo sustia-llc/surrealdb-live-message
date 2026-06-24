@@ -28,6 +28,19 @@ pub struct Sdb {
     pub username: String,
     pub password: String,
     pub endpoint: String,
+    /// Retention window (seconds) for the durable message log. Drives both the
+    /// `message` table `CHANGEFEED` window (how far back a reconnecting agent can
+    /// replay) and the periodic age-out sweep (`DELETE message WHERE created <
+    /// now - retention`). Defaults to 24h. An agent offline longer than this
+    /// loses the messages sent while it was gone.
+    #[serde(default = "Sdb::default_message_retention_secs")]
+    pub message_retention_secs: u64,
+}
+
+impl Sdb {
+    fn default_message_retention_secs() -> u64 {
+        86_400 // 24h
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

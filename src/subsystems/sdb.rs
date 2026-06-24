@@ -99,17 +99,35 @@ impl SurrealDBWrapper {
     /// (`FLEXIBLE TYPE any` errors), and an un-flexible `TYPE any` adds no value
     /// while risking dropped fields. SCHEMALESS enforces the endpoints + typed
     /// `created` without ever constraining `payload`.
+    ///
+    /// `message` carries a **`CHANGEFEED`** so the two-tier durable bus can
+    /// replay missed messages on (re)connect (`SHOW CHANGES FOR TABLE message
+    /// SINCE <versionstamp>`); the window equals `message_retention_secs`. The
+    /// feed is set via `DEFINE TABLE IF NOT EXISTS` so it is established once at
+    /// table creation and **preserved across restarts** — re-defining it every
+    /// startup would reset the change log and defeat cross-restart catch-up.
+    /// NOTE: a `message` table created by a pre-changefeed schema version will
+    /// not gain the feed retroactively (this lib is pre-1.0; no migration ships).
+    ///
+    /// `cursor` persists each agent's high-water mark (the last versionstamp it
+    /// drained) so catch-up is bounded and exactly resumable across restarts.
     async fn define_schema(db: &Surreal<any::Any>) -> Result<()> {
-        let schema = "
+        let retention = SETTINGS.sdb.message_retention_secs;
+        let schema = format!(
+            "
             DEFINE TABLE IF NOT EXISTS agent SCHEMAFULL;
             DEFINE FIELD IF NOT EXISTS name ON agent TYPE string;
             DEFINE FIELD IF NOT EXISTS created ON agent TYPE datetime;
 
-            DEFINE TABLE IF NOT EXISTS message TYPE RELATION IN agent OUT agent SCHEMALESS;
+            DEFINE TABLE IF NOT EXISTS message TYPE RELATION IN agent OUT agent SCHEMALESS CHANGEFEED {retention}s;
             DEFINE FIELD IF NOT EXISTS created ON message TYPE datetime;
-        ";
 
-        db.query(schema)
+            DEFINE TABLE IF NOT EXISTS cursor SCHEMAFULL;
+            DEFINE FIELD IF NOT EXISTS versionstamp ON cursor TYPE int;
+        "
+        );
+
+        db.query(&schema)
             .await
             .map_err(Error::Schema)?
             .check()

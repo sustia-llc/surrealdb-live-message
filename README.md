@@ -1,17 +1,19 @@
 # surrealdb-live-message
 
-A light message layer for multi-agent interaction, built on SurrealDB live queries. Messages are first-class graph edges: agents send to one another by establishing a `RELATE` relation, and each agent subscribes via `LIVE SELECT` to the edges targeting it.
+A light message layer for multi-agent interaction, built on SurrealDB. Messages are first-class graph edges: agents send to one another by establishing a `RELATE` relation.
+
+Delivery is a **two-tier durable bus**: the `message` table is a `CHANGEFEED`-backed durable log, a `LIVE SELECT` is a low-latency *wake-up*, and the sole delivery path is a `SHOW CHANGES … SINCE <cursor>` catch-up that advances a **persisted per-agent versionstamp cursor**. Delivery is therefore **at-least-once and survives disconnects and restarts** — a message published while an agent is offline is replayed on reconnect, where plain `LIVE` alone is at-most-once with no replay. (See the SurrealDB `live-queries` skill, "Delivery guarantees".) Consumers should treat handling as idempotent.
 
 As of the 2026-04 library-first refactor, the library exposes a `Coalition<T: SurrealValue>` surface rather than a `tokio-graceful-shutdown` subsystem. Callers wire their own top-level shutdown (bare `tokio::signal::ctrl_c`, parent token, or wrap in their preferred framework); the library hands back a `CancellationToken` and a three-step `shutdown().await`.
 
 ## Architecture
 
-- **`Message<T: SurrealValue>`** — payload-generic edge record. `T` is the caller's typed payload.
-- **`Agent::new(name)`** — validates `name` (non-empty, ASCII alphanumeric or `_`; rejects with `Error::InvalidAgentName`) before creating the `agent` record.
+- **`Message<T: SurrealValue>`** — payload-generic edge record. `T` is the caller's typed payload; `id` is populated on delivery (from the changefeed record) so consumers can identify/deduplicate under the at-least-once guarantee.
+- **`Agent::new(name)`** — validates `name` (non-empty, ASCII alphanumeric or `_`; rejects with `Error::InvalidAgentName`), then **reuses an existing `agent` record or creates one** (restart-idempotent, so a restarted coalition resumes its durable cursors).
 - **`Agent::send<T>(to, payload)`** — issues a typed `RELATE $from -> message -> $to CONTENT { ... }`. Rejects unknown recipients (`Error::UnknownRecipient`) instead of creating a dangling `out` edge.
-- **`Agent::listen_loop<T>(token, ready_tx)`** — `LIVE SELECT *, in, out FROM message WHERE out = $owner` (owner bound as a parameter, never string-interpolated), drives `Notification<Message<T>>` until `token.cancelled()`.
-- **`Coalition<T>`** — registry + `TaskTracker` + root `CancellationToken` + per-spawn `child_token()`. `new()` performs a oneshot readiness handshake with every listen loop before returning, so the first `Agent::send` after `Coalition::new()` is guaranteed to be observed.
-- **`sdb_task(token)`** — SurrealDB container/connection lifecycle as a plain async task.
+- **`Agent::listen_loop<T>(token, ready_tx)`** — the two-tier durable bus. A `LIVE SELECT … WHERE out = $owner` (owner bound as a parameter, never string-interpolated) acts as a wake-up; each wake (and each **reconnect**, with capped exponential backoff) runs a `SHOW CHANGES FOR TABLE message SINCE <cursor>` catch-up that delivers every message addressed to the agent and advances + persists its versionstamp cursor (`cursor:<agent>`). Runs until `token.cancelled()`; messages are **never deleted here**.
+- **`Coalition<T>`** — registry + `TaskTracker` + root `CancellationToken` + per-spawn `child_token()`. `new()` performs a oneshot readiness handshake with every listen loop before returning, so the first `Agent::send` after `Coalition::new()` is guaranteed to be observed. It also spawns one **retention sweep** task that ages out the durable log (`DELETE message WHERE created < now - sdb.message_retention_secs`, default 24h).
+- **`sdb_task(token)`** — SurrealDB container/connection lifecycle as a plain async task. Defines the schema, including the `message` `CHANGEFEED` window and the `cursor` table.
 
 See the integration test for an end-to-end library-first usage.
 
@@ -134,10 +136,11 @@ cargo run --example parent_token
 
 This repo is the reference implementation for several transferable patterns, each documented in a corresponding cc-polymath skill:
 
+- **Two-tier durable message bus** (`surrealdb:live-queries`, "Delivery guarantees") — `LIVE` is at-most-once with no replay, so it is used only as a low-latency wake-up over a durable, `CHANGEFEED`-backed log. The sole delivery path is `SHOW CHANGES … SINCE <cursor>` catch-up, advancing a persisted per-agent versionstamp cursor (`cursor = max_seen + 1`, so messages are never re-read — no dedup set). The listen loop reconnects with backoff and re-drains on every (re)connect; a per-coalition retention sweep ages out the log. Result: at-least-once delivery that survives disconnects and restarts. (`sequences` skill covers the cursor-as-high-water-mark variant.)
 - **Library-first async lifecycle** (`rust-v2:async-lifecycle`) — expose `CancellationToken` + `TaskTracker`, not `SubsystemHandle`; let callers wire their top-level shutdown. Readiness handshake in `Coalition::new` for subscription-registering spawns. `DropGuard` in the integration test for panic-safe container teardown.
 - **`#[surreal(rename)]` for raw-identifier fields** (`surrealdb:repository-patterns`) — the `SurrealValue` derive ignores `#[serde(rename)]`. Fields like `r#in` must carry `#[surreal(rename = "in")]` or round-trip as `None`.
-- **Explicit edge-pointer projection in LIVE SELECT** (`surrealdb:live-queries`) — `LIVE SELECT *` on `RELATE`-created edges omits `in`/`out` from notifications. Must be `LIVE SELECT *, in, out FROM message WHERE ...`.
-- **Sync/async delivery bus** — each agent forwards received live-query messages onto a shared [kanal](https://github.com/fereidani/kanal) MPMC channel as `Delivery<T> { recipient, message }`. Consume with `coalition.inbox()`; clone for multiple workers, or bridge to a synchronous agent handler via kanal's `to_sync()` / `as_sync()` (see `examples/worker_pool.rs`). This is the seam a framework hangs agent logic off of.
+- **Explicit edge-pointer projection on edge records** (`surrealdb:live-queries`) — a bare `SELECT *` / `LIVE SELECT *` on `RELATE`-created edges omits `in`/`out`; read them with `SELECT *, in, out FROM message ...` (as the integration test asserts). The durable-bus delivery path sidesteps this — `SHOW CHANGES` changeset records carry `id`/`in`/`out` natively — so the wake-up subscription only needs `LIVE SELECT id`.
+- **Sync/async delivery bus** — each agent forwards durable-log messages (delivered via catch-up) onto a shared [kanal](https://github.com/fereidani/kanal) MPMC channel as `Delivery<T> { recipient, message }`. Consume with `coalition.inbox()`; clone for multiple workers, or bridge to a synchronous agent handler via kanal's `to_sync()` / `as_sync()` (see `examples/worker_pool.rs`). This is the seam a framework hangs agent logic off of.
 - **Validate at the boundary, parameterize at the query** (`surrealdb:graph-operations`) — agent names are validated in `Agent::new` (`InvalidAgentName`) and bound into the LIVE query as `$owner` rather than interpolated, so a name can never alter the SQL. `Agent::send` checks the recipient exists (`UnknownRecipient`) instead of writing a dangling edge.
 
 ## Documentation
@@ -148,6 +151,7 @@ For detailed documentation on SurrealDB, visit [SurrealDB's Documentation](https
 
 - [@tsondru](https://github.com/tsondru) — original design, daemon-shape POC, SurrealDB integration.
 - Claude Opus 4.7 (1M context, via [Claude Code](https://claude.com/claude-code)) — library-first refactor (2026-04): `Coalition<T>`, generic `Message<T>`, readiness handshake, panic-safe test via `DropGuard`, and the three SDK-gotcha diagnoses (subscription race, `#[surreal(rename)]`, edge-pointer projection).
+- Claude Opus 4.8 (1M context, via [Claude Code](https://claude.com/claude-code)) — two-tier durable bus (2026-06): `CHANGEFEED` + `SHOW CHANGES` catch-up over a persisted per-agent versionstamp cursor, LIVE-as-wake-up, reconnect/backoff, retention sweep, restart-idempotent `Agent::new`, restart-replay integration test; surrealdb 3.1.4 → 3.1.5.
 
 ## Acknowledgments
 

@@ -63,6 +63,27 @@ pub enum Error {
         source: surrealdb::Error,
     },
 
+    #[error("failed to load the durable-log cursor for agent '{agent}'")]
+    CursorLoad {
+        agent: String,
+        #[source]
+        source: surrealdb::Error,
+    },
+
+    #[error("failed to persist the durable-log cursor for agent '{agent}'")]
+    CursorSave {
+        agent: String,
+        #[source]
+        source: surrealdb::Error,
+    },
+
+    #[error("durable-log catch-up (SHOW CHANGES) failed for agent '{agent}'")]
+    CatchUp {
+        agent: String,
+        #[source]
+        source: surrealdb::Error,
+    },
+
     #[error("agent '{agent}' listen_loop did not signal ready within {timeout:?}")]
     ReadyTimeout { agent: String, timeout: Duration },
 

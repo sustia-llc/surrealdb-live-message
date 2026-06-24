@@ -208,6 +208,7 @@ async fn test_agent_messaging() {
     scenario_backpressure().await;
     scenario_invalid_agent_name().await;
     scenario_bus_close().await;
+    scenario_durable_restart().await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
     coalition.shutdown().await;
@@ -420,6 +421,59 @@ async fn scenario_invalid_agent_name() {
             "expected InvalidAgentName, got {e:?}"
         ),
     }
+}
+
+/// **Durable bus survives restart.** A message sent to an agent while it is
+/// DOWN is replayed from the `CHANGEFEED` on restart (`SHOW CHANGES` catch-up
+/// from the persisted cursor), not lost — the property plain at-most-once LIVE
+/// lacks. Exercises: messages/agents persist across shutdown (no delete),
+/// `Agent::new` restart-idempotency, cursor resume, and catch-up delivery.
+async fn scenario_durable_restart() {
+    // Round 1: bring frank + grace up so grace snapshots + persists its cursor.
+    // Grab a sender handle — `send` only needs the global connection, which
+    // outlives the coalition.
+    let c1 = Coalition::<ChatMessage>::new(vec!["frank".to_string(), "grace".to_string()])
+        .await
+        .expect("round-1 coalition");
+    let frank = c1.agent("frank").await.expect("frank in coalition");
+    c1.shutdown().await; // grace's listen loop stops; messages + cursor persist
+
+    // While grace is DOWN, frank sends it a message — a durable edge with no
+    // live subscriber to receive it.
+    frank
+        .send(
+            "grace",
+            ChatMessage {
+                content: "sent while down".to_string(),
+            },
+        )
+        .await
+        .expect("frank → grace send while down");
+
+    // Round 2: restart. `Agent::new` reuses the persisted records; grace resumes
+    // from its saved cursor and the catch-up replays the missed message.
+    let c2 = Coalition::<ChatMessage>::new(vec!["frank".to_string(), "grace".to_string()])
+        .await
+        .expect("round-2 coalition (restart)");
+    let inbox = c2.inbox();
+    let d = timeout(Duration::from_secs(5), inbox.recv())
+        .await
+        .expect("durable replay timed out — message sent while down was lost")
+        .expect("inbox bus closed unexpectedly");
+    assert_eq!(d.recipient, "grace");
+    assert_eq!(
+        d.message.payload,
+        ChatMessage {
+            content: "sent while down".to_string()
+        },
+        "the message sent while grace was down must be replayed on restart"
+    );
+    assert!(
+        d.message.id.is_some(),
+        "a durably-replayed message should carry its edge id"
+    );
+
+    c2.shutdown().await;
 }
 
 /// **Bus close semantics.** After every agent shuts down, the last bus sender

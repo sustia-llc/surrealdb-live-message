@@ -3,15 +3,17 @@ use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 use futures::StreamExt;
 use kanal::{AsyncReceiver, AsyncSender};
 use serde::{Deserialize, Serialize};
-use surrealdb::Notification;
-use surrealdb_types::{Action, Datetime, RecordId, SurrealValue};
+use surrealdb::engine::any;
+use surrealdb::{Notification, Surreal};
+use surrealdb_types::{Datetime, RecordId, SurrealValue, Value};
 use tokio::sync::{RwLock, oneshot};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, sleep, timeout};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Instrument;
 
 use crate::error::{Error, Result};
-use crate::message::Message;
+use crate::message::{MESSAGE_TABLE, Message};
+use crate::settings::SETTINGS;
 use crate::subsystems::sdb;
 
 pub const AGENT_TABLE: &str = "agent";
@@ -24,6 +26,16 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Capacity of the shared MPMC delivery bus connecting agent listen loops to
 /// downstream consumers via [`Coalition::inbox`].
 const INBOX_CAPACITY: usize = 256;
+
+/// Table holding each agent's durable-log high-water-mark cursor (`cursor:<agent>`).
+pub const CURSOR_TABLE: &str = "cursor";
+
+/// Max changesets pulled per `SHOW CHANGES` page during catch-up.
+const CATCHUP_BATCH: usize = 1000;
+
+/// Reconnect backoff bounds for the LIVE wake-up subscription.
+const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(200);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// An inbound message delivered to an agent's listen loop, forwarded onto the
 /// coalition's shared kanal bus. `recipient` is the agent that received it;
@@ -61,6 +73,22 @@ impl Agent {
         }
 
         let db = sdb::SurrealDBWrapper::connection().await;
+
+        // Reuse an existing agent record if present. Agents are now durable —
+        // they are NOT deleted on shutdown (the message log persists, so the
+        // agent identity must too), and `create` errors on a duplicate id. A
+        // select-then-create makes coalition *restart* idempotent, which is what
+        // lets a restarted agent resume its durable-log cursor.
+        if let Some(existing) = db
+            .select((AGENT_TABLE, name))
+            .await
+            .map_err(|source| Error::AgentCreate {
+                agent: name.to_string(),
+                source,
+            })?
+        {
+            return Ok(existing);
+        }
 
         let agent: Agent = db
             .create((AGENT_TABLE, name))
@@ -129,17 +157,28 @@ impl Agent {
         Ok(())
     }
 
-    /// Listen loop — subscribes to LIVE SELECT on messages addressed to this
-    /// agent and drains the stream until `token` cancels.
+    /// Listen loop — runs the two-tier durable bus for this agent until `token`
+    /// cancels.
     ///
-    /// `ready_tx` fires after the LIVE query is registered with the server
-    /// but before the first notification is polled. Callers (e.g.
-    /// `Coalition::new`) await this so `Agent::send` calls can't race the
-    /// subscription.
+    /// **Tier 1** the `message` edge table is a durable, `CHANGEFEED`-backed
+    /// log. **Tier 2** a `LIVE SELECT` acts purely as a low-latency *wake-up*;
+    /// every wake (and every reconnect) triggers a `SHOW CHANGES … SINCE
+    /// <cursor>` catch-up that is the *sole* delivery path. Catch-up advances a
+    /// persisted per-agent versionstamp cursor (`cursor = max_seen + 1`), so a
+    /// message is delivered once per cursor advance and never lost across a
+    /// disconnect/restart — at-least-once with idempotent, monotonic resume.
+    /// (LIVE alone is at-most-once with no replay; see the `live-queries`
+    /// skill, "Delivery guarantees".)
+    ///
+    /// `ready_tx` fires after the first successful subscribe + backlog drain, so
+    /// `Agent::send` calls issued after `Coalition::new` returns cannot race the
+    /// subscription. A startup-phase failure (before `ready_tx` fires) returns
+    /// `Err`, dropping the sender so `Coalition::new` surfaces it; failures after
+    /// readiness reconnect with capped exponential backoff. Messages are NEVER
+    /// deleted here — the log is aged out by the coalition's retention sweep.
     ///
     /// Library-side lifecycle primitive. No `SubsystemHandle`, no signal
-    /// handling. See `rust-practical:async-lifecycle` skill in rust-v2
-    /// v4.1.0.
+    /// handling. See `rust-practical:async-lifecycle` skill.
     async fn listen_loop<T>(
         self,
         token: CancellationToken,
@@ -151,97 +190,120 @@ impl Agent {
     {
         tracing::info!("listen_loop starting for {}", self.name);
         let db = sdb::SurrealDBWrapper::connection().await;
-
-        // Explicit field projection — `LIVE SELECT *` on edges doesn't
-        // always include `in`/`out` in the notification payload. The owner is
-        // bound as a parameter (not string-interpolated) so the agent name can
-        // never alter the query.
         let owner = RecordId::new(AGENT_TABLE, self.name.clone());
-        let query = "LIVE SELECT *, in, out FROM message WHERE out = $owner";
-        let mut response = db
-            .query(query)
-            .bind(("owner", owner))
-            .await
-            .map_err(|source| Error::LiveQuery {
-                agent: self.name.clone(),
-                source,
-            })?;
-        let mut stream = response
-            .stream::<Notification<Message<T>>>(0)
-            .map_err(|source| Error::Stream {
-                agent: self.name.clone(),
-                source,
-            })?;
 
-        // Signal the caller that this agent's subscription is live. Send()
-        // calls issued after Coalition::new returns are now guaranteed to
-        // be captured by this stream.
-        let _ = ready_tx.send(());
+        // Cursor: resume from the persisted high-water mark, or on first run
+        // snapshot the current latest versionstamp so a brand-new agent starts
+        // "from now" instead of replaying pre-existing backlog.
+        let mut cursor = match load_cursor(db, &self.name).await? {
+            Some(c) => c,
+            None => {
+                let start = latest_versionstamp(db, &self.name).await? + 1;
+                save_cursor(db, &self.name, start).await?;
+                start
+            }
+        };
+
+        let mut ready_tx = Some(ready_tx);
+        let mut backoff = RECONNECT_BACKOFF_START;
 
         loop {
-            tokio::select! {
-                // `biased`: give cancellation strict priority over message
-                // processing so a high-rate stream can't starve shutdown.
-                biased;
-                _ = token.cancelled() => {
-                    tracing::info!("listen_loop for {} received shutdown", self.name);
-                    drop(stream);
-                    // Best-effort cleanup of this agent's message edges. RELATE
-                    // assigns random edge ids, so delete by endpoint (in/out)
-                    // rather than by a name-keyed id (which matches nothing).
-                    // Bounded by a timeout so a wedged DB can't hang shutdown.
-                    let owner = RecordId::new(AGENT_TABLE, self.name.clone());
-                    let cleanup = async {
-                        db.query("DELETE message WHERE in = $owner OR out = $owner")
-                            .bind(("owner", owner))
-                            .await
-                    };
-                    match timeout(Duration::from_secs(2), cleanup).await {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => {
-                            tracing::warn!("failed to delete agent messages on shutdown: {}", e)
-                        }
-                        Err(_) => tracing::warn!(
-                            "timed out deleting agent messages on shutdown for {}",
-                            self.name
-                        ),
+            // (Re)subscribe the LIVE wake-up. The payload is ignored (typed as
+            // `Value` so it can never fail to deserialize) — it only signals
+            // "something changed"; delivery happens via catch_up. The owner is
+            // bound as a param so the agent name can't alter the query.
+            let query = "LIVE SELECT id FROM message WHERE out = $owner";
+            let subscribe = async {
+                let mut response =
+                    db.query(query)
+                        .bind(("owner", owner.clone()))
+                        .await
+                        .map_err(|source| Error::LiveQuery {
+                            agent: self.name.clone(),
+                            source,
+                        })?;
+                response
+                    .stream::<Notification<Value>>(0)
+                    .map_err(|source| Error::Stream {
+                        agent: self.name.clone(),
+                        source,
+                    })
+            };
+            let mut stream = match subscribe.await {
+                Ok(s) => s,
+                Err(e) if ready_tx.is_some() => return Err(e), // startup failure
+                Err(e) => {
+                    tracing::error!("resubscribe failed for {}: {e}", self.name);
+                    if cancel_or_sleep(&token, backoff).await {
+                        return Ok(());
                     }
-                    break;
+                    backoff = next_backoff(backoff);
+                    continue;
                 }
-                maybe = stream.next() => {
-                    match maybe {
-                        Some(Ok(notification)) => {
-                            let action = notification.action;
-                            if action == Action::Delete {
-                                continue;
-                            }
-                            let message = notification.data;
-                            tracing::info!(
-                                target = %self.name,
-                                from = ?message.r#in,
-                                "message received"
-                            );
-                            if let Err(e) = inbox_tx
-                                .send(Delivery { recipient: self.name.clone(), message })
-                                .await
+            };
+
+            // Drain the durable log up to the live edge. Anything published
+            // during the drain is buffered by the live stream and handled by the
+            // next catch_up in the inner loop.
+            if let Err(e) =
+                catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx).await
+            {
+                if ready_tx.is_some() {
+                    return Err(e); // startup failure
+                }
+                tracing::error!("catch_up failed for {}: {e}", self.name);
+                drop(stream);
+                if cancel_or_sleep(&token, backoff).await {
+                    return Ok(());
+                }
+                backoff = next_backoff(backoff);
+                continue;
+            }
+
+            // First successful subscribe + drain: signal readiness once.
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(());
+            }
+            backoff = RECONNECT_BACKOFF_START;
+
+            // Inner loop: each wake triggers a catch_up; stream end/error
+            // breaks out to reconnect.
+            loop {
+                tokio::select! {
+                    // `biased`: cancellation takes strict priority so a hot
+                    // stream can't starve shutdown.
+                    biased;
+                    _ = token.cancelled() => {
+                        tracing::info!("listen_loop for {} received shutdown", self.name);
+                        return Ok(());
+                    }
+                    maybe = stream.next() => match maybe {
+                        Some(Ok(_wake)) => {
+                            if let Err(e) =
+                                catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx).await
                             {
-                                tracing::debug!("inbox bus closed for {}: {}", self.name, e);
+                                tracing::error!("catch_up failed for {}: {e}", self.name);
+                                break;
                             }
                         }
-                        Some(Err(error)) => tracing::error!("stream error: {}", error),
-                        // Stream ended on its own (server KILLed the LIVE query,
-                        // connection dropped). Exit cleanly so this task returns
-                        // and drops its `inbox_tx` clone — otherwise the agent
-                        // would go silent yet keep the bus open until cancel.
+                        Some(Err(error)) => {
+                            tracing::error!("live wake stream error for {}: {error}", self.name);
+                            break;
+                        }
                         None => {
-                            tracing::info!("live stream ended for {}, listen_loop exiting", self.name);
+                            tracing::info!("live wake stream ended for {}, reconnecting", self.name);
                             break;
                         }
                     }
                 }
             }
+
+            drop(stream);
+            if cancel_or_sleep(&token, backoff).await {
+                return Ok(());
+            }
+            backoff = next_backoff(backoff);
         }
-        Ok(())
     }
 }
 
@@ -316,6 +378,16 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         // Drop our sender so only agent-held senders remain; the bus then closes
         // (recv returns Err) once every agent's listen_loop has shut down.
         drop(inbox_tx);
+
+        // One table-wide retention sweep per coalition ages out the durable
+        // message log (agents never delete messages). Runs under the same
+        // TaskTracker + a child token, so cancel→close→wait drains it too.
+        let sweep_token = cancellation_token.child_token();
+        let retention = Duration::from_secs(SETTINGS.sdb.message_retention_secs);
+        task_tracker.spawn(
+            retention_sweep(sweep_token, retention)
+                .instrument(tracing::info_span!("retention_sweep")),
+        );
 
         // Wait until every listen_loop has confirmed its LIVE query is
         // registered with the server. Without this handshake, Coalition::new
@@ -400,6 +472,205 @@ async fn await_ready(
             timeout: ready_timeout,
         }),
     }
+}
+
+// ============================================================================
+// Durable-log helpers (two-tier bus)
+// ============================================================================
+
+/// The single-field shape written to the `cursor` table.
+#[derive(Debug, SurrealValue)]
+struct CursorRow {
+    versionstamp: i64,
+}
+
+/// Pull the `versionstamp` out of a `cursor` record (or a `SHOW CHANGES`
+/// changeset) `Value::Object`.
+fn versionstamp_of(v: &Value) -> Option<i64> {
+    match v {
+        Value::Object(o) => match o.get("versionstamp") {
+            Some(Value::Number(n)) => n.to_int(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Load the persisted high-water-mark cursor for `agent`, if any.
+async fn load_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Option<i64>> {
+    let row: Option<Value> =
+        db.select((CURSOR_TABLE, agent))
+            .await
+            .map_err(|source| Error::CursorLoad {
+                agent: agent.to_string(),
+                source,
+            })?;
+    Ok(row.as_ref().and_then(versionstamp_of))
+}
+
+/// Persist `agent`'s cursor (UPSERT so the first save creates the row). The
+/// return is read back as `Value` to avoid coupling to the record's `id` field.
+async fn save_cursor(db: &Surreal<any::Any>, agent: &str, versionstamp: i64) -> Result<()> {
+    let _: Option<Value> = db
+        .upsert((CURSOR_TABLE, agent))
+        .content(CursorRow { versionstamp })
+        .await
+        .map_err(|source| Error::CursorSave {
+            agent: agent.to_string(),
+            source,
+        })?;
+    Ok(())
+}
+
+/// Largest `versionstamp` in a `SHOW CHANGES` result array (0 if empty/none).
+fn max_versionstamp(v: &Value) -> i64 {
+    let Value::Array(arr) = v else { return 0 };
+    arr.iter().filter_map(versionstamp_of).max().unwrap_or(0)
+}
+
+/// Latest versionstamp currently retained in the message changefeed, for the
+/// first-run "start from now" snapshot. Reads (and discards) the retained window
+/// once; returns 0 when the feed is empty. Only runs when an agent has no
+/// persisted cursor yet.
+async fn latest_versionstamp(db: &Surreal<any::Any>, agent: &str) -> Result<i64> {
+    let q = format!("SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE 0 LIMIT 1000000");
+    let v: Value = db
+        .query(&q)
+        .await
+        .map_err(|source| Error::CatchUp {
+            agent: agent.to_string(),
+            source,
+        })?
+        .take(0)
+        .map_err(|source| Error::CatchUp {
+            agent: agent.to_string(),
+            source,
+        })?;
+    Ok(max_versionstamp(&v))
+}
+
+/// Drain the durable log from `*cursor` and deliver every message addressed to
+/// `owner`, advancing + persisting the cursor past everything seen. Bounded and
+/// resumable; loops until a short page signals the live edge is reached. Because
+/// `cursor = max_seen + 1`, a delivered message is never re-read (no dedup set
+/// needed); `SHOW CHANGES` is table-wide, so non-owner changes are filtered out.
+async fn catch_up<T>(
+    db: &Surreal<any::Any>,
+    owner: &RecordId,
+    agent: &str,
+    cursor: &mut i64,
+    inbox_tx: &AsyncSender<Delivery<T>>,
+) -> Result<()>
+where
+    T: SurrealValue + Send + Sync + Unpin + 'static,
+{
+    loop {
+        let q = format!(
+            "SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {} LIMIT {CATCHUP_BATCH}",
+            *cursor
+        );
+        let v: Value = db
+            .query(&q)
+            .await
+            .map_err(|source| Error::CatchUp {
+                agent: agent.to_string(),
+                source,
+            })?
+            .take(0)
+            .map_err(|source| Error::CatchUp {
+                agent: agent.to_string(),
+                source,
+            })?;
+        let Value::Array(changesets) = v else { break };
+        let page = changesets.len();
+        if page == 0 {
+            break;
+        }
+
+        let mut max_vs = *cursor - 1;
+        for changeset in changesets.iter() {
+            let Value::Object(obj) = changeset else {
+                continue;
+            };
+            if let Some(vs) = versionstamp_of(changeset) {
+                max_vs = max_vs.max(vs);
+            }
+            let Some(Value::Array(changes)) = obj.get("changes") else {
+                continue;
+            };
+            for change in changes.iter() {
+                let Value::Object(op) = change else { continue };
+                // RELATE-created edges surface as a "create"/"update" op carrying
+                // the full record; "delete" ops (retention sweep) are skipped.
+                let Some(record) = op.get("update").or_else(|| op.get("create")) else {
+                    continue;
+                };
+                let message = match Message::<T>::from_value(record.clone()) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!("skipping undecodable change for {agent}: {e}");
+                        continue;
+                    }
+                };
+                if message.out.as_ref() != Some(owner) {
+                    continue; // table-wide feed — keep only ours
+                }
+                tracing::info!(target = %agent, from = ?message.r#in, "message delivered");
+                if let Err(e) = inbox_tx
+                    .send(Delivery {
+                        recipient: agent.to_string(),
+                        message,
+                    })
+                    .await
+                {
+                    tracing::debug!("inbox bus closed for {agent}: {e}");
+                }
+            }
+        }
+
+        if max_vs >= *cursor {
+            *cursor = max_vs + 1;
+            save_cursor(db, agent, *cursor).await?;
+        }
+        if page < CATCHUP_BATCH {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Periodic age-out sweep: delete message rows older than the retention window.
+/// One task per coalition (table-wide); the durable log is otherwise never
+/// pruned. Runs every `retention/4` (min 60s) until cancelled.
+async fn retention_sweep(token: CancellationToken, retention: Duration) {
+    let db = sdb::SurrealDBWrapper::connection().await;
+    let interval = (retention / 4).max(Duration::from_secs(60));
+    let secs = retention.as_secs();
+    let q = format!("DELETE {MESSAGE_TABLE} WHERE created < time::now() - {secs}s");
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = sleep(interval) => {
+                if let Err(e) = db.query(&q).await.and_then(|r| r.check()) {
+                    tracing::warn!("retention sweep failed: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Sleep for `dur` unless cancelled first. Returns `true` if cancellation won
+/// (the caller should stop).
+async fn cancel_or_sleep(token: &CancellationToken, dur: Duration) -> bool {
+    tokio::select! {
+        _ = token.cancelled() => true,
+        _ = sleep(dur) => false,
+    }
+}
+
+/// Capped exponential backoff step.
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(RECONNECT_BACKOFF_MAX)
 }
 
 #[cfg(test)]

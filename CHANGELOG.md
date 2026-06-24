@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Two-tier durable message bus** — delivery is now at-least-once + idempotent
+  across disconnects *and* restarts, replacing the previous at-most-once LIVE
+  behaviour (a message published while an agent was disconnected was silently
+  lost; see the SurrealDB `live-queries` skill, "Delivery guarantees").
+  - The `message` edge table is the durable log, backed by a `CHANGEFEED`
+    (window = `sdb.message_retention_secs`, default 24h).
+  - `LIVE SELECT` is now a pure low-latency **wake-up**; the sole delivery path
+    is a `SHOW CHANGES … SINCE <cursor>` catch-up that advances a **persisted
+    per-agent versionstamp cursor** (`cursor:<agent>`), so messages are never
+    re-read (no dedup set) and resume exactly across restarts.
+  - The listen loop now **reconnects** with capped exponential backoff and
+    re-runs catch-up on every (re)connect, instead of exiting on stream end.
+  - Messages are **no longer deleted on shutdown**; the log is aged out by a
+    per-coalition retention sweep (`DELETE message WHERE created < now-retention`).
+  - `Agent::new` is now restart-idempotent (reuses an existing agent record) so a
+    restarted coalition resumes its durable cursors.
+  - `Message<T>` gains an `id: Option<RecordId>` field, populated on delivery, so
+    consumers can identify/deduplicate under the at-least-once guarantee.
+  - New setting `sdb.message_retention_secs` (default `86400`).
+
+### Changed
+
+- Bumped `surrealdb` / `surrealdb-types` 3.1.4 → 3.1.5. Notably inherits the WS
+  client fix [surrealdb#7037](https://github.com/surrealdb/surrealdb/issues/7037):
+  an incoming WS frame that cannot be decoded far enough to recover its request
+  id now **fails all pending requests with the deserialization error** instead of
+  being silently dropped (which previously left every in-flight `await` — query,
+  LIVE registration, RELATE — hanging indefinitely). Relevant here because the
+  dev/prod endpoints are `ws://` / `wss://` and the listen loop relies on
+  long-lived LIVE streams; a malformed/incompatible server frame can no longer
+  wedge an agent forever.
+
 ## [0.1.0] - 2026-06-17
 
 ### Added

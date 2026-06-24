@@ -19,3 +19,6 @@ database = "main"
 username = "root"
 password = "root"
 endpoint = "ws://127.0.0.1:8000"
+# Durable message-log retention window (seconds). Drives the `message` table
+# CHANGEFEED window (max replay-on-reconnect) and the age-out sweep. Default 24h.
+message_retention_secs = 86400
