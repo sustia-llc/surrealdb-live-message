@@ -9,10 +9,10 @@ edition = "2024"
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
-surrealdb = { version = "3.1.5", features = ["kv-mem"] }
-surrealdb-types = "3.1.5"
+surrealdb = { version = "3.2.1", features = ["kv-mem"] }
+surrealdb-types = "3.2.1"
 futures = "0.3"
-kanal = { git = "https://github.com/fereidani/kanal", rev = "9a4b98d570258410fa07c5329e3c4499533b1e92" }
+kanal = { git = "https://github.com/fereidani/kanal", rev = "89a1a3c75d4d8cdf7d624afd1c593f11da6c0047" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
