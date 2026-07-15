@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-15
+
+### Changed
+
+- Bump `surrealdb`/`surrealdb-types` to 3.2.1 and `kanal` to rev `89a1a3c`
+  (commit `4052401`, 2026-07-11 — tagged here so downstream git-tag consumers
+  such as koalisi can pin the 3.2.1-aligned stack).
+- `Cargo.toml` `version` field now tracks releases (it had stayed at `0.1.0`
+  through the `v0.2.0` tag; the git tag is the authoritative pin either way).
+
+## [0.2.0] - 2026-06-24
+
 ### Added
 
 - **Two-tier durable message bus** — delivery is now at-least-once + idempotent
