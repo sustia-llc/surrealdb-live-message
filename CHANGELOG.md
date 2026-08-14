@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-14
+
+### Changed
+
+- Bump `surrealdb`/`surrealdb-types` to 3.2.4 and the test-harness Docker image
+  tag (`sdb.tag` in `config/default.toml`) to `v3.2.4`. No source changes were
+  needed — `cargo clippy --all-targets -- -W clippy::pedantic` is clean of new
+  diagnostics and both `--lib` and the Docker-backed `integration_test` pass
+  against the v3.2.4 container.
+
+### Fixed
+
+- Docs: the "edge records omit `in`/`out`" gotcha in `CLAUDE.md` and
+  `src/message.rs` still described the pre-two-tier subscription shape
+  (`LIVE SELECT *, in, out`). The wake-up subscription has been
+  `LIVE SELECT id FROM message WHERE out = $owner` since 0.2.0 —
+  `SHOW CHANGES` changesets carry `id`/`in`/`out` natively. The gotcha is
+  re-pointed at the plain `SELECT` sites in `tests/integration_test.rs`,
+  where it is still load-bearing. (`README.md` was already correct.)
+
 ## [0.2.1] - 2026-07-15
 
 ### Changed

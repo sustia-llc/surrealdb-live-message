@@ -18,8 +18,8 @@ messaging over SurrealDB graph edges + LIVE queries, with `src/main.rs` as a bin
 
 These were diagnosed fixes; tests lock them in. See docstrings in `src/message.rs` and `src/subsystems/agents.rs`.
 
-1. **Edge fields need `#[surreal(rename = "in")]`.** `SurrealValue` derive uses raw Rust identifiers as wire keys, so `r#in` would serialize as `"r#in"`. SurrealDB emits `"in"` for edge source. **serde `rename` is ignored** — must use the `#[surreal(...)]` attribute. (`src/message.rs:25`)
-2. **`LIVE SELECT *` on edge records omits `in`/`out`.** The subscription must be `LIVE SELECT *, in, out FROM message WHERE ...` (`src/subsystems/agents.rs:95`). `tests/integration_test.rs:127` asserts both pointers deserialize.
+1. **Edge fields need `#[surreal(rename = "in")]`.** `SurrealValue` derive uses raw Rust identifiers as wire keys, so `r#in` would serialize as `"r#in"`. SurrealDB emits `"in"` for edge source. **serde `rename` is ignored** — must use the `#[surreal(...)]` attribute. (`src/message.rs:34`)
+2. **A bare `SELECT *` / `LIVE SELECT *` on edge records omits `in`/`out`.** Read edge pointers with an explicit projection — `SELECT *, in, out FROM message WHERE ...` (`tests/integration_test.rs:151`, `:175`, `:242`; the pointer assertions at `:165`–`:172` lock it in). The **durable bus sidesteps this**: `SHOW CHANGES` changeset records carry `id`/`in`/`out` natively, so the wake-up subscription is only `LIVE SELECT id FROM message WHERE out = $owner` (`src/subsystems/agents.rs:215`). The gotcha still applies to any plain `SELECT` you add.
 3. Payload types must derive `SurrealValue` — `Message<T: SurrealValue>`, not just `Serialize`.
 
 ## Lifecycle / shutdown contract

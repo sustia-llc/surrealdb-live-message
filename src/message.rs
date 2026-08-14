@@ -17,9 +17,12 @@ pub const MESSAGE_TABLE: &str = "message";
 ///    `SurrealValue` derive). Without this, `Option<RecordId>` silently
 ///    deserializes to `None`.
 ///
-/// 2. **`LIVE SELECT *` on edge records omits `in`/`out`.** The subscription
-///    must be `LIVE SELECT *, in, out FROM message WHERE ...`. See
-///    `agents::Agent::listen_loop`.
+/// 2. **A bare `SELECT *` / `LIVE SELECT *` on edge records omits `in`/`out`.**
+///    Read the edge pointers with an explicit projection —
+///    `SELECT *, in, out FROM message WHERE ...`. The two-tier durable bus
+///    sidesteps this on the delivery path: `SHOW CHANGES` changeset records
+///    carry `id`/`in`/`out` natively, so the wake-up subscription in
+///    `agents::Agent::listen_loop` is only `LIVE SELECT id`.
 #[derive(Debug, Serialize, Deserialize, SurrealValue)]
 pub struct Message<T: SurrealValue> {
     /// The edge record's own id. Populated on **delivery** (the durable-log
