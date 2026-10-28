@@ -1,33 +1,33 @@
 [package]
 name = "surrealdb_live_message"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
-tokio-stream = "0.1"
-tokio-util = { version = "0.7", features = ["rt"] }
-surrealdb = { version = "3.2.4", features = ["kv-mem"] }
-surrealdb-types = "3.2.4"
-futures = "0.3"
+tokio = { version = "1.54.1", features = ["full", "macros", "rt-multi-thread"] }
+tokio-stream = "0.1.19"
+tokio-util = { version = "0.7.20", features = ["rt"] }
+surrealdb = { version = "3.3.4", features = ["kv-mem"] }
+surrealdb-types = "3.3.4"
+futures = "0.3.34"
 kanal = { git = "https://github.com/fereidani/kanal", rev = "89a1a3c75d4d8cdf7d624afd1c593f11da6c0047" }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0"
-anyhow = "1.0"
-thiserror = "2"
-tracing = "0.1.4"
-tracing-subscriber = "0.3"
-config = "0.15"
-bollard = "0.21"
-reqwest = { version = "0.13", default-features = false, features = [
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+config = "0.15.27"
+bollard = "0.21.1"
+reqwest = { version = "0.13.5", default-features = false, features = [
     "blocking",
     "gzip",
 ] }
 
 [dev-dependencies]
-futures = "0.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0"
-tokio-graceful-shutdown = "0.20"
+futures = "0.3.34"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio-graceful-shutdown = "0.20.0"

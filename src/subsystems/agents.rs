@@ -4,14 +4,15 @@ use futures::StreamExt;
 use kanal::{AsyncReceiver, AsyncSender};
 use serde::{Deserialize, Serialize};
 use surrealdb::engine::any;
+use surrealdb::method::QueryStream;
 use surrealdb::{Notification, Surreal};
-use surrealdb_types::{Datetime, RecordId, SurrealValue, Value};
+use surrealdb_types::{Datetime, RecordId, SurrealValue, Uuid, Value};
 use tokio::sync::{RwLock, oneshot};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Instrument;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, chain};
 use crate::message::{MESSAGE_TABLE, Message};
 use crate::settings::SETTINGS;
 use crate::subsystems::sdb;
@@ -36,6 +37,9 @@ const CATCHUP_BATCH: usize = 1000;
 /// Reconnect backoff bounds for the LIVE wake-up subscription.
 const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(200);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Maximum time [`end_live`] waits for a `KILL` of a live query.
+const LIVE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// An inbound message delivered to an agent's listen loop, forwarded onto the
 /// coalition's shared kanal bus. `recipient` is the agent that received it;
@@ -84,7 +88,7 @@ impl Agent {
             .await
             .map_err(|source| Error::AgentCreate {
                 agent: name.to_string(),
-                source,
+                source: Box::new(source),
             })?
         {
             return Ok(existing);
@@ -100,7 +104,7 @@ impl Agent {
             .await
             .map_err(|source| Error::AgentCreate {
                 agent: name.to_string(),
-                source,
+                source: Box::new(source),
             })?
             // Defensive: on a healthy DB `create().content()` returns `Some` on
             // success or `Err` on a duplicate id, never `Ok(None)`. This branch
@@ -135,7 +139,7 @@ impl Agent {
                 .await
                 .map_err(|source| Error::Send {
                     to: to.to_string(),
-                    source,
+                    source: Box::new(source),
                 })?;
         if recipient.is_none() {
             return Err(Error::UnknownRecipient { to: to.to_string() });
@@ -151,7 +155,7 @@ impl Agent {
             .await
             .map_err(|source| Error::Send {
                 to: to.to_string(),
-                source,
+                source: Box::new(source),
             })?;
 
         Ok(())
@@ -208,32 +212,12 @@ impl Agent {
         let mut backoff = RECONNECT_BACKOFF_START;
 
         loop {
-            // (Re)subscribe the LIVE wake-up. The payload is ignored (typed as
-            // `Value` so it can never fail to deserialize) — it only signals
-            // "something changed"; delivery happens via catch_up. The owner is
-            // bound as a param so the agent name can't alter the query.
-            let query = "LIVE SELECT id FROM message WHERE out = $owner";
-            let subscribe = async {
-                let mut response =
-                    db.query(query)
-                        .bind(("owner", owner.clone()))
-                        .await
-                        .map_err(|source| Error::LiveQuery {
-                            agent: self.name.clone(),
-                            source,
-                        })?;
-                response
-                    .stream::<Notification<Value>>(0)
-                    .map_err(|source| Error::Stream {
-                        agent: self.name.clone(),
-                        source,
-                    })
-            };
-            let mut stream = match subscribe.await {
+            // (Re)subscribe the LIVE wake-up.
+            let (mut stream, live_id) = match subscribe_wake(db, &owner, &self.name).await {
                 Ok(s) => s,
                 Err(e) if ready_tx.is_some() => return Err(e), // startup failure
                 Err(e) => {
-                    tracing::error!("resubscribe failed for {}: {e}", self.name);
+                    tracing::error!("resubscribe failed for {}: {}", self.name, chain(&e));
                     if cancel_or_sleep(&token, backoff).await {
                         return Ok(());
                     }
@@ -245,14 +229,12 @@ impl Agent {
             // Drain the durable log up to the live edge. Anything published
             // during the drain is buffered by the live stream and handled by the
             // next catch_up in the inner loop.
-            if let Err(e) =
-                catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx).await
-            {
+            if let Err(e) = catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx).await {
+                end_live(db, &self.name, live_id, stream).await;
                 if ready_tx.is_some() {
                     return Err(e); // startup failure
                 }
-                tracing::error!("catch_up failed for {}: {e}", self.name);
-                drop(stream);
+                tracing::error!("catch_up failed for {}: {}", self.name, chain(&e));
                 if cancel_or_sleep(&token, backoff).await {
                     return Ok(());
                 }
@@ -275,6 +257,7 @@ impl Agent {
                     biased;
                     _ = token.cancelled() => {
                         tracing::info!("listen_loop for {} received shutdown", self.name);
+                        end_live(db, &self.name, live_id, stream).await;
                         return Ok(());
                     }
                     maybe = stream.next() => match maybe {
@@ -282,12 +265,16 @@ impl Agent {
                             if let Err(e) =
                                 catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx).await
                             {
-                                tracing::error!("catch_up failed for {}: {e}", self.name);
+                                tracing::error!("catch_up failed for {}: {}", self.name, chain(&e));
                                 break;
                             }
                         }
                         Some(Err(error)) => {
-                            tracing::error!("live wake stream error for {}: {error}", self.name);
+                            tracing::error!(
+                                "live wake stream error for {}: {}",
+                                self.name,
+                                chain(&error)
+                            );
                             break;
                         }
                         None => {
@@ -298,7 +285,7 @@ impl Agent {
                 }
             }
 
-            drop(stream);
+            end_live(db, &self.name, live_id, stream).await;
             if cancel_or_sleep(&token, backoff).await {
                 return Ok(());
             }
@@ -503,7 +490,7 @@ async fn load_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Option<i64>>
             .await
             .map_err(|source| Error::CursorLoad {
                 agent: agent.to_string(),
-                source,
+                source: Box::new(source),
             })?;
     Ok(row.as_ref().and_then(versionstamp_of))
 }
@@ -517,7 +504,7 @@ async fn save_cursor(db: &Surreal<any::Any>, agent: &str, versionstamp: i64) -> 
         .await
         .map_err(|source| Error::CursorSave {
             agent: agent.to_string(),
-            source,
+            source: Box::new(source),
         })?;
     Ok(())
 }
@@ -539,12 +526,12 @@ async fn latest_versionstamp(db: &Surreal<any::Any>, agent: &str) -> Result<i64>
         .await
         .map_err(|source| Error::CatchUp {
             agent: agent.to_string(),
-            source,
+            source: Box::new(source),
         })?
         .take(0)
         .map_err(|source| Error::CatchUp {
             agent: agent.to_string(),
-            source,
+            source: Box::new(source),
         })?;
     Ok(max_versionstamp(&v))
 }
@@ -574,12 +561,12 @@ where
             .await
             .map_err(|source| Error::CatchUp {
                 agent: agent.to_string(),
-                source,
+                source: Box::new(source),
             })?
             .take(0)
             .map_err(|source| Error::CatchUp {
                 agent: agent.to_string(),
-                source,
+                source: Box::new(source),
             })?;
         let Value::Array(changesets) = v else { break };
         let page = changesets.len();
@@ -608,7 +595,7 @@ where
                 let message = match Message::<T>::from_value(record.clone()) {
                     Ok(m) => m,
                     Err(e) => {
-                        tracing::warn!("skipping undecodable change for {agent}: {e}");
+                        tracing::warn!("skipping undecodable change for {agent}: {}", chain(&e));
                         continue;
                     }
                 };
@@ -652,7 +639,7 @@ async fn retention_sweep(token: CancellationToken, retention: Duration) {
             _ = token.cancelled() => break,
             _ = sleep(interval) => {
                 if let Err(e) = db.query(&q).await.and_then(|r| r.check()) {
-                    tracing::warn!("retention sweep failed: {e}");
+                    tracing::warn!("retention sweep failed: {}", chain(&e));
                 }
             }
         }
@@ -671,6 +658,73 @@ async fn cancel_or_sleep(token: &CancellationToken, dur: Duration) -> bool {
 /// Capped exponential backoff step.
 fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(RECONNECT_BACKOFF_MAX)
+}
+
+/// Register the LIVE wake-up subscription for `owner` and return its stream
+/// with its live-query id, read from statement 0's result.
+///
+/// The payload is typed as `Value` and only signals that a message for `owner`
+/// changed; delivery happens via catch_up. `owner` is bound as a parameter.
+async fn subscribe_wake(
+    db: &Surreal<any::Any>,
+    owner: &RecordId,
+    agent: &str,
+) -> Result<(QueryStream<Notification<Value>>, Uuid)> {
+    let mut response = db
+        .query("LIVE SELECT id FROM message WHERE out = $owner")
+        .bind(("owner", owner.clone()))
+        .await
+        .map_err(|source| Error::LiveQuery {
+            agent: agent.to_string(),
+            source: Box::new(source),
+        })?;
+    let stream = response
+        .stream::<Notification<Value>>(0)
+        .map_err(|source| Error::Stream {
+            agent: agent.to_string(),
+            source: Box::new(source),
+        })?;
+    match response.take::<Value>(0) {
+        Ok(Value::Uuid(live_id)) => Ok((stream, live_id)),
+        _ => Err(Error::LiveQueryIdMissing {
+            agent: agent.to_string(),
+        }),
+    }
+}
+
+/// `KILL` live query `live_id` through `db` within [`LIVE_KILL_TIMEOUT`],
+/// logging a failure or timeout at warn, then drop `stream`.
+async fn end_live(
+    db: &Surreal<any::Any>,
+    agent: &str,
+    live_id: Uuid,
+    stream: QueryStream<Notification<Value>>,
+) {
+    let kill = db.query("KILL $id").bind(("id", Value::Uuid(live_id)));
+    let outcome = match timeout(LIVE_KILL_TIMEOUT, kill).await {
+        Ok(result) => result
+            .and_then(|r| r.check())
+            .map(drop)
+            .map_err(|source| Error::LiveKill {
+                agent: agent.to_string(),
+                live_id,
+                source: Box::new(source),
+            }),
+        Err(_elapsed) => Err(Error::LiveKillTimeout {
+            agent: agent.to_string(),
+            live_id,
+            timeout: LIVE_KILL_TIMEOUT,
+        }),
+    };
+    if let Err(e) = outcome {
+        warn_end_live(&e);
+    }
+    drop(stream);
+}
+
+/// Log an [`end_live`] failure at warn with its full source chain.
+fn warn_end_live(e: &Error) {
+    tracing::warn!("{}", chain(e));
 }
 
 #[cfg(test)]
@@ -703,6 +757,131 @@ mod tests {
         assert!(
             matches!(err, Error::ListenLoopDropped { ref agent } if agent == "frank"),
             "expected ListenLoopDropped for 'frank', got {err:?}"
+        );
+    }
+
+    /// An in-memory datastore with the `message` table defined.
+    async fn mem_db() -> Surreal<any::Any> {
+        let db = any::connect("mem://").await.expect("connect mem://");
+        db.use_ns("test").use_db("test").await.expect("use ns/db");
+        db.query(format!("DEFINE TABLE {MESSAGE_TABLE}"))
+            .await
+            .and_then(|r| r.check())
+            .expect("define message table");
+        db
+    }
+
+    /// Ids of the live queries the datastore holds on `message`, read from
+    /// `INFO FOR TABLE message` → `lives`.
+    async fn message_lives(db: &Surreal<any::Any>) -> Vec<String> {
+        let info: Value = db
+            .query(format!("INFO FOR TABLE {MESSAGE_TABLE}"))
+            .await
+            .expect("info query")
+            .take(0)
+            .expect("info result");
+        let Value::Object(info) = info else {
+            panic!("INFO FOR TABLE returned a non-object: {info:?}");
+        };
+        match info.get("lives") {
+            Some(Value::Object(lives)) => lives.keys().cloned().collect(),
+            other => panic!("INFO FOR TABLE has no `lives` object: {other:?}"),
+        }
+    }
+
+    /// Time for a `Drop`-spawned SDK KILL to run before the datastore is read.
+    const DROP_KILL_SETTLE: Duration = Duration::from_millis(300);
+
+    /// [`end_live`] removes the wake-up subscription from the datastore.
+    #[tokio::test]
+    async fn end_live_removes_the_live_query() {
+        let db = mem_db().await;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe");
+        let id = live_id.to_string();
+        let before = message_lives(&db).await;
+        assert_eq!(
+            before,
+            vec![id.clone()],
+            "subscribe registers one live query"
+        );
+
+        end_live(&db, "frank", live_id, stream).await;
+        sleep(DROP_KILL_SETTLE).await;
+
+        let after = message_lives(&db).await;
+        assert!(
+            after.is_empty(),
+            "live query {id} must be gone after end_live; datastore still lists {after:?}"
+        );
+    }
+
+    /// Countermodel: dropping the SDK stream alone leaves the live query
+    /// registered. Its `Drop` KILL runs on a fresh session with no namespace,
+    /// database or sign-in, which the datastore refuses.
+    #[tokio::test]
+    async fn dropping_the_stream_leaves_the_live_query() {
+        let db = mem_db().await;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe");
+
+        drop(stream);
+        sleep(DROP_KILL_SETTLE).await;
+
+        let after = message_lives(&db).await;
+        assert_eq!(
+            after,
+            vec![live_id.to_string()],
+            "the SDK's Drop KILL is expected to fail and leave {live_id} registered"
+        );
+    }
+
+    /// In-memory sink for a test tracing subscriber.
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log sink lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// [`end_live`]'s warn line for [`Error::LiveKill`] carries the inner
+    /// surrealdb error text, not only the variant's own message.
+    #[test]
+    fn end_live_warning_includes_the_kill_error_source() {
+        let inner = "kill refused by datastore";
+        let err = Error::LiveKill {
+            agent: "frank".to_string(),
+            live_id: Uuid::new_v4(),
+            source: Box::new(surrealdb::Error::internal(inner.to_string())),
+        };
+
+        let sink = LogSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || warn_end_live(&err));
+
+        let logs =
+            String::from_utf8(sink.0.lock().expect("log sink lock").clone()).expect("utf-8 logs");
+        let line = logs
+            .lines()
+            .find(|l| l.contains("failed to KILL live query"))
+            .unwrap_or_else(|| panic!("no LiveKill warn line; captured logs {logs:?}"));
+        assert!(
+            line.contains(inner),
+            "LiveKill warn line must contain the inner error {inner:?}; got {line:?}"
         );
     }
 

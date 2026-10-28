@@ -103,8 +103,8 @@ async fn daemon(subsys: &mut SubsystemHandle) -> anyhow::Result<()> {
             sdb_token.cancel();
             match result {
                 Ok(Ok(())) => anyhow::bail!("sdb_task exited before signalling ready"),
-                Ok(Err(e)) => anyhow::bail!("sdb_task failed during startup: {e}"),
-                Err(e)     => anyhow::bail!("sdb_task panicked during startup: {e}"),
+                Ok(Err(e)) => return Err(anyhow::Error::new(e).context("sdb_task failed during startup")),
+                Err(e)     => return Err(anyhow::Error::new(e).context("sdb_task panicked during startup")),
             }
         }
         _ = sleep(STARTUP_TIMEOUT) => {

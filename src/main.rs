@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use surrealdb_types::SurrealValue;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+use surrealdb_live_message::error::chain;
 use surrealdb_live_message::logger;
 use surrealdb_live_message::subsystems::agents::Coalition;
 use surrealdb_live_message::subsystems::sdb::{self, SurrealDBWrapper};
@@ -30,7 +31,7 @@ async fn main() -> Result<()> {
     let sdb_token = token.child_token();
     tracker.spawn(async move {
         if let Err(e) = sdb::sdb_task(sdb_token).await {
-            tracing::error!("sdb_task failed: {}", e);
+            tracing::error!("sdb_task failed: {}", chain(&e));
         }
     });
 

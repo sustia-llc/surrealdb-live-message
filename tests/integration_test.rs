@@ -211,10 +211,46 @@ async fn test_agent_messaging() {
     scenario_durable_restart().await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
+    let lives_before = message_lives(db).await;
+    assert!(
+        !lives_before.is_empty(),
+        "precondition: the live coalition must hold live queries on `message` \
+         before shutdown; found {} ({lives_before:?})",
+        lives_before.len()
+    );
     coalition.shutdown().await;
+    assert_no_live_queries(db).await;
     harness_token.cancel();
     harness_tracker.close();
     harness_tracker.wait().await;
+}
+
+/// Ids of the live queries the server holds on `message`.
+async fn message_lives(db: &Surreal<any::Any>) -> Vec<String> {
+    let info: surrealdb_types::Value = db
+        .query(format!("INFO FOR TABLE {MESSAGE_TABLE}"))
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    let surrealdb_types::Value::Object(info) = info else {
+        panic!("INFO FOR TABLE returned a non-object: {info:?}");
+    };
+    match info.get("lives") {
+        Some(surrealdb_types::Value::Object(lives)) => lives.keys().cloned().collect(),
+        other => panic!("INFO FOR TABLE has no `lives` object: {other:?}"),
+    }
+}
+
+/// **Shutdown ends every LIVE query.** Once every coalition in this test has
+/// shut down, the server lists no live query on `message`
+/// (`INFO FOR TABLE message` → `lives`).
+async fn assert_no_live_queries(db: &Surreal<any::Any>) {
+    let lives = message_lives(db).await;
+    assert!(
+        lives.is_empty(),
+        "live queries still registered after shutdown: {lives:?}"
+    );
 }
 
 /// **Send to unknown agent is rejected.** `Agent::send` to a name with no

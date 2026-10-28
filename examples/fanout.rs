@@ -60,7 +60,11 @@ async fn main() -> anyhow::Result<()> {
         }
         result = &mut sdb_handle => {
             token.cancel();
-            anyhow::bail!("sdb_task exited during startup: {result:?}");
+            match result {
+                Ok(Ok(())) => anyhow::bail!("sdb_task exited before signalling ready"),
+                Ok(Err(e)) => return Err(anyhow::Error::new(e).context("sdb_task failed during startup")),
+                Err(e)     => return Err(anyhow::Error::new(e).context("sdb_task panicked during startup")),
+            }
         }
         _ = sleep(STARTUP_TIMEOUT) => {
             token.cancel();

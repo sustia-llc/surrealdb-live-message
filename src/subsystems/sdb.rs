@@ -54,13 +54,13 @@ impl SurrealDBWrapper {
     async fn client() -> Surreal<any::Any> {
         let db = any::connect(&SETTINGS.sdb.endpoint)
             .await
-            .map_err(Error::Connect)
+            .map_err(|e| Error::Connect(Box::new(e)))
             .expect("Failed to connect to SurrealDB via WebSocket");
 
         db.use_ns(&SETTINGS.sdb.namespace)
             .use_db(&SETTINGS.sdb.database)
             .await
-            .map_err(Error::UseNsDb)
+            .map_err(|e| Error::UseNsDb(Box::new(e)))
             .expect("Failed to select namespace and database");
 
         let _ = db
@@ -69,7 +69,7 @@ impl SurrealDBWrapper {
                 password: SETTINGS.sdb.password.clone(),
             })
             .await
-            .map_err(Error::Auth)
+            .map_err(|e| Error::Auth(Box::new(e)))
             .expect("Failed to authenticate with SurrealDB");
 
         // Define schema exactly once, after signin and before any agent/message
@@ -129,9 +129,9 @@ impl SurrealDBWrapper {
 
         db.query(&schema)
             .await
-            .map_err(Error::Schema)?
+            .map_err(|e| Error::Schema(Box::new(e)))?
             .check()
-            .map_err(Error::Schema)?;
+            .map_err(|e| Error::Schema(Box::new(e)))?;
 
         Ok(())
     }

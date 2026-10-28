@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bump `surrealdb`/`surrealdb-types` to 3.3.4 and the integration-test Docker
+  image tag (`sdb.tag` in `config/default.toml`) to `v3.3.4`. Pin the other
+  dependencies to their current patch versions. Bump the toolchain to 1.99.1.
+- Breaking: every `Error` variant that holds a `surrealdb::Error` now holds a
+  `Box<surrealdb::Error>`. `Connect`, `UseNsDb`, `Auth` and `Schema` box the
+  tuple field. `AgentCreate`, `Send`, `LiveQuery`, `Stream`, `CursorLoad`,
+  `CursorSave` and `CatchUp` box their `source` field.
+
+### Added
+
+- `Error::LiveQueryIdMissing`, `Error::LiveKill` and `Error::LiveKillTimeout`.
+- `error::chain`, which joins an error and its `source()` chain with `": "`.
+  The warn and error logs in `listen_loop`, the retention sweep, `main.rs`
+  and `examples/messaging.rs` use it, so they show the inner SurrealDB error.
+- All seven examples return the startup failure of `sdb_task` as the source
+  of the `anyhow` error, so `{:#}` shows the inner error.
+
+### Fixed
+
+- `listen_loop` sends `KILL` for its wake-up live query through the signed-in
+  connection before it drops the stream, with a 2-second limit
+  (`LIVE_KILL_TIMEOUT`). The SDK's own drop sends `KILL` on a session that
+  never signed in, so the server refused it and the live query stayed
+  registered (surrealdb/surrealdb#7625). The SDK still logs
+  `Failed to kill live query` once per stream.
+
 ## [0.2.2] - 2026-08-14
 
 ### Changed

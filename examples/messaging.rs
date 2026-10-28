@@ -29,6 +29,7 @@ use surrealdb_types::SurrealValue;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+use surrealdb_live_message::error::chain;
 use surrealdb_live_message::logger;
 use surrealdb_live_message::subsystems::agents::Coalition;
 use surrealdb_live_message::subsystems::sdb::{self, SurrealDBWrapper};
@@ -65,7 +66,11 @@ async fn main() -> anyhow::Result<()> {
         }
         result = &mut sdb_handle => {
             token.cancel();
-            anyhow::bail!("sdb_task exited during startup: {result:?}");
+            match result {
+                Ok(Ok(())) => anyhow::bail!("sdb_task exited before signalling ready"),
+                Ok(Err(e)) => return Err(anyhow::Error::new(e).context("sdb_task failed during startup")),
+                Err(e)     => return Err(anyhow::Error::new(e).context("sdb_task panicked during startup")),
+            }
         }
         _ = sleep(STARTUP_TIMEOUT) => {
             token.cancel();
@@ -103,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
                         body: format!("re: {}", d.message.payload.body),
                     };
                     if let Err(e) = bob.send(&d.message.payload.from, reply).await {
-                        tracing::error!("bob reply failed: {e}");
+                        tracing::error!("bob reply failed: {}", chain(&e));
                     }
                 }
                 // Reply landed back on the original sender — round-trip done.
