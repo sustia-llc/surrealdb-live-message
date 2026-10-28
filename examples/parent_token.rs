@@ -58,7 +58,9 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.expect("install ctrl_c handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install ctrl_c handler");
         tracing::info!("ctrl-c received");
     }
 }

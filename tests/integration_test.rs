@@ -384,7 +384,11 @@ async fn scenario_fanout() {
         *seen.entry(d.recipient).or_default() += 1;
     }
     for w in WORKERS {
-        assert_eq!(seen.get(w), Some(&1), "worker {w} should receive exactly once");
+        assert_eq!(
+            seen.get(w),
+            Some(&1),
+            "worker {w} should receive exactly once"
+        );
     }
 
     coalition.shutdown().await;

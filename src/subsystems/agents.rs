@@ -83,13 +83,13 @@ impl Agent {
         // agent identity must too), and `create` errors on a duplicate id. A
         // select-then-create makes coalition *restart* idempotent, which is what
         // lets a restarted agent resume its durable-log cursor.
-        if let Some(existing) = db
-            .select((AGENT_TABLE, name))
-            .await
-            .map_err(|source| Error::AgentCreate {
-                agent: name.to_string(),
-                source: Box::new(source),
-            })?
+        if let Some(existing) =
+            db.select((AGENT_TABLE, name))
+                .await
+                .map_err(|source| Error::AgentCreate {
+                    agent: name.to_string(),
+                    source: Box::new(source),
+                })?
         {
             return Ok(existing);
         }
