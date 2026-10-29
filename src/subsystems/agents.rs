@@ -269,7 +269,7 @@ impl Agent {
                             let full = page.len() >= CATCHUP_BATCH;
                             let start = cursor;
                             if let ControlFlow::Break(stop) =
-                                deliver_page(&ctx, &mut cursor, &mut wakes, &page).await?
+                                deliver_page(&ctx, &mut cursor, &mut wakes, page).await?
                             {
                                 return Ok(ControlFlow::Break(stop));
                             }
@@ -355,7 +355,9 @@ pub struct Coalition<T: SurrealValue + Send + Sync + Unpin + 'static> {
 
 impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// Create `N` agents and spawn their listen loops under an internal
-    /// `TaskTracker`, each with its own `child_token()`.
+    /// `TaskTracker`, each with its own `child_token()`. A name that appears
+    /// more than once returns [`Error::DuplicateAgentName`] before anything is
+    /// created or spawned.
     ///
     /// Waits for every `listen_loop` to signal that its LIVE query is
     /// registered and its first catch-up page query succeeded before
@@ -394,6 +396,10 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         ready_timeout: Duration,
         cancellation_token: CancellationToken,
     ) -> Result<Self> {
+        let mut unique = std::collections::HashSet::with_capacity(names.len());
+        if let Some(name) = names.iter().find(|n| !unique.insert(n.as_str())) {
+            return Err(Error::DuplicateAgentName { name: name.clone() });
+        }
         let agents = Arc::new(RwLock::new(HashMap::new()));
         let task_tracker = TaskTracker::new();
 
@@ -609,9 +615,17 @@ async fn load_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Option<Curso
     row.map(|row| parse_cursor(agent, &row)).transpose()
 }
 
+/// `index` when it is non-negative and at most `max`, else `None`.
+fn position_within(index: i64, max: u64) -> Option<i64> {
+    u64::try_from(index)
+        .ok()
+        .filter(|i| *i <= max)
+        .map(|_| index)
+}
+
 /// Parse a `cursor` row: an object with a non-negative integer `versionstamp`
-/// and an optional non-negative integer `change_index` (absent → 0). Any
-/// other shape returns [`Error::CursorLoad`] for `agent`.
+/// and an optional non-negative integer `change_index` (absent → 0) that fits
+/// `usize`. Any other shape returns [`Error::CursorLoad`] for `agent`.
 fn parse_cursor(agent: &str, row: &Value) -> Result<Cursor> {
     let malformed = || Error::CursorLoad {
         agent: agent.to_string(),
@@ -627,7 +641,10 @@ fn parse_cursor(agent: &str, row: &Value) -> Result<Cursor> {
     };
     let change_index = match o.get("change_index") {
         None | Some(Value::None) | Some(Value::Null) => 0,
-        Some(Value::Number(n)) => non_negative(n.to_int())?,
+        Some(Value::Number(n)) => n
+            .to_int()
+            .and_then(|i| position_within(i, u64::try_from(usize::MAX).unwrap_or(u64::MAX)))
+            .ok_or_else(malformed)?,
         Some(_) => return Err(malformed()),
     };
     Ok(Cursor {
@@ -872,7 +889,7 @@ async fn deliver_page<T>(
     ctx: &LoopCtx<'_, T>,
     cursor: &mut Cursor,
     wakes: &mut Wakes,
-    page: &[Value],
+    page: Vec<Value>,
 ) -> Result<ControlFlow<Stop>>
 where
     T: SurrealValue + Send + Sync + Unpin + 'static,
@@ -881,32 +898,36 @@ where
     let page_start = *cursor;
     let mut committed = *cursor;
     let mut stopped = None;
-    'page: for changeset in page {
-        let (Value::Object(obj), Some(vs)) = (changeset, versionstamp_of(changeset)) else {
+    'page: for mut changeset in page {
+        // `versionstamp_of` returns `None` for anything but an object.
+        let Some(vs) = versionstamp_of(&changeset) else {
             tracing::error!(
                 "catch_up for {agent}: changeset is not an object with an integer \
                  versionstamp, skipped: {changeset:?}"
             );
             continue;
         };
+        let Value::Object(obj) = &mut changeset else {
+            unreachable!("invariant: versionstamp_of returned Some, so the changeset is an object");
+        };
         let skip = if vs == page_start.versionstamp {
             usize::try_from(page_start.change_index).expect(
-                "invariant: change_index is non-negative (parse_cursor rejects negatives; \
-                 catch-up stores usize positions), so it fits a 64-bit usize",
+                "invariant: parse_cursor accepts only a change_index that fits usize, and \
+                 catch-up stores usize positions",
             )
         } else {
             0
         };
-        let changes = match obj.get("changes") {
-            Some(Value::Array(changes)) => changes.as_slice(),
+        let changes: &mut [Value] = match obj.get_mut("changes") {
+            Some(Value::Array(changes)) => changes.as_mut_slice(),
             other => {
                 tracing::error!(
                     "catch_up for {agent}: changeset {vs} has no `changes` array, skipped: {other:?}"
                 );
-                &[]
+                &mut []
             }
         };
-        for (index, change) in changes.iter().enumerate().skip(skip) {
+        for (index, change) in changes.iter_mut().enumerate().skip(skip) {
             let Value::Object(op) = change else {
                 tracing::error!(
                     "catch_up for {agent}: change {index} of changeset {vs} is not an object, \
@@ -916,7 +937,7 @@ where
             };
             // A RELATE-created edge surfaces as an "update" op carrying the
             // full record.
-            let Some(record) = op.get("update") else {
+            let Some(record) = op.get_mut("update") else {
                 if !NON_MESSAGE_OPS.iter().any(|k| op.get(*k).is_some()) {
                     let keys: Vec<&String> = op.keys().collect();
                     tracing::error!(
@@ -926,7 +947,7 @@ where
                 }
                 continue;
             };
-            let Value::Object(fields) = record else {
+            let Value::Object(fields) = &*record else {
                 tracing::error!(
                     "catch_up for {agent}: record of change {index} in changeset {vs} is not \
                      an object, skipped: {record:?}"
@@ -944,7 +965,7 @@ where
                     continue;
                 }
             }
-            let message = match Message::<T>::from_value(record.clone()) {
+            let message = match Message::<T>::from_value(std::mem::take(record)) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(
@@ -1255,6 +1276,25 @@ mod tests {
         }
     }
 
+    /// A repeated name fails [`Coalition::new`] with
+    /// [`Error::DuplicateAgentName`] before any database call: no SurrealDB
+    /// server runs for this test, so reaching `Agent::new` does not return
+    /// `DuplicateAgentName`.
+    #[tokio::test]
+    async fn coalition_rejects_a_duplicate_name_before_any_work() {
+        let result = timeout(
+            Duration::from_secs(5),
+            Coalition::<String>::new(vec!["ann".to_string(), "bo".to_string(), "ann".to_string()]),
+        )
+        .await
+        .expect("Coalition::new reached the database instead of rejecting the duplicate");
+        match result {
+            Err(Error::DuplicateAgentName { name }) => assert_eq!(name, "ann"),
+            Err(e) => panic!("expected DuplicateAgentName for 'ann', got {e:?}"),
+            Ok(_) => panic!("a duplicate name must be rejected"),
+        }
+    }
+
     /// [`deliver_page`] on a crafted page: `delete` and `define_table` ops and a
     /// message for another agent are skipped without an error line; an
     /// unknown op key and a record without a record-id `out` are each logged
@@ -1315,7 +1355,7 @@ mod tests {
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
         let mut cursor = Cursor::at(5);
-        let flow = deliver_page(&ctx, &mut cursor, &mut wakes, &page)
+        let flow = deliver_page(&ctx, &mut cursor, &mut wakes, page)
             .await
             .expect("deliver_page");
         drop(guard);
@@ -1412,9 +1452,19 @@ mod tests {
     /// [`parse_cursor`] reads `versionstamp` and `change_index`, defaults a
     /// missing `change_index` to 0, and rejects a non-object row, a missing,
     /// non-integer or negative `versionstamp`, and a non-integer or negative
-    /// `change_index`.
+    /// `change_index`. The `usize` bound on `change_index` is checked through
+    /// [`position_within`], which `parse_cursor` calls with `usize::MAX`: a
+    /// 64-bit `i64` cannot exceed that, so the bound is exercised with
+    /// `max = u32::MAX` (a 32-bit `usize::MAX`).
     #[test]
     fn parse_cursor_accepts_valid_rows_and_rejects_malformed_ones() {
+        let max = u64::from(u32::MAX);
+        let top = i64::from(u32::MAX);
+        assert_eq!(position_within(0, max), Some(0));
+        assert_eq!(position_within(top, max), Some(top));
+        assert_eq!(position_within(top + 1, max), None, "one above max");
+        assert_eq!(position_within(-1, max), None, "negative");
+
         let row = |pairs: Vec<(&str, Value)>| {
             Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
         };

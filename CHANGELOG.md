@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Coalition::new_with_parent`, whose root token is a child of a caller's
   token.
+- `Error::DuplicateAgentName`.
 
 ### Fixed
 
@@ -62,8 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Deliveries already on the bus are not replayed and are lost if the process
   exits, or every receiver is dropped, before a consumer reads them.
 - A `cursor` row whose `versionstamp` or `change_index` is not a
-  non-negative integer fails with `Error::CursorLoad` instead of being
-  treated as absent.
+  non-negative integer, or whose `change_index` does not fit `usize`, fails
+  with `Error::CursorLoad` instead of being treated as absent.
+- `Coalition::new` rejects a name that appears more than once with
+  `Error::DuplicateAgentName`, before any agent is created or listen loop
+  spawned.
 
 ## [0.3.0] - 2026-10-28
 

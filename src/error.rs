@@ -39,6 +39,9 @@ pub enum Error {
     )]
     InvalidAgentName { name: String },
 
+    #[error("agent name '{name}' appears more than once in one coalition")]
+    DuplicateAgentName { name: String },
+
     #[error("failed to send message to '{to}'")]
     Send {
         to: String,
