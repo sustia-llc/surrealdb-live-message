@@ -12,7 +12,7 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 surrealdb = { version = "3.3.4", features = ["kv-mem"] }
 surrealdb-types = "3.3.4"
 futures = "0.3.34"
-kanal = { git = "https://github.com/fereidani/kanal", rev = "89a1a3c75d4d8cdf7d624afd1c593f11da6c0047" }
+crossbeam-queue = "0.3.14"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 anyhow = "1.0.104"

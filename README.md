@@ -115,11 +115,11 @@ each to completion:
 cargo run --example messaging
 
 # N-agent fan-out: hub broadcasts to four workers; the consumer asserts each
-# recipient received exactly once (kanal MPMC under N producers).
+# recipient received exactly once (MPMC bus under N producers).
 cargo run --example fanout
 
 # MPMC worker pool: M async workers clone inbox() and compete for a burst,
-# plus a blocking handler bridged via inbox().to_sync() on spawn_blocking.
+# plus a blocking handler calling inbox().blocking_recv() on spawn_blocking.
 cargo run --example worker_pool
 ```
 
@@ -153,7 +153,7 @@ This repo is the reference implementation for several transferable patterns, eac
 - **Library-first async lifecycle** (`rust-v2:async-lifecycle`) — expose `CancellationToken` + `TaskTracker`, not `SubsystemHandle`; let callers wire their top-level shutdown. Readiness handshake in `Coalition::new` for subscription-registering spawns. `DropGuard` in the integration test for panic-safe container teardown.
 - **`#[surreal(rename)]` for raw-identifier fields** (`surrealdb:repository-patterns`) — the `SurrealValue` derive ignores `#[serde(rename)]`. Fields like `r#in` must carry `#[surreal(rename = "in")]` or round-trip as `None`.
 - **Explicit edge-pointer projection on edge records** (`surrealdb:live-queries`) — a bare `SELECT *` / `LIVE SELECT *` on `RELATE`-created edges omits `in`/`out`; read them with `SELECT *, in, out FROM message ...` (as the integration test asserts). The durable-bus delivery path sidesteps this — `SHOW CHANGES` changeset records carry `id`/`in`/`out` natively — so the wake-up subscription only needs `LIVE SELECT id`.
-- **Sync/async delivery bus** — each agent forwards durable-log messages (delivered via catch-up) onto a shared [kanal](https://github.com/fereidani/kanal) MPMC channel as `Delivery<T> { recipient, message }`. Consume with `coalition.inbox()`; clone for multiple workers, or bridge to a synchronous agent handler via kanal's `to_sync()` / `as_sync()` (see `examples/worker_pool.rs`). This is the seam a framework hangs agent logic off of.
+- **Sync/async delivery bus** — each agent forwards durable-log messages (delivered via catch-up) onto a shared bounded MPMC channel (`src/bus.rs`, a [crossbeam-queue](https://crates.io/crates/crossbeam-queue) `ArrayQueue` with a `tokio` `Semaphore` and `Notify`) as `Delivery<T> { recipient, message }`. Consume with `coalition.inbox()`; clone for multiple workers, or call `blocking_recv()` from a synchronous agent handler on a blocking thread (see `examples/worker_pool.rs`). This is the seam a framework hangs agent logic off of.
 - **Validate at the boundary, parameterize at the query** (`surrealdb:graph-operations`) — agent names are validated in `Agent::new` (`InvalidAgentName`) and bound into the LIVE query as `$owner` rather than interpolated, so a name can never alter the SQL. `Agent::send` checks the recipient exists (`UnknownRecipient`) instead of writing a dangling edge.
 
 ## Documentation

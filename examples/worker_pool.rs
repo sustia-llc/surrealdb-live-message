@@ -1,15 +1,12 @@
 //! MPMC worker pool over the delivery bus, plus the sync-handler bridge.
 //!
-//! The whole point of the kanal MPMC bus is that [`Coalition::inbox`] can be
-//! cloned and pulled from concurrently. This example fans a burst of messages
-//! out across:
+//! [`Coalition::inbox`] can be cloned and pulled from concurrently. This
+//! example fans a burst of messages out across:
 //!
-//! - `N_ASYNC` async workers, each holding its own `inbox()` clone; kanal
-//!   load-balances deliveries across them (each delivery goes to exactly one
-//!   worker).
-//! - one **sync** worker bridged via `inbox().to_sync()`, running inside
-//!   `spawn_blocking` so a blocking handler never stalls the async runtime —
-//!   the pattern `CLAUDE.md` advertises but no other example shows.
+//! - `N_ASYNC` async workers, each holding its own `inbox()` clone; each
+//!   delivery goes to exactly one worker.
+//! - one **sync** worker calling `inbox().blocking_recv()` inside
+//!   `spawn_blocking`, so a blocking handler never stalls the async runtime.
 //!
 //! All workers exit when the bus closes: `coalition.shutdown()` cancels the
 //! listen-loops, the last sender drops, and every `recv()` returns `Err`.
@@ -81,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to build coalition")?;
 
-    // Async worker pool — each worker owns a clone of the inbox. kanal hands
+    // Async worker pool — each worker owns a clone of the inbox. The bus hands
     // each delivery to exactly one of them.
     let mut workers = Vec::with_capacity(N_ASYNC);
     for id in 0..N_ASYNC {
@@ -96,14 +93,13 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
-    // Sync bridge — a blocking consumer driven off the same bus. `to_sync()`
-    // converts the cloned async receiver into a sync `Receiver`; `recv()` then
-    // blocks the worker thread, so it must live on `spawn_blocking`, never on
-    // an async task.
-    let sync_rx = coalition.inbox().to_sync();
+    // Sync bridge — a blocking consumer driven off the same bus.
+    // `blocking_recv()` blocks the worker thread, so it must live on
+    // `spawn_blocking`, never on an async task.
+    let sync_rx = coalition.inbox();
     let sync_worker = tokio::task::spawn_blocking(move || {
         let mut handled = 0usize;
-        while let Ok(d) = sync_rx.recv() {
+        while let Ok(d) = sync_rx.blocking_recv() {
             handled += 1;
             tracing::info!(seq = d.message.payload.seq, "sync handled");
         }

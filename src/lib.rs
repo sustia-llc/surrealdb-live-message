@@ -2,6 +2,7 @@ pub mod subsystems {
     pub mod agents;
     pub mod sdb;
 }
+pub mod bus;
 pub mod error;
 pub mod logger;
 pub mod message;
