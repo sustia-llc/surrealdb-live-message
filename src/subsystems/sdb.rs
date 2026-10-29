@@ -109,8 +109,9 @@ impl SurrealDBWrapper {
     /// NOTE: a `message` table created by a pre-changefeed schema version will
     /// not gain the feed retroactively (this lib is pre-1.0; no migration ships).
     ///
-    /// `cursor` persists each agent's high-water mark (the last versionstamp it
-    /// drained) so catch-up is bounded and exactly resumable across restarts.
+    /// `cursor` persists each agent's log position: the `versionstamp` of a
+    /// changeset and the `change_index` within it (default 0) of the first
+    /// change not yet handed to the bus.
     async fn define_schema(db: &Surreal<any::Any>) -> Result<()> {
         let retention = SETTINGS.sdb.message_retention_secs;
         let schema = format!(
@@ -124,6 +125,7 @@ impl SurrealDBWrapper {
 
             DEFINE TABLE IF NOT EXISTS cursor SCHEMAFULL;
             DEFINE FIELD IF NOT EXISTS versionstamp ON cursor TYPE int;
+            DEFINE FIELD IF NOT EXISTS change_index ON cursor TYPE int DEFAULT 0;
         "
         );
 

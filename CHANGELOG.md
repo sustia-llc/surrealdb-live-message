@@ -20,20 +20,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Coalition::new` returns when an agent's durable backlog exceeds the bus
   capacity: each listen loop signals readiness after its first LIVE
-  subscribe and a one-row `SHOW CHANGES` probe, before the backlog drain. A
-  failing probe fails `Coalition::new` with `Error::ListenLoopDropped`.
-- Wakes queued on the LIVE stream are merged: one catch-up pass serves every
-  wake ready when the pass starts.
+  subscribe and its first catch-up page query succeed, before any bus send.
+  An error before then is logged with its source chain and fails
+  `Coalition::new` with `Error::ListenLoopDropped`.
+- Wakes on the LIVE stream are read while a bus send waits on a full bus,
+  and every wake read before or during a catch-up pass is served by one
+  further pass.
 - `Coalition::shutdown` returns when the bus is full and nothing consumes it:
   each bus send in the catch-up is raced against the cancellation token.
-- The persisted cursor never passes a message that did not reach the bus. A
-  catch-up stopped by cancellation, or by a bus with no receivers, saves the
-  cursor at the first changeset with an undelivered message, which the next
-  catch-up reads again from its first message, so that changeset's
-  already-sent messages go on the bus again. Delivery onto the bus is
-  at-least-once; deliveries already on the bus are not replayed and are lost
-  if the process exits, or every receiver is dropped, before a consumer reads
-  them.
+- The persisted cursor never passes a message that did not reach the bus. The
+  `cursor` table gains `change_index` (default 0): a catch-up stopped by
+  cancellation, or by a bus with no receivers, saves the cursor at the first
+  change not on the bus, and the next catch-up resumes there. The cursor is
+  persisted once per catch-up page, so a process exit mid-page puts that
+  page's already-sent messages on the bus again. Deliveries already on the bus
+  are not replayed and are lost if the process exits, or every receiver is
+  dropped, before a consumer reads them.
 
 ## [0.3.0] - 2026-10-28
 

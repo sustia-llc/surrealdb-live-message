@@ -7,7 +7,8 @@
 //! - A three-arm startup `select!` that races DB readiness, sdb task failure,
 //!   and a hard startup timeout — no path can hang forever.
 //! - Correct shutdown ORDER: `coalition.shutdown()` first (agent listen-loops
-//!   delete their message edges while the DB is still up), then cancel the sdb
+//!   persist their cursors and KILL their live queries while the DB is still
+//!   up), then cancel the sdb
 //!   token (triggers the 2 s drain + container stop).
 //! - A bounded graceful drain via `tokio::time::timeout` so the process never
 //!   blocks past `SHUTDOWN_TIMEOUT`.
@@ -195,8 +196,9 @@ async fn main() -> anyhow::Result<()> {
     // Bounded graceful drain
     //
     // ORDER MATTERS:
-    //   1. coalition.shutdown() — cancels agent listen-loops, which delete
-    //      their message edges.  The DB must still be up for this to succeed.
+    //   1. coalition.shutdown() — cancels agent listen-loops, which persist
+    //      their cursors and KILL their live queries.  The DB must still be up
+    //      for this to succeed.
     //   2. token.cancel()       — propagates to the sdb child token, triggering
     //      its 2 s drain and container stop.
     //   3. tracker.wait()       — waits for the sdb_task JoinHandle to resolve.

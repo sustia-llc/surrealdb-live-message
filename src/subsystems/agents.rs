@@ -167,28 +167,29 @@ impl Agent {
     /// **Tier 1** the `message` edge table is a durable, `CHANGEFEED`-backed
     /// log. **Tier 2** a `LIVE SELECT` acts purely as a low-latency *wake-up*;
     /// every wake (and every reconnect) triggers a `SHOW CHANGES … SINCE
-    /// <cursor>` catch-up that is the *sole* delivery path. Catch-up advances a
-    /// persisted per-agent versionstamp cursor past a changeset only once every
-    /// delivery in it is on the bus, so a message not yet on the bus is put on
-    /// it after a disconnect/restart: delivery onto the bus is at-least-once.
-    /// A stop partway through a changeset that holds several messages for this
-    /// agent puts that changeset's already-sent messages on the bus again.
-    /// Deliveries already on the bus are not replayed: they are lost if the
-    /// process exits, or every receiver is dropped, before a consumer reads
-    /// them.
+    /// <cursor>` catch-up that is the *sole* delivery path. The persisted
+    /// per-agent cursor is a (versionstamp, change index) pair that advances
+    /// past a change only once its delivery is on the bus, and is persisted
+    /// after each catch-up page and when a pass stops. A message not yet on the
+    /// bus is put on it after a disconnect/restart. After a stop by
+    /// cancellation or a bus with no receivers, no message is put on the bus
+    /// twice; after a process exit mid-page, that page's already-sent messages
+    /// are put on the bus again. Deliveries already on the bus are not
+    /// replayed: they are lost if the process exits, or every receiver is
+    /// dropped, before a consumer reads them.
     /// (LIVE alone is at-most-once with no replay; see the `live-queries`
     /// skill, "Delivery guarantees".)
     ///
-    /// `ready_tx` fires after the first successful subscribe and before the
-    /// backlog drain, so `Agent::send` calls issued after `Coalition::new`
-    /// returns cannot race the subscription, and a backlog larger than the bus
-    /// does not block startup. A failure before `ready_tx` fires (cursor load,
-    /// first subscribe, or a one-row `SHOW CHANGES` probe that sends nothing)
-    /// returns `Err`, dropping the sender so `Coalition::new` surfaces it;
-    /// later failures reconnect with capped exponential backoff.
-    /// Cancellation of `token` ends the loop, including while a delivery waits
-    /// on a full bus. Messages are NEVER deleted here — the log is aged out by
-    /// the coalition's retention sweep.
+    /// `ready_tx` fires once, after the first subscribe and the first catch-up
+    /// page query succeed and before that pass puts anything on the bus. A
+    /// failure before then (cursor load, first-run snapshot, first subscribe,
+    /// first page query) is logged with its source chain and returned as
+    /// `Err`, dropping the sender so `Coalition::new` fails; later failures
+    /// reconnect with capped exponential backoff. While a delivery waits on a
+    /// full bus the wake stream is still read. Cancellation of `token` ends the
+    /// loop, including while a delivery waits on a full bus. Messages are
+    /// NEVER deleted here — the log is aged out by the coalition's retention
+    /// sweep.
     ///
     /// Library-side lifecycle primitive. No `SubsystemHandle`, no signal
     /// handling. See `rust-practical:async-lifecycle` skill.
@@ -204,15 +205,24 @@ impl Agent {
         tracing::info!("listen_loop starting for {}", self.name);
         let db = sdb::SurrealDBWrapper::connection().await;
         let owner = RecordId::new(AGENT_TABLE, self.name.clone());
+        let name = self.name.as_str();
 
-        // Cursor: resume from the persisted high-water mark, or on first run
-        // snapshot the current latest versionstamp so a brand-new agent starts
-        // "from now" instead of replaying pre-existing backlog.
-        let mut cursor = match load_cursor(db, &self.name).await? {
+        // Cursor: resume from the persisted position, or on first run snapshot
+        // the current latest versionstamp so a brand-new agent starts "from
+        // now" instead of replaying pre-existing backlog.
+        let loaded = load_cursor(db, name)
+            .await
+            .map_err(|e| startup_failure(name, e))?;
+        let mut cursor = match loaded {
             Some(c) => c,
             None => {
-                let start = latest_versionstamp(db, &self.name).await? + 1;
-                save_cursor(db, &self.name, start).await?;
+                let latest = latest_versionstamp(db, name)
+                    .await
+                    .map_err(|e| startup_failure(name, e))?;
+                let start = Cursor::at(latest + 1);
+                save_cursor(db, name, start)
+                    .await
+                    .map_err(|e| startup_failure(name, e))?;
                 start
             }
         };
@@ -222,11 +232,11 @@ impl Agent {
 
         loop {
             // (Re)subscribe the LIVE wake-up.
-            let (mut stream, live_id) = match subscribe_wake(db, &owner, &self.name).await {
+            let (stream, live_id) = match subscribe_wake(db, &owner, name).await {
                 Ok(s) => s,
-                Err(e) if ready_tx.is_some() => return Err(e), // startup failure
+                Err(e) if ready_tx.is_some() => return Err(startup_failure(name, e)),
                 Err(e) => {
-                    tracing::error!("resubscribe failed for {}: {}", self.name, chain(&e));
+                    tracing::error!("resubscribe failed for {name}: {}", chain(&e));
                     if cancel_or_sleep(&token, backoff).await {
                         return Ok(());
                     }
@@ -235,99 +245,62 @@ impl Agent {
                 }
             };
 
-            // First successful subscribe: probe the changefeed without sending
-            // on the bus, then signal readiness once, before the drain.
-            if let Some(tx) = ready_tx.take() {
-                if let Err(e) = probe_changes(db, &self.name, cursor).await {
-                    end_live(db, &self.name, live_id, stream).await;
-                    return Err(e); // startup failure
-                }
-                let _ = tx.send(());
-            }
-
-            // Drain the durable log up to the live edge. Anything published
-            // during the drain is buffered by the live stream and handled by the
-            // next catch_up in the inner loop.
-            match catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx, &token).await {
-                Ok(ControlFlow::Continue(())) => {}
-                Ok(ControlFlow::Break(stop)) => {
-                    stop.log(&self.name);
-                    end_live(db, &self.name, live_id, stream).await;
-                    return Ok(());
-                }
-                Err(e) => {
-                    end_live(db, &self.name, live_id, stream).await;
-                    tracing::error!("catch_up failed for {}: {}", self.name, chain(&e));
-                    if cancel_or_sleep(&token, backoff).await {
-                        return Ok(());
+            // Every (re)subscribe starts with one catch-up pass; each later
+            // wake schedules another.
+            let mut wakes = Wakes::new(stream);
+            let exit = loop {
+                if wakes.pending {
+                    wakes.pending = false;
+                    let pass = catch_up::<T>(
+                        db,
+                        &owner,
+                        name,
+                        &mut cursor,
+                        &inbox_tx,
+                        &token,
+                        &mut wakes,
+                        &mut ready_tx,
+                    )
+                    .await;
+                    match pass {
+                        Ok(ControlFlow::Continue(())) => backoff = RECONNECT_BACKOFF_START,
+                        Ok(ControlFlow::Break(stop)) => break Exit::Stop(stop),
+                        Err(e) => break Exit::CatchUp(e),
                     }
-                    backoff = next_backoff(backoff);
-                    continue;
                 }
-            }
-            backoff = RECONNECT_BACKOFF_START;
-
-            // Inner loop: each wake triggers a catch_up; stream end/error
-            // breaks out to reconnect.
-            loop {
+                if let Some(end) = wakes.end.take() {
+                    break Exit::Wake(end);
+                }
                 tokio::select! {
                     // `biased`: cancellation takes strict priority so a hot
                     // stream can't starve shutdown.
                     biased;
-                    _ = token.cancelled() => {
-                        tracing::info!("listen_loop for {} received shutdown", self.name);
-                        end_live(db, &self.name, live_id, stream).await;
-                        return Ok(());
+                    _ = token.cancelled() => break Exit::Stop(Stop::Cancelled),
+                    item = wakes.stream.next() => wakes.record(item),
+                }
+            };
+
+            let Wakes { stream, end, .. } = wakes;
+            end_live(db, name, live_id, stream).await;
+            match exit {
+                Exit::Stop(stop) => {
+                    stop.log(name);
+                    return Ok(());
+                }
+                Exit::CatchUp(e) if ready_tx.is_some() => {
+                    if let Some(end) = end {
+                        end.log(name);
                     }
-                    maybe = stream.next() => match maybe {
-                        Some(Ok(_wake)) => {
-                            // One catch_up serves every wake already queued.
-                            let after = drain_ready_wakes(&mut stream);
-                            match catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx, &token).await {
-                                Ok(ControlFlow::Continue(())) => {}
-                                Ok(ControlFlow::Break(stop)) => {
-                                    stop.log(&self.name);
-                                    end_live(db, &self.name, live_id, stream).await;
-                                    return Ok(());
-                                }
-                                Err(e) => {
-                                    tracing::error!("catch_up failed for {}: {}", self.name, chain(&e));
-                                    break;
-                                }
-                            }
-                            match after {
-                                QueuedWakes::Open => {}
-                                QueuedWakes::Error(error) => {
-                                    tracing::error!(
-                                        "live wake stream error for {}: {}",
-                                        self.name,
-                                        chain(&error)
-                                    );
-                                    break;
-                                }
-                                QueuedWakes::Ended => {
-                                    tracing::info!("live wake stream ended for {}, reconnecting", self.name);
-                                    break;
-                                }
-                            }
-                        }
-                        Some(Err(error)) => {
-                            tracing::error!(
-                                "live wake stream error for {}: {}",
-                                self.name,
-                                chain(&error)
-                            );
-                            break;
-                        }
-                        None => {
-                            tracing::info!("live wake stream ended for {}, reconnecting", self.name);
-                            break;
-                        }
+                    return Err(startup_failure(name, e));
+                }
+                Exit::CatchUp(e) => {
+                    tracing::error!("catch_up failed for {name}: {}", chain(&e));
+                    if let Some(end) = end {
+                        end.log(name);
                     }
                 }
+                Exit::Wake(end) => end.log(name),
             }
-
-            end_live(db, &self.name, live_id, stream).await;
             if cancel_or_sleep(&token, backoff).await {
                 return Ok(());
             }
@@ -357,9 +330,10 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// Create `N` agents and spawn their listen loops under an internal
     /// `TaskTracker`, each with its own `child_token()`.
     ///
-    /// Waits for every `listen_loop` to confirm its LIVE query is registered
-    /// before returning. Each wait is bounded by [`READY_TIMEOUT`]; a stalled
-    /// or dropped listen loop yields an error instead of hanging.
+    /// Waits for every `listen_loop` to signal that its LIVE query is
+    /// registered and its first catch-up page query succeeded before
+    /// returning. Each wait is bounded by [`READY_TIMEOUT`]; a stalled or
+    /// dropped listen loop yields an error instead of hanging.
     pub async fn new(names: Vec<String>) -> Result<Self> {
         Self::new_with_ready_timeout(names, READY_TIMEOUT).await
     }
@@ -418,12 +392,9 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
                 .instrument(tracing::info_span!("retention_sweep")),
         );
 
-        // Wait until every listen_loop has confirmed its LIVE query is
-        // registered with the server. Without this handshake, Coalition::new
-        // could return before subscriptions exist and the first Agent::send
-        // calls would be lost. Each await is bounded by READY_TIMEOUT so an
-        // unresponsive DB stalling LIVE registration (sender neither sent nor
-        // dropped) cannot hang Coalition::new forever.
+        // Wait until every listen_loop has signalled ready (LIVE query
+        // registered, first catch-up page query succeeded). Each await is
+        // bounded by READY_TIMEOUT.
         for (name, rx) in ready_rxs {
             let Err(err) = await_ready(name, rx, ready_timeout).await else {
                 continue;
@@ -508,10 +479,35 @@ async fn await_ready(
 // Durable-log helpers (two-tier bus)
 // ============================================================================
 
-/// The single-field shape written to the `cursor` table.
-#[derive(Debug, SurrealValue)]
-struct CursorRow {
+/// An agent's position in the durable log: the changeset at `versionstamp`,
+/// from its change at `change_index` on. Ordered by versionstamp, then index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, SurrealValue)]
+struct Cursor {
     versionstamp: i64,
+    change_index: i64,
+}
+
+impl Cursor {
+    /// The start of the changeset at `versionstamp`.
+    fn at(versionstamp: i64) -> Self {
+        Self {
+            versionstamp,
+            change_index: 0,
+        }
+    }
+}
+
+impl std::fmt::Display for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}", self.versionstamp, self.change_index)
+    }
+}
+
+/// Log `e` with its source chain as a `listen_loop` failure before readiness
+/// for `agent`, and return it.
+fn startup_failure(agent: &str, e: Error) -> Error {
+    tracing::error!("listen_loop for {agent} failed before ready: {}", chain(&e));
+    e
 }
 
 /// Pull the `versionstamp` out of a `cursor` record (or a `SHOW CHANGES`
@@ -526,8 +522,9 @@ fn versionstamp_of(v: &Value) -> Option<i64> {
     }
 }
 
-/// Load the persisted high-water-mark cursor for `agent`, if any.
-async fn load_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Option<i64>> {
+/// Load the persisted cursor for `agent`, if any. A row without a
+/// `change_index` resumes at index 0 of its versionstamp.
+async fn load_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Option<Cursor>> {
     let row: Option<Value> =
         db.select((CURSOR_TABLE, agent))
             .await
@@ -535,15 +532,29 @@ async fn load_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Option<i64>>
                 agent: agent.to_string(),
                 source: Box::new(source),
             })?;
-    Ok(row.as_ref().and_then(versionstamp_of))
+    let Some(row) = row else { return Ok(None) };
+    let Some(versionstamp) = versionstamp_of(&row) else {
+        return Ok(None);
+    };
+    let change_index = match &row {
+        Value::Object(o) => match o.get("change_index") {
+            Some(Value::Number(n)) => n.to_int().unwrap_or(0),
+            _ => 0,
+        },
+        _ => 0,
+    };
+    Ok(Some(Cursor {
+        versionstamp,
+        change_index,
+    }))
 }
 
 /// Persist `agent`'s cursor (UPSERT so the first save creates the row). The
 /// return is read back as `Value` to avoid coupling to the record's `id` field.
-async fn save_cursor(db: &Surreal<any::Any>, agent: &str, versionstamp: i64) -> Result<()> {
+async fn save_cursor(db: &Surreal<any::Any>, agent: &str, cursor: Cursor) -> Result<()> {
     let _: Option<Value> = db
         .upsert((CURSOR_TABLE, agent))
-        .content(CursorRow { versionstamp })
+        .content(cursor)
         .await
         .map_err(|source| Error::CursorSave {
             agent: agent.to_string(),
@@ -563,26 +574,34 @@ fn max_versionstamp(v: &Value) -> i64 {
 /// once; returns 0 when the feed is empty. Only runs when an agent has no
 /// persisted cursor yet.
 async fn latest_versionstamp(db: &Surreal<any::Any>, agent: &str) -> Result<i64> {
-    let q = format!("SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE 0 LIMIT 1000000");
-    let v: Value = db
-        .query(&q)
-        .await
-        .map_err(|source| Error::CatchUp {
-            agent: agent.to_string(),
-            source: Box::new(source),
-        })?
-        .take(0)
-        .map_err(|source| Error::CatchUp {
-            agent: agent.to_string(),
-            source: Box::new(source),
-        })?;
+    let v = show_changes(db, agent, 0, 1_000_000).await?;
     Ok(max_versionstamp(&v))
+}
+
+/// Run `SHOW CHANGES FOR TABLE message SINCE <since> LIMIT <limit>` and return
+/// statement 0's result. Errors map to [`Error::CatchUp`] for `agent`.
+async fn show_changes(
+    db: &Surreal<any::Any>,
+    agent: &str,
+    since: i64,
+    limit: usize,
+) -> Result<Value> {
+    let q = format!("SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {since} LIMIT {limit}");
+    let catch_up_err = |source| Error::CatchUp {
+        agent: agent.to_string(),
+        source: Box::new(source),
+    };
+    db.query(&q)
+        .await
+        .map_err(catch_up_err)?
+        .take(0)
+        .map_err(catch_up_err)
 }
 
 /// Why a [`catch_up`] pass stopped before reaching the live edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stop {
-    /// `token` was cancelled before a delivery reached the bus.
+    /// `token` was cancelled.
     Cancelled,
     /// Every bus receiver is dropped, so a delivery cannot reach the bus.
     NoReceivers,
@@ -598,88 +617,157 @@ impl Stop {
     }
 }
 
-/// Outcome of handing one delivery to the bus.
-enum Handoff {
-    /// The delivery is on the bus.
-    Sent,
-    /// The delivery was not put on the bus.
-    Stopped(Stop),
+/// How a wake stream stopped yielding wakes.
+enum WakeEnd {
+    /// The stream yielded an error.
+    Error(surrealdb::Error),
+    /// The stream ended.
+    Ended,
 }
 
-/// Run `SHOW CHANGES FOR TABLE message SINCE <cursor> LIMIT 1` and discard the
-/// result. Returns [`Error::CatchUp`] when the query fails. Sends nothing on
-/// the bus.
-async fn probe_changes(db: &Surreal<any::Any>, agent: &str, cursor: i64) -> Result<()> {
-    let q = format!("SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {cursor} LIMIT 1");
-    let _: Value = db
-        .query(&q)
-        .await
-        .map_err(|source| Error::CatchUp {
-            agent: agent.to_string(),
-            source: Box::new(source),
-        })?
-        .take(0)
-        .map_err(|source| Error::CatchUp {
-            agent: agent.to_string(),
-            source: Box::new(source),
-        })?;
-    Ok(())
+impl WakeEnd {
+    /// Log this end of `agent`'s wake stream.
+    fn log(&self, agent: &str) {
+        match self {
+            WakeEnd::Error(error) => {
+                tracing::error!("live wake stream error for {agent}: {}", chain(error));
+            }
+            WakeEnd::Ended => tracing::info!("live wake stream ended for {agent}, reconnecting"),
+        }
+    }
+}
+
+/// An agent's LIVE wake-up stream and what has been read from it.
+struct Wakes {
+    stream: QueryStream<Notification<Value>>,
+    /// A wake (or a fresh subscribe) has not yet been served by a catch-up pass.
+    pending: bool,
+    /// The stream's error or end, once read.
+    end: Option<WakeEnd>,
+}
+
+impl Wakes {
+    /// A freshly subscribed stream, with one catch-up pass pending.
+    fn new(stream: QueryStream<Notification<Value>>) -> Self {
+        Self {
+            stream,
+            pending: true,
+            end: None,
+        }
+    }
+
+    /// Record `item`, read from the stream, then every further item the
+    /// stream has ready without waiting. A wake sets `pending`; an error or
+    /// the end of the stream sets `end` and stops reading.
+    fn record(&mut self, item: Option<std::result::Result<Notification<Value>, surrealdb::Error>>) {
+        let mut item = item;
+        loop {
+            match item {
+                Some(Ok(_wake)) => self.pending = true,
+                Some(Err(error)) => {
+                    self.end = Some(WakeEnd::Error(error));
+                    return;
+                }
+                None => {
+                    self.end = Some(WakeEnd::Ended);
+                    return;
+                }
+            }
+            match self.stream.next().now_or_never() {
+                Some(next) => item = next,
+                None => return,
+            }
+        }
+    }
+}
+
+/// How a listen-loop subscription ended.
+enum Exit {
+    /// Cancellation, or a bus with no receivers.
+    Stop(Stop),
+    /// A catch-up pass failed.
+    CatchUp(Error),
+    /// The wake stream errored or ended.
+    Wake(WakeEnd),
+}
+
+/// Put `delivery` on the bus, reading `wakes` while the bus is full. Returns
+/// `Err` without putting it on the bus when `token` is cancelled first or
+/// every receiver is dropped.
+async fn hand_off<T>(
+    inbox_tx: &Sender<Delivery<T>>,
+    delivery: Delivery<T>,
+    token: &CancellationToken,
+    wakes: &mut Wakes,
+) -> std::result::Result<(), Stop>
+where
+    T: SurrealValue + Send + Sync + Unpin + 'static,
+{
+    let send = inbox_tx.send(delivery);
+    tokio::pin!(send);
+    loop {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => return Err(Stop::Cancelled),
+            result = &mut send => return result.map_err(|_| Stop::NoReceivers),
+            item = wakes.stream.next(), if wakes.end.is_none() => wakes.record(item),
+        }
+    }
 }
 
 /// Drain the durable log from `*cursor` and deliver every message addressed to
-/// `owner` onto the bus, in versionstamp order. `SHOW CHANGES` is table-wide,
-/// so non-owner changes are filtered out. The cursor is set to one past the
-/// last changeset whose deliveries all reached the bus, and persisted; a
-/// changeset holding an undelivered message is read again, from its first
-/// message, by the next pass. Each bus send is raced against `token`:
-/// cancellation, or a bus with no receivers, ends the pass with
+/// `owner` onto the bus, in log order. `SHOW CHANGES` is table-wide, so
+/// non-owner changes are filtered out. After each page, the cursor is set to
+/// the first change not yet handed to the bus, and persisted. `ready_tx`, if
+/// still held, fires after the first page query succeeds and before any send.
+/// Each send is raced against `token`, and `wakes` is read while a send waits
+/// on a full bus. Cancellation, or a bus with no receivers, ends the pass with
 /// `ControlFlow::Break` after persisting the cursor. Returns
 /// `ControlFlow::Continue` once a short page signals the live edge is reached.
+#[allow(clippy::too_many_arguments)]
 async fn catch_up<T>(
     db: &Surreal<any::Any>,
     owner: &RecordId,
     agent: &str,
-    cursor: &mut i64,
+    cursor: &mut Cursor,
     inbox_tx: &Sender<Delivery<T>>,
     token: &CancellationToken,
+    wakes: &mut Wakes,
+    ready_tx: &mut Option<oneshot::Sender<()>>,
 ) -> Result<ControlFlow<Stop>>
 where
     T: SurrealValue + Send + Sync + Unpin + 'static,
 {
     loop {
-        let q = format!(
-            "SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {} LIMIT {CATCHUP_BATCH}",
-            *cursor
-        );
-        let v: Value = db
-            .query(&q)
-            .await
-            .map_err(|source| Error::CatchUp {
-                agent: agent.to_string(),
-                source: Box::new(source),
-            })?
-            .take(0)
-            .map_err(|source| Error::CatchUp {
-                agent: agent.to_string(),
-                source: Box::new(source),
-            })?;
+        let v = show_changes(db, agent, cursor.versionstamp, CATCHUP_BATCH).await?;
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(());
+        }
         let Value::Array(changesets) = v else { break };
         let page = changesets.len();
         if page == 0 {
             break;
         }
 
+        let page_start = *cursor;
         let mut committed = *cursor;
         let mut stopped = None;
         'page: for changeset in changesets.iter() {
             let Value::Object(obj) = changeset else {
                 continue;
             };
+            let vs = versionstamp_of(changeset);
+            let skip = match vs {
+                Some(vs) if vs == page_start.versionstamp => {
+                    usize::try_from(page_start.change_index).unwrap_or(0)
+                }
+                _ => 0,
+            };
             let changes = match obj.get("changes") {
                 Some(Value::Array(changes)) => changes.as_slice(),
                 _ => &[],
             };
-            for change in changes {
+            for (index, change) in changes.iter().enumerate().skip(skip) {
                 let Value::Object(op) = change else { continue };
                 // RELATE-created edges surface as a "create"/"update" op carrying
                 // the full record; "delete" ops (retention sweep) are skipped.
@@ -701,24 +789,23 @@ where
                     recipient: agent.to_string(),
                     message,
                 };
-                let handoff = tokio::select! {
-                    biased;
-                    _ = token.cancelled() => Handoff::Stopped(Stop::Cancelled),
-                    result = inbox_tx.send(delivery) => match result {
-                        Ok(()) => Handoff::Sent,
-                        Err(_) => Handoff::Stopped(Stop::NoReceivers),
-                    },
-                };
-                match handoff {
-                    Handoff::Sent => span.in_scope(|| tracing::info!("message delivered")),
-                    Handoff::Stopped(stop) => {
+                match hand_off(inbox_tx, delivery, token, wakes).await {
+                    Ok(()) => span.in_scope(|| tracing::info!("message delivered")),
+                    Err(stop) => {
+                        if let Some(vs) = vs {
+                            let change_index = i64::try_from(index).unwrap_or(i64::MAX);
+                            committed = committed.max(Cursor {
+                                versionstamp: vs,
+                                change_index,
+                            });
+                        }
                         stopped = Some(stop);
                         break 'page;
                     }
                 }
             }
-            if let Some(vs) = versionstamp_of(changeset) {
-                committed = committed.max(vs + 1);
+            if let Some(vs) = vs {
+                committed = committed.max(Cursor::at(vs + 1));
             }
         }
 
@@ -803,29 +890,6 @@ async fn subscribe_wake(
         _ => Err(Error::LiveQueryIdMissing {
             agent: agent.to_string(),
         }),
-    }
-}
-
-/// State of the wake stream after [`drain_ready_wakes`].
-enum QueuedWakes {
-    /// No further item is ready; the stream is still open.
-    Open,
-    /// A ready item was a stream error.
-    Error(surrealdb::Error),
-    /// The stream ended.
-    Ended,
-}
-
-/// Consume every wake `stream` has ready without waiting, stopping at the
-/// first error or at the end of the stream.
-fn drain_ready_wakes(stream: &mut QueryStream<Notification<Value>>) -> QueuedWakes {
-    loop {
-        match stream.next().now_or_never() {
-            Some(Some(Ok(_wake))) => {}
-            Some(Some(Err(error))) => return QueuedWakes::Error(error),
-            Some(None) => return QueuedWakes::Ended,
-            None => return QueuedWakes::Open,
-        }
     }
 }
 
@@ -926,42 +990,28 @@ mod tests {
         }
     }
 
-    /// [`probe_changes`] fails with [`Error::CatchUp`] on a connection with no
-    /// namespace or database selected.
-    #[tokio::test]
-    async fn probe_changes_fails_without_namespace() {
-        let db = any::connect("mem://").await.expect("connect mem://");
-        let err = probe_changes(&db, "frank", 1)
-            .await
-            .expect_err("SHOW CHANGES with no namespace selected must fail");
-        assert!(
-            matches!(err, Error::CatchUp { ref agent, .. } if agent == "frank"),
-            "expected CatchUp for 'frank', got {err:?}"
-        );
-    }
-
-    /// [`probe_changes`] succeeds on a `message` table defined without a
+    /// [`show_changes`] succeeds on a `message` table defined without a
     /// `CHANGEFEED`: the datastore answers `SHOW CHANGES` on it without error.
     #[tokio::test]
-    async fn probe_changes_succeeds_without_changefeed() {
+    async fn show_changes_succeeds_without_changefeed() {
         let db = mem_db().await;
-        probe_changes(&db, "frank", 1)
+        show_changes(&db, "frank", 1, 1)
             .await
             .expect("SHOW CHANGES on a table without a changefeed returns no error");
     }
 
-    /// [`probe_changes`] succeeds on a `message` table with a `CHANGEFEED`.
+    /// [`show_changes`] fails with [`Error::CatchUp`] for a negative `since`,
+    /// which the parser rejects.
     #[tokio::test]
-    async fn probe_changes_succeeds_with_changefeed() {
-        let db = any::connect("mem://").await.expect("connect mem://");
-        db.use_ns("test").use_db("test").await.expect("use ns/db");
-        db.query(format!("DEFINE TABLE {MESSAGE_TABLE} CHANGEFEED 1h"))
+    async fn show_changes_fails_on_negative_since() {
+        let db = mem_db().await;
+        let err = show_changes(&db, "frank", -1, 1)
             .await
-            .and_then(|r| r.check())
-            .expect("define message table with changefeed");
-        probe_changes(&db, "frank", 1)
-            .await
-            .expect("SHOW CHANGES on a changefeed table must succeed");
+            .expect_err("SHOW CHANGES SINCE -1 must fail");
+        assert!(
+            matches!(err, Error::CatchUp { ref agent, .. } if agent == "frank"),
+            "expected CatchUp for 'frank', got {err:?}"
+        );
     }
 
     /// Time for a `Drop`-spawned SDK KILL to run before the datastore is read.

@@ -174,8 +174,8 @@ async fn daemon(subsys: &mut SubsystemHandle) -> anyhow::Result<()> {
 
     // ------------------------------------------------------------------
     // Graceful shutdown — ORDER MATTERS (same as production_shutdown.rs):
-    //   1. coalition.shutdown() — agent listen-loops delete message edges;
-    //      DB must still be up.
+    //   1. coalition.shutdown() — agent listen-loops persist cursors and KILL
+    //      live queries; DB must still be up.
     //   2. sdb_token.cancel()  — triggers 2 s drain + container stop.
     //   3. tracker.wait()      — waits for the sdb_task JoinHandle.
     //

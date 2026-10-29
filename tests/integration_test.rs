@@ -210,6 +210,8 @@ async fn test_agent_messaging() {
     scenario_backpressure().await;
     scenario_startup_backlog().await;
     scenario_full_bus_shutdown_and_replay().await;
+    scenario_stop_mid_changeset(db).await;
+    scenario_first_page_error(db).await;
     scenario_invalid_agent_name().await;
     scenario_bus_close().await;
     scenario_durable_restart().await;
@@ -401,9 +403,7 @@ async fn scenario_fanout() {
 /// **Bus backpressure.** Flood a single sink with more messages than the bus
 /// capacity (256) while a deliberately-slow consumer drains concurrently. The
 /// bounded bus must apply backpressure on the listen loop rather than dropping —
-/// every message survives. The consumer runs *concurrently* (not after the
-/// flood) so the SDK's live-query notification buffer can't overflow and stall
-/// the shared connection.
+/// every message survives. The consumer runs concurrently with the flood.
 async fn scenario_backpressure() {
     const N: usize = 300; // > INBOX_CAPACITY (256)
 
@@ -585,6 +585,137 @@ async fn scenario_full_bus_shutdown_and_replay() {
     );
 
     c2.shutdown().await;
+}
+
+/// **Stop inside a multi-message changeset.** A sink restarted with 255 single
+/// messages and then one transaction that RELATEs three messages to it, with
+/// no consumer, puts the 255 and the transaction's first message on the bus
+/// (256, full) and waits on the second. After `shutdown()`, the old inbox
+/// holds those 256; a new coalition delivers the transaction's other two.
+/// Across the two inboxes every message arrives exactly once.
+async fn scenario_stop_mid_changeset(db: &Surreal<any::Any>) {
+    const SINGLES: usize = 255;
+    const TX: [&str; 3] = ["mc_tx_a", "mc_tx_b", "mc_tx_c"];
+    let names = || vec!["mc_src".to_string(), "mc_sink".to_string()];
+
+    let c0 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-0 coalition");
+    let src = c0.agent("mc_src").await.expect("mc_src in coalition");
+    c0.shutdown().await;
+    for i in 0..SINGLES {
+        src.send(
+            "mc_sink",
+            ChatMessage {
+                content: format!("mc{i}"),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("single send {i}: {e}"));
+    }
+    let relate = |content: &str| {
+        format!(
+            "RELATE agent:mc_src->message->agent:mc_sink \
+             CONTENT {{ created: time::now(), payload: {{ content: '{content}' }} }};"
+        )
+    };
+    let tx = format!(
+        "BEGIN TRANSACTION; {} {} {} COMMIT TRANSACTION;",
+        relate(TX[0]),
+        relate(TX[1]),
+        relate(TX[2])
+    );
+    db.query(tx)
+        .await
+        .and_then(|r| r.check())
+        .expect("three-message transaction");
+
+    let c1 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-1 coalition");
+    let inbox1 = c1.inbox();
+    timeout(Duration::from_secs(15), async {
+        while !inbox1.is_full() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("bus never filled; it holds {}", inbox1.len()));
+    timeout(Duration::from_secs(15), c1.shutdown())
+        .await
+        .expect("shutdown hung with a full bus and no consumer");
+
+    let mut seen = HashMap::new();
+    recv_distinct(
+        &inbox1,
+        SINGLES + TX.len(),
+        Duration::from_secs(1),
+        &mut seen,
+    )
+    .await;
+    assert!(
+        seen.contains_key(TX[0]) && !seen.contains_key(TX[1]),
+        "precondition: the old bus must end inside the transaction (hold {} but not {}); \
+         it holds {} deliveries",
+        TX[0],
+        TX[1],
+        seen.len()
+    );
+
+    let c2 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-2 coalition (restart)");
+    let inbox2 = c2.inbox();
+    recv_distinct(
+        &inbox2,
+        SINGLES + TX.len(),
+        Duration::from_secs(5),
+        &mut seen,
+    )
+    .await;
+    let expected: Vec<String> = (0..SINGLES)
+        .map(|i| format!("mc{i}"))
+        .chain(TX.iter().map(|s| s.to_string()))
+        .collect();
+    let missing: Vec<&String> = expected.iter().filter(|m| !seen.contains_key(*m)).collect();
+    let dups: Vec<_> = seen.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(
+        missing.is_empty() && dups.is_empty(),
+        "stop inside a changeset: missing {missing:?}, duplicated {dups:?}"
+    );
+
+    c2.shutdown().await;
+}
+
+/// **First catch-up query error fails startup.** An agent whose persisted
+/// cursor makes the first `SHOW CHANGES` query fail (a negative versionstamp,
+/// which the parser rejects) fails `Coalition::new` with
+/// [`Error::ListenLoopDropped`].
+async fn scenario_first_page_error(db: &Surreal<any::Any>) {
+    db.query("UPSERT cursor:pf_agent CONTENT { versionstamp: -1, change_index: 0 }")
+        .await
+        .and_then(|r| r.check())
+        .expect("write a negative cursor");
+
+    let result = timeout(
+        Duration::from_secs(30),
+        Coalition::<ChatMessage>::new(vec!["pf_agent".to_string()]),
+    )
+    .await
+    .expect("Coalition::new hung on a failing first catch-up query");
+    match result {
+        Err(Error::ListenLoopDropped { agent }) => assert_eq!(agent, "pf_agent"),
+        Err(e) => panic!("expected ListenLoopDropped for pf_agent, got {e:?}"),
+        Ok(c) => {
+            c.shutdown().await;
+            panic!("Coalition::new must fail when the first catch-up query fails");
+        }
+    }
+
+    db.query("DELETE cursor:pf_agent")
+        .await
+        .and_then(|r| r.check())
+        .expect("remove the negative cursor");
 }
 
 /// **Invalid agent name is rejected.** `Agent::new` (via `Coalition::new`)

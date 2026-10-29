@@ -146,8 +146,8 @@ async fn main() -> anyhow::Result<()> {
     app_token.cancelled().await;
     tracing::info!("parent token cancelled, draining");
 
-    // ORDER MATTERS: coalition first (agent listen-loops delete their message
-    // edges while the DB is still up), THEN cancel the independent sdb token
+    // ORDER MATTERS: coalition first (agent listen-loops persist cursors and
+    // KILL live queries while the DB is still up), THEN cancel the independent sdb token
     // (triggers the container drain + stop), then wait for the sdb task.
     coalition.shutdown().await;
     sdb_token.cancel();
