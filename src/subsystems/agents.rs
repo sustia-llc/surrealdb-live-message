@@ -185,8 +185,8 @@ impl Agent {
     /// save succeeds, no message is put on the bus twice; after a process exit
     /// mid-page, or a failed save, the messages sent since the last saved
     /// position are put on the bus again. Deliveries already on the bus are
-    /// not replayed: they are lost if the process exits, or the bus closes,
-    /// before a consumer reads them.
+    /// not replayed: they are lost if the process exits, or every receiver is
+    /// dropped, before a consumer reads them.
     ///
     /// `ready_tx` receives `Ok(())` once, after the first subscribe and the
     /// first catch-up page query succeed and before that pass puts anything on

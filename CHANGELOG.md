@@ -64,8 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   position. The cursor is persisted once per catch-up page, so a process exit
   mid-page puts that page's already-sent messages on the bus again.
   Deliveries already on the bus are not replayed and are lost if the process
-  exits, or the bus closes, before a consumer reads them. The bus closes when
-  every receiver is dropped or `close()` is called on any receiver.
+  exits, or every receiver is dropped, before a consumer reads them.
+  `close()` on any receiver stops further sends, and the queued deliveries
+  stay readable.
 - A `cursor` row whose `versionstamp` or `change_index` is not a
   non-negative integer, or whose `change_index` does not fit `usize`, fails
   with `Error::CursorLoad` instead of being treated as absent.

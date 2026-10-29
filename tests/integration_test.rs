@@ -866,8 +866,7 @@ async fn scenario_wake_during_pass() {
 /// `cursor` row exists and the server's live-query count equals its earlier
 /// value; the count stays there for 5 s.
 async fn scenario_build_failure_teardown(db: &Surreal<any::Any>) {
-    // First run for bt_ok: its listen loop creates cursor:bt_ok before it can
-    // see the cancellation, so the row exists only if the loop was waited for.
+    // Reset bt_ok so Coalition::new runs its first-run cursor path.
     db.query("DELETE cursor:bt_ok; DELETE agent:bt_ok;")
         .await
         .and_then(|r| r.check())
