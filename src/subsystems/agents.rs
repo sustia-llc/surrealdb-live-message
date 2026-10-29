@@ -77,6 +77,12 @@ impl Agent {
     /// absent, it is created at the changeset after the latest one retained in
     /// the `message` changefeed. Both records are written in one transaction,
     /// so this never leaves `agent:<name>` without `cursor:<name>`.
+    ///
+    /// Errors: [`Error::InvalidAgentName`] for a rejected `name`;
+    /// [`Error::AgentCreate`] when a database call fails (the cursor
+    /// existence check, the changefeed read, the transaction, or the read of
+    /// the agent record), with that call's error as its source;
+    /// [`Error::AgentCreateEmpty`] when the agent record reads back as absent.
     pub async fn new(name: &str) -> Result<Self> {
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(Error::InvalidAgentName {
@@ -263,7 +269,6 @@ impl Agent {
         loop {
             // (Re)subscribe the LIVE wake-up.
             let Some(subscribed) = subscribe_unless_cancelled(&ctx, &mut ready_tx).await else {
-                Stop::Cancelled.log(name);
                 return;
             };
             let (stream, live_id) = match subscribed {
@@ -289,22 +294,37 @@ impl Agent {
                     wakes.pending = false;
                     let pass = async {
                         loop {
-                            let page = match fetch_page(&ctx, cursor).await? {
-                                ControlFlow::Continue(page) => page,
-                                ControlFlow::Break(stop) => return Ok(ControlFlow::Break(stop)),
-                            };
-                            if let Some(tx) = ready_tx.take() {
-                                if tx.send(Ok(())).is_err() {
-                                    return Ok(ControlFlow::Break(Stop::NotStarted));
-                                }
-                                tokio::select! {
-                                    biased;
-                                    () = ctx.token.cancelled() => {
-                                        return Ok(ControlFlow::Break(Stop::Cancelled));
+                            let fetched = fetch_page(&ctx, cursor).await;
+                            // The first page decides the startup outcome, which
+                            // is sent on `ready_tx` before any cleanup await.
+                            let page = match (fetched, ready_tx.take()) {
+                                (Ok(ControlFlow::Continue(page)), None) => page,
+                                (Ok(ControlFlow::Continue(page)), Some(tx)) => {
+                                    if tx.send(Ok(())).is_err() {
+                                        return Ok(ControlFlow::Break(Stop::NotStarted));
                                     }
-                                    () = start.opened() => {}
+                                    tokio::select! {
+                                        biased;
+                                        () = ctx.token.cancelled() => {
+                                            return Ok(ControlFlow::Break(Stop::Cancelled));
+                                        }
+                                        () = start.opened() => {}
+                                    }
+                                    page
                                 }
-                            }
+                                (Ok(ControlFlow::Break(stop)), None) => {
+                                    return Ok(ControlFlow::Break(stop));
+                                }
+                                (Ok(ControlFlow::Break(_)), Some(tx)) => {
+                                    cancel_startup(name, tx);
+                                    return Ok(ControlFlow::Break(Stop::StartupReported));
+                                }
+                                (Err(e), None) => return Err(e),
+                                (Err(e), Some(tx)) => {
+                                    fail_startup(name, tx, e);
+                                    return Ok(ControlFlow::Break(Stop::StartupReported));
+                                }
+                            };
                             if page.is_empty() {
                                 return Ok(ControlFlow::Continue(()));
                             }
@@ -350,42 +370,20 @@ impl Agent {
                 }
             };
 
-            // Before the ready signal, the outcome is sent before any cleanup
-            // await.
-            let exit = match ready_tx.take() {
-                None => Some(exit),
-                Some(tx) => {
-                    match exit {
-                        Exit::Stop(Stop::Cancelled) => cancel_startup(name, tx),
-                        Exit::CatchUp(e) => fail_startup(name, tx, e),
-                        Exit::Stop(Stop::NoReceivers | Stop::NotStarted) | Exit::Wake => {
-                            fail_startup(
-                                name,
-                                tx,
-                                Error::ListenLoopDropped {
-                                    agent: name.to_string(),
-                                },
-                            );
-                        }
-                    }
-                    None
-                }
-            };
             let Wakes { stream, end, .. } = wakes;
             end_live(ctx.db, name, live_id, stream).await;
             if let Some(end) = end {
                 end.log(name);
             }
             match exit {
-                None => return,
-                Some(Exit::Stop(stop)) => {
+                Exit::Stop(stop) => {
                     stop.log(name);
                     return;
                 }
-                Some(Exit::CatchUp(e)) => {
+                Exit::CatchUp(e) => {
                     tracing::error!("catch_up failed for {name}: {}", chain(&e));
                 }
-                Some(Exit::Wake) => {}
+                Exit::Wake => {}
             }
             if cancel_or_sleep(&ctx.token, backoff).await {
                 return;
@@ -421,7 +419,7 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// created or spawned.
     ///
     /// Each [`Agent::new`] call is bounded by [`READY_TIMEOUT`], which returns
-    /// [`Error::ReadyTimeout`] for that agent, and raced against the
+    /// [`Error::AgentCreateTimeout`] for that agent, and raced against the
     /// coalition's token. Waits for every `listen_loop` to signal that its
     /// LIVE query is registered and its first catch-up page query succeeded.
     /// Each wait is bounded by [`READY_TIMEOUT`]. Each loop holds at its ready
@@ -436,8 +434,8 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// If the coalition's token is cancelled before every loop is ready, this
     /// returns [`Error::Cancelled`]: with `agent: None` when the token is
     /// cancelled before any database call (it is checked first) or when it is
-    /// found cancelled after the readiness waits end in `Ok`, `ReadyTimeout`
-    /// or `ListenLoopDropped`; with `agent: Some(name)` when the cancel
+    /// found cancelled after the readiness waits end in `Ok` or
+    /// `ReadyTimeout`; with `agent: Some(name)` when the cancel
     /// interrupts that agent's `Agent::new` call or its loop's startup.
     /// Dropping the returned future before it completes cancels the token,
     /// which ends every spawned loop and the retention sweep; the drop does
@@ -503,7 +501,7 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
                 }
                 Err(_elapsed) => {
                     abort_build(&cancellation_token, &task_tracker).await;
-                    return Err(Error::ReadyTimeout {
+                    return Err(Error::AgentCreateTimeout {
                         agent: name,
                         timeout: ready_timeout,
                     });
@@ -548,15 +546,8 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
                 (index, await_ready(name, rx, ready_timeout).await)
             })
             .collect();
-        let outcome = match first_ready_error(outcomes).await {
-            Ok(()) | Err(Error::ReadyTimeout { .. } | Error::ListenLoopDropped { .. })
-                if cancellation_token.is_cancelled() =>
-            {
-                Err(Error::Cancelled { agent: None })
-            }
-            other => other,
-        };
-        if let Err(err) = outcome {
+        let outcome = first_ready_error(outcomes).await;
+        if let Err(err) = cancel_override(outcome, cancellation_token.is_cancelled()) {
             abort_build(&cancellation_token, &task_tracker).await;
             return Err(err);
         }
@@ -639,6 +630,19 @@ async fn first_ready_error(outcomes: impl Stream<Item = (usize, Result<()>)>) ->
         }
     }
     fallback.map_or(Ok(()), |(_, e)| Err(e))
+}
+
+/// The readiness `outcome` to return when the coalition token's cancel state
+/// is `cancelled`: [`Error::Cancelled`] with `agent: None` in place of
+/// `Ok(())` or [`Error::ReadyTimeout`] when `cancelled` is true; `outcome`
+/// unchanged otherwise.
+fn cancel_override(outcome: Result<()>, cancelled: bool) -> Result<()> {
+    match outcome {
+        Ok(()) | Err(Error::ReadyTimeout { .. }) if cancelled => {
+            Err(Error::Cancelled { agent: None })
+        }
+        other => other,
+    }
 }
 
 /// Tear down a coalition whose construction failed: cancel `token`, close
@@ -847,9 +851,15 @@ fn max_versionstamp(v: &Value) -> i64 {
 /// Latest versionstamp currently retained in the message changefeed, for the
 /// first-run "start from now" snapshot. Reads (and discards) the retained window
 /// once; returns 0 when the feed is empty. [`Agent::new`] runs it only when
-/// `cursor:<agent>` is absent.
+/// `cursor:<agent>` is absent. Errors map to [`Error::AgentCreate`] for
+/// `agent`.
 async fn latest_versionstamp(db: &Surreal<any::Any>, agent: &str) -> Result<i64> {
-    let v = show_changes(db, agent, 0, 1_000_000).await?;
+    let v = query_changes(db, 0, 1_000_000)
+        .await
+        .map_err(|source| Error::AgentCreate {
+            agent: agent.to_string(),
+            source: Box::new(source),
+        })?;
     Ok(max_versionstamp(&v))
 }
 
@@ -861,16 +871,23 @@ async fn show_changes(
     since: i64,
     limit: usize,
 ) -> Result<Value> {
-    let q = format!("SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {since} LIMIT {limit}");
-    let catch_up_err = |source| Error::CatchUp {
-        agent: agent.to_string(),
-        source: Box::new(source),
-    };
-    db.query(&q)
+    query_changes(db, since, limit)
         .await
-        .map_err(catch_up_err)?
-        .take(0)
-        .map_err(catch_up_err)
+        .map_err(|source| Error::CatchUp {
+            agent: agent.to_string(),
+            source: Box::new(source),
+        })
+}
+
+/// Run `SHOW CHANGES FOR TABLE message SINCE <since> LIMIT <limit>` and return
+/// statement 0's result, or the datastore error.
+async fn query_changes(
+    db: &Surreal<any::Any>,
+    since: i64,
+    limit: usize,
+) -> std::result::Result<Value, surrealdb::Error> {
+    let q = format!("SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {since} LIMIT {limit}");
+    db.query(&q).await?.take(0)
 }
 
 /// Why a catch-up pass stopped before reaching the live edge.
@@ -883,10 +900,14 @@ enum Stop {
     NoReceivers,
     /// The ready send failed: the ready receiver is gone.
     NotStarted,
+    /// The first page query was cancelled or failed; that outcome has
+    /// already been logged and sent on the ready channel.
+    StartupReported,
 }
 
 impl Stop {
-    /// Log that `agent`'s listen loop ends for this reason.
+    /// Log that `agent`'s listen loop ends for this reason; nothing for
+    /// [`Stop::StartupReported`], whose outcome is already logged.
     fn log(self, agent: &str) {
         match self {
             Stop::Cancelled => tracing::info!("listen_loop for {agent} received shutdown"),
@@ -894,6 +915,7 @@ impl Stop {
             Stop::NotStarted => {
                 tracing::info!("the ready receiver for {agent} is gone; {agent} stops");
             }
+            Stop::StartupReported => {}
         }
     }
 }
@@ -1275,7 +1297,8 @@ async fn subscribe_wake(
 
 /// [`subscribe_wake`] for `ctx.owner`, raced against `ctx.token`. Returns
 /// `None` when the token is cancelled first; if `ready_tx` still holds the
-/// ready sender, [`Error::Cancelled`] is sent on it before any further await.
+/// ready sender, [`Error::Cancelled`] is sent on it before any further await,
+/// else the stop is logged.
 /// A subscribe in flight at the cancel is then given up to
 /// [`LIVE_KILL_TIMEOUT`] to finish, and its live query is ended with
 /// [`end_live`]. A subscribe still in flight after that bound, and a
@@ -1285,10 +1308,9 @@ async fn subscribe_unless_cancelled<T: SurrealValue>(
     ctx: &LoopCtx<'_, T>,
     ready_tx: &mut Option<oneshot::Sender<Result<()>>>,
 ) -> Option<Result<(QueryStream<Notification<Value>>, Uuid)>> {
-    let cancelled = |ready_tx: &mut Option<oneshot::Sender<Result<()>>>| {
-        if let Some(tx) = ready_tx.take() {
-            cancel_startup(ctx.agent, tx);
-        }
+    let cancelled = |ready_tx: &mut Option<oneshot::Sender<Result<()>>>| match ready_tx.take() {
+        Some(tx) => cancel_startup(ctx.agent, tx),
+        None => Stop::Cancelled.log(ctx.agent),
     };
     if ctx.token.is_cancelled() {
         cancelled(ready_tx);
@@ -1552,6 +1574,61 @@ mod tests {
         );
         let picked = first_ready_error_of(vec![Ok(()), Ok(())]).await;
         assert!(picked.is_ok(), "all ready must be Ok, got {picked:?}");
+    }
+
+    /// [`cancel_override`] under a cancelled token turns `Ok(())` and
+    /// `ReadyTimeout` into `Cancelled { agent: None }` and keeps
+    /// `ListenLoopDropped` and a sent error; under a live token it keeps every
+    /// outcome.
+    #[test]
+    fn cancel_override_relabels_only_ok_and_ready_timeout() {
+        let timeout_err = || {
+            Err(Error::ReadyTimeout {
+                agent: "ann".to_string(),
+                timeout: Duration::from_secs(10),
+            })
+        };
+        let dropped = || {
+            Err(Error::ListenLoopDropped {
+                agent: "cy".to_string(),
+            })
+        };
+        let sent = || {
+            Err(Error::LiveQueryIdMissing {
+                agent: "bo".to_string(),
+            })
+        };
+
+        let picked = cancel_override(Ok(()), true);
+        assert!(
+            matches!(picked, Err(Error::Cancelled { agent: None })),
+            "Ok under a cancelled token must become Cancelled, got {picked:?}"
+        );
+        let picked = cancel_override(timeout_err(), true);
+        assert!(
+            matches!(picked, Err(Error::Cancelled { agent: None })),
+            "ReadyTimeout under a cancelled token must become Cancelled, got {picked:?}"
+        );
+        let picked = cancel_override(dropped(), true);
+        assert!(
+            matches!(&picked, Err(Error::ListenLoopDropped { agent }) if agent == "cy"),
+            "ListenLoopDropped under a cancelled token must be kept, got {picked:?}"
+        );
+        let picked = cancel_override(sent(), true);
+        assert!(
+            matches!(&picked, Err(Error::LiveQueryIdMissing { agent }) if agent == "bo"),
+            "a sent error under a cancelled token must be kept, got {picked:?}"
+        );
+        let picked = cancel_override(Ok(()), false);
+        assert!(
+            picked.is_ok(),
+            "Ok under a live token must be kept, got {picked:?}"
+        );
+        let picked = cancel_override(timeout_err(), false);
+        assert!(
+            matches!(&picked, Err(Error::ReadyTimeout { agent, .. }) if agent == "ann"),
+            "ReadyTimeout under a live token must be kept, got {picked:?}"
+        );
     }
 
     /// [`first_ready_error`] over [`await_ready`] outcomes returns a sent

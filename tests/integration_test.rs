@@ -211,14 +211,13 @@ async fn test_agent_messaging() {
     scenario_startup_backlog().await;
     scenario_full_bus_shutdown_and_replay().await;
     scenario_stop_mid_changeset(db).await;
-    scenario_cancelled_parent_leaves_cursor_behind(db).await;
     scenario_drop_cancels(db).await;
     scenario_malformed_cursor(db).await;
     scenario_wake_during_pass().await;
     scenario_build_failure_teardown(db).await;
     scenario_cancelled_parent_makes_no_db_call(db).await;
     scenario_stalled_startup_returns_ready_timeout(db).await;
-    scenario_stalled_agent_record_returns_ready_timeout(db).await;
+    scenario_stalled_agent_record_returns_create_timeout(db).await;
     scenario_dropped_new_cancels_loops(db).await;
     scenario_cancel_after_ready_before_start(db).await;
     scenario_failed_new_keeps_backlog(db).await;
@@ -699,86 +698,6 @@ async fn scenario_stop_mid_changeset(db: &Surreal<any::Any>) {
     c2.shutdown().await;
 }
 
-/// **An already-cancelled parent returns before any loop runs.** A sink whose
-/// cursor predates 2 500 changesets of traffic between two other agents is
-/// started with `Coalition::new_with_parent` under an already-cancelled parent
-/// token. The scenario asserts that `Coalition::new_with_parent` returns
-/// `Cancelled` with no agent within 15 s, and that `SHOW CHANGES` from the
-/// sink's persisted cursor still returns changesets.
-async fn scenario_cancelled_parent_leaves_cursor_behind(db: &Surreal<any::Any>) {
-    const TRAFFIC: usize = 2_500;
-    let c0 = Coalition::<ChatMessage>::new(vec![
-        "qc_sink".to_string(),
-        "qc_a".to_string(),
-        "qc_b".to_string(),
-    ])
-    .await
-    .expect("round-0 coalition");
-    c0.shutdown().await;
-
-    let statement = "RELATE agent:qc_a->message->agent:qc_b \
-                     CONTENT { created: time::now(), payload: { content: 'qc' } };";
-    db.query(statement.repeat(TRAFFIC))
-        .await
-        .and_then(|r| r.check())
-        .expect("other agents' traffic");
-
-    let parent = CancellationToken::new();
-    parent.cancel();
-    let started = timeout(
-        Duration::from_secs(15),
-        Coalition::<ChatMessage>::new_with_parent(vec!["qc_sink".to_string()], &parent),
-    )
-    .await
-    .expect("Coalition::new_with_parent hung under a cancelled parent");
-    let started_ok = match &started {
-        Ok(c) => {
-            c.shutdown().await;
-            true
-        }
-        Err(_) => false,
-    };
-
-    let row: Option<surrealdb_types::Value> = db
-        .select(("cursor", "qc_sink"))
-        .await
-        .expect("read qc_sink cursor");
-    let versionstamp = match &row {
-        Some(surrealdb_types::Value::Object(o)) => match o.get("versionstamp") {
-            Some(surrealdb_types::Value::Number(n)) => n.to_int(),
-            _ => None,
-        },
-        _ => None,
-    }
-    .unwrap_or_else(|| panic!("qc_sink cursor row has no integer versionstamp: {row:?}"));
-    let rest: surrealdb_types::Value = db
-        .query(format!(
-            "SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {versionstamp} LIMIT 10"
-        ))
-        .await
-        .expect("show changes after the cursor")
-        .take(0)
-        .expect("show changes result");
-    let remaining = match &rest {
-        surrealdb_types::Value::Array(a) => a.len(),
-        _ => 0,
-    };
-    assert!(
-        remaining > 0,
-        "the sink's cursor {versionstamp} reached the end of {TRAFFIC} changesets: \
-         its pass did not stop on cancellation"
-    );
-    assert!(
-        !started_ok,
-        "Coalition::new_with_parent must not start under a cancelled parent"
-    );
-    match started {
-        Err(Error::Cancelled { agent }) => assert_eq!(agent, None),
-        Err(e) => panic!("expected Cancelled with no agent, got {e:?}"),
-        Ok(_) => unreachable!("checked by the `started_ok` assertion"),
-    }
-}
-
 /// `(versionstamp, change_index)` of the persisted `cursor:<agent>` row, or
 /// `None` when the row is missing or has no integer versionstamp.
 async fn cursor_position(db: &Surreal<any::Any>, agent: &str) -> Option<(i64, i64)> {
@@ -977,8 +896,8 @@ async fn scenario_dropped_new_cancels_loops(db: &Surreal<any::Any>) {
 /// **A stalled `Agent::new` is bounded by the ready timeout.** Reads of
 /// `agent:as_stall` wait [`STALL_SECS`] on the server.
 /// `Coalition::new_with_ready_timeout` for `as_ok` and `as_stall` with a 1 s
-/// ready timeout returns `ReadyTimeout` for `as_stall` within 3 s.
-async fn scenario_stalled_agent_record_returns_ready_timeout(db: &Surreal<any::Any>) {
+/// ready timeout returns `AgentCreateTimeout` for `as_stall` within 3 s.
+async fn scenario_stalled_agent_record_returns_create_timeout(db: &Surreal<any::Any>) {
     let names = || vec!["as_ok".to_string(), "as_stall".to_string()];
     Coalition::<ChatMessage>::new(names())
         .await
@@ -1000,13 +919,13 @@ async fn scenario_stalled_agent_record_returns_ready_timeout(db: &Surreal<any::A
         panic!("Coalition::new did not return within 3 s with a stalled agent read ({elapsed:?})")
     });
     match result {
-        Err(Error::ReadyTimeout { agent, timeout }) => {
+        Err(Error::AgentCreateTimeout { agent, timeout }) => {
             assert_eq!(
                 (agent.as_str(), timeout),
                 ("as_stall", Duration::from_secs(1))
             );
         }
-        Err(e) => panic!("expected ReadyTimeout for as_stall, got {e:?}"),
+        Err(e) => panic!("expected AgentCreateTimeout for as_stall, got {e:?}"),
         Ok(c) => {
             c.shutdown().await;
             panic!("Coalition::new must not start with a stalled agent read");

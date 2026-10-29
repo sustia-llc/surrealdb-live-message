@@ -33,6 +33,11 @@ pub enum Error {
     #[error("creating agent '{agent}' returned no record")]
     AgentCreateEmpty { agent: String },
 
+    /// `Agent::new` for `agent`, called by `Coalition::new`, did not finish
+    /// within `timeout`.
+    #[error("creating agent '{agent}' did not finish within {timeout:?}")]
+    AgentCreateTimeout { agent: String, timeout: Duration },
+
     #[error(
         "invalid agent name '{name}': must be a non-empty record-id key \
          (ASCII alphanumeric or underscore)"
