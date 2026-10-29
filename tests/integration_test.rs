@@ -203,6 +203,7 @@ async fn test_agent_messaging() {
     // Consolidating keeps one container and a deterministic order (matches the
     // `rust-v2:testing` "quality over quantity" guidance).
     // ------------------------------------------------------------------
+    scenario_lost_cursor_replays_backlog(db).await;
     scenario_unknown_agent(db, &alice).await;
     scenario_schema_enforcement(db).await;
     scenario_handshake_race().await;
@@ -1042,6 +1043,69 @@ async fn scenario_failed_new_keeps_fresh_cursor(db: &Surreal<any::Any>) {
     assert!(
         seen.contains_key("fk_m"),
         "the message sent to fk_x before its next start was not delivered; got {seen:?}"
+    );
+}
+
+/// **An existing agent that lost its cursor gets its backlog.** `lc_x` is
+/// created by a coalition that then shuts down; `cursor:lc_x` is deleted and
+/// `lc_src` sends 20 messages to `lc_x`. A new coalition for `lc_src` and
+/// `lc_x` delivers each of the 20 at least once, each `recv` bounded by 5 s.
+/// Precondition: the changefeed retains fewer than 1 000 changesets, the
+/// most one `SHOW CHANGES` returns.
+async fn scenario_lost_cursor_replays_backlog(db: &Surreal<any::Any>) {
+    const N: usize = 20;
+    let retained: surrealdb_types::Value = db
+        .query(format!(
+            "SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE 0 LIMIT 1000"
+        ))
+        .await
+        .expect("count retained changesets")
+        .take(0)
+        .expect("retained changesets");
+    let retained = match &retained {
+        surrealdb_types::Value::Array(a) => a.len(),
+        _ => 0,
+    };
+    assert!(
+        retained < 1000,
+        "precondition: fewer than 1000 retained changesets; found {retained}"
+    );
+    let names = || vec!["lc_src".to_string(), "lc_x".to_string()];
+    let c0 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-0 coalition");
+    let src = c0.agent("lc_src").await.expect("lc_src in coalition");
+    c0.shutdown().await;
+    db.query("DELETE cursor:lc_x")
+        .await
+        .and_then(|r| r.check())
+        .expect("delete cursor:lc_x");
+    for i in 0..N {
+        src.send(
+            "lc_x",
+            ChatMessage {
+                content: format!("lc{i}"),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("backlog send {i}: {e}"));
+    }
+
+    let c1 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("restart coalition");
+    let inbox = c1.inbox();
+    let mut seen = HashMap::new();
+    recv_distinct(&inbox, N, Duration::from_secs(5), &mut seen).await;
+    c1.shutdown().await;
+    let missing: Vec<usize> = (0..N)
+        .filter(|i| !seen.contains_key(&format!("lc{i}")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "an existing agent without a cursor must receive its backlog: {} of {N} arrived, \
+         missing {missing:?}",
+        N - missing.len()
     );
 }
 

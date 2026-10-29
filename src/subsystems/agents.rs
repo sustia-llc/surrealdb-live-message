@@ -74,9 +74,14 @@ impl Agent {
     /// Validates `name` first: non-empty, ASCII alphanumeric or underscore,
     /// else [`Error::InvalidAgentName`]. An existing `agent` record and an
     /// existing `cursor` row are kept unchanged. When `cursor:<name>` is
-    /// absent, it is created at the changeset after the latest one retained in
-    /// the `message` changefeed. Both records are written in one transaction,
-    /// so this does not write `agent:<name>` without `cursor:<name>`.
+    /// absent, it is created in the same transaction that checks for
+    /// `agent:<name>`: for a new agent, at the changeset after the latest one
+    /// retained in the `message` changefeed; for an agent whose record
+    /// already existed, at versionstamp 0, so the next catch-up reads the
+    /// whole retained changefeed, and that start is logged at warn with the
+    /// agent and the position as fields. Both records are written in one
+    /// transaction, so this does not write `agent:<name>` without
+    /// `cursor:<name>`.
     ///
     /// Errors: [`Error::InvalidAgentName`] for a rejected `name`;
     /// [`Error::AgentCreate`] when a database call fails (the cursor
@@ -109,32 +114,49 @@ impl Agent {
             Some(_) => None,
             None => Some(Cursor::at(latest_versionstamp(db, name).await? + 1)),
         };
+        let replay = Cursor::at(0);
 
-        let cursor_stmt = if start.is_some() {
-            "IF (SELECT VALUE id FROM ONLY $cursor) = NONE { CREATE $cursor CONTENT $start };"
+        let cursor_stmts = if start.is_some() {
+            "LET $replayed = $existed AND ((SELECT VALUE id FROM ONLY $cursor) = NONE); \
+             LET $initial = IF $existed { $replay } ELSE { $start }; \
+             IF (SELECT VALUE id FROM ONLY $cursor) = NONE { CREATE $cursor CONTENT $initial };"
         } else {
-            ""
+            "LET $replayed = false;"
         };
-        db.query(format!(
-            "BEGIN TRANSACTION; \
-             IF (SELECT VALUE id FROM ONLY $agent) = NONE {{ \
-                 CREATE $agent CONTENT {{ name: $name, created: time::now() }} \
-             }}; \
-             {cursor_stmt} \
-             COMMIT TRANSACTION;"
-        ))
-        .bind(("agent", agent_id.clone()))
-        .bind(("cursor", cursor_id))
-        .bind(("name", name.to_string()))
-        .bind(("start", start.unwrap_or(Cursor::at(0))))
-        .await
-        .map_err(create_err)?
-        .check()
-        .map_err(create_err)?;
+        let mut response = db
+            .query(format!(
+                "BEGIN TRANSACTION; \
+                 LET $existed = (SELECT VALUE id FROM ONLY $agent) != NONE; \
+                 IF !$existed {{ \
+                     CREATE $agent CONTENT {{ name: $name, created: time::now() }} \
+                 }}; \
+                 {cursor_stmts} \
+                 RETURN $replayed; \
+                 COMMIT TRANSACTION;"
+            ))
+            .bind(("agent", agent_id.clone()))
+            .bind(("cursor", cursor_id))
+            .bind(("name", name.to_string()))
+            .bind(("start", start.unwrap_or(replay)))
+            .bind(("replay", replay))
+            .await
+            .map_err(create_err)?
+            .check()
+            .map_err(create_err)?;
+        // The `RETURN` result is the one before `COMMIT`'s.
+        let returned = response.num_statements().saturating_sub(2);
+        let replayed: Option<bool> = response.take(returned).map_err(create_err)?;
+        if replayed == Some(true) {
+            tracing::warn!(
+                agent = name,
+                versionstamp = replay.versionstamp,
+                change_index = replay.change_index,
+                "created a missing cursor for an existing agent at the start of the retained \
+                 changefeed"
+            );
+        }
 
         let agent: Option<Agent> = db.select(agent_id).await.map_err(create_err)?;
-        // Defensive: the transaction above has committed `agent:<name>`, so
-        // `None` is not reachable without a concurrent delete.
         agent.ok_or_else(|| Error::AgentCreateEmpty {
             agent: name.to_string(),
         })
