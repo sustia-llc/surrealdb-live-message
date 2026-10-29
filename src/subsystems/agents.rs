@@ -38,6 +38,10 @@ const CATCHUP_BATCH: usize = 1000;
 const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(200);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Maximum number of already-ready wakes [`Wakes::record`] reads after the
+/// one it is given.
+const WAKE_DRAIN_MAX: usize = 64;
+
 /// Maximum time [`end_live`] waits for a `KILL` of a live query.
 const LIVE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -168,38 +172,40 @@ impl Agent {
     /// log. **Tier 2** a `LIVE SELECT` acts purely as a low-latency *wake-up*;
     /// every wake (and every reconnect) triggers a `SHOW CHANGES … SINCE
     /// <cursor>` catch-up that is the *sole* delivery path. The persisted
-    /// per-agent cursor is a (versionstamp, change index) pair that advances
-    /// past a change only once its delivery is on the bus, and is persisted
-    /// after each catch-up page and when a pass stops. A message not yet on the
-    /// bus is put on it after a disconnect/restart. After a stop by
-    /// cancellation or a bus with no receivers, no message is put on the bus
-    /// twice; after a process exit mid-page, that page's already-sent messages
-    /// are put on the bus again. Deliveries already on the bus are not
-    /// replayed: they are lost if the process exits, or every receiver is
-    /// dropped, before a consumer reads them.
+    /// per-agent cursor is a (versionstamp, change index) pair. It advances
+    /// past a change once that change's delivery is on the bus, or once the
+    /// change is not a message for this agent; a message addressed to this
+    /// agent whose payload does not decode as `T` is logged and skipped. The
+    /// cursor is persisted after each catch-up page and when a pass stops; if
+    /// that save fails, the persisted cursor stays at its previous saved
+    /// position. A message not yet on the bus is put on it after a
+    /// disconnect/restart. After a stop by cancellation or a bus with no
+    /// receivers whose cursor save succeeds, no message is put on the bus
+    /// twice; after a process exit mid-page, or a failed save, the messages
+    /// sent since the last saved position are put on the bus again. Deliveries
+    /// already on the bus are not replayed: they are lost if the process
+    /// exits, or every receiver is dropped, before a consumer reads them.
     /// (LIVE alone is at-most-once with no replay; see the `live-queries`
     /// skill, "Delivery guarantees".)
     ///
-    /// `ready_tx` fires once, after the first subscribe and the first catch-up
-    /// page query succeed and before that pass puts anything on the bus. A
-    /// failure before then (cursor load, first-run snapshot, first subscribe,
-    /// first page query) is logged with its source chain and returned as
-    /// `Err`, dropping the sender so `Coalition::new` fails; later failures
-    /// reconnect with capped exponential backoff. While a delivery waits on a
-    /// full bus the wake stream is still read. Cancellation of `token` ends the
-    /// loop, including while a delivery waits on a full bus. Messages are
-    /// NEVER deleted here — the log is aged out by the coalition's retention
-    /// sweep.
+    /// `ready_tx` receives `Ok(())` once, after the first subscribe and the
+    /// first catch-up page query succeed and before that pass puts anything on
+    /// the bus. A failure before then (cursor load, first-run snapshot, first
+    /// subscribe, first page query) is logged with its source chain and sent
+    /// as `Err` on `ready_tx`, and the loop ends; later failures reconnect with
+    /// capped exponential backoff. While a delivery waits on a full bus the
+    /// wake stream is still read. Cancellation of `token` ends the loop at the
+    /// next bus send, page query, or wait for a wake. Messages are NEVER
+    /// deleted here — the log is aged out by the coalition's retention sweep.
     ///
     /// Library-side lifecycle primitive. No `SubsystemHandle`, no signal
     /// handling. See `rust-practical:async-lifecycle` skill.
     async fn listen_loop<T>(
         self,
         token: CancellationToken,
-        ready_tx: oneshot::Sender<()>,
+        ready_tx: oneshot::Sender<Result<()>>,
         inbox_tx: Sender<Delivery<T>>,
-    ) -> Result<()>
-    where
+    ) where
         T: SurrealValue + Send + Sync + Unpin + 'static,
     {
         tracing::info!("listen_loop starting for {}", self.name);
@@ -210,21 +216,9 @@ impl Agent {
         // Cursor: resume from the persisted position, or on first run snapshot
         // the current latest versionstamp so a brand-new agent starts "from
         // now" instead of replaying pre-existing backlog.
-        let loaded = load_cursor(db, name)
-            .await
-            .map_err(|e| startup_failure(name, e))?;
-        let mut cursor = match loaded {
-            Some(c) => c,
-            None => {
-                let latest = latest_versionstamp(db, name)
-                    .await
-                    .map_err(|e| startup_failure(name, e))?;
-                let start = Cursor::at(latest + 1);
-                save_cursor(db, name, start)
-                    .await
-                    .map_err(|e| startup_failure(name, e))?;
-                start
-            }
+        let mut cursor = match initial_cursor(db, name).await {
+            Ok(c) => c,
+            Err(e) => return fail_startup(name, ready_tx, e),
         };
 
         let mut ready_tx = Some(ready_tx);
@@ -234,11 +228,13 @@ impl Agent {
             // (Re)subscribe the LIVE wake-up.
             let (stream, live_id) = match subscribe_wake(db, &owner, name).await {
                 Ok(s) => s,
-                Err(e) if ready_tx.is_some() => return Err(startup_failure(name, e)),
                 Err(e) => {
+                    if let Some(tx) = ready_tx.take() {
+                        return fail_startup(name, tx, e);
+                    }
                     tracing::error!("resubscribe failed for {name}: {}", chain(&e));
                     if cancel_or_sleep(&token, backoff).await {
-                        return Ok(());
+                        return;
                     }
                     backoff = next_backoff(backoff);
                     continue;
@@ -282,27 +278,24 @@ impl Agent {
 
             let Wakes { stream, end, .. } = wakes;
             end_live(db, name, live_id, stream).await;
+            if let Some(end) = end {
+                end.log(name);
+            }
             match exit {
                 Exit::Stop(stop) => {
                     stop.log(name);
-                    return Ok(());
-                }
-                Exit::CatchUp(e) if ready_tx.is_some() => {
-                    if let Some(end) = end {
-                        end.log(name);
-                    }
-                    return Err(startup_failure(name, e));
+                    return;
                 }
                 Exit::CatchUp(e) => {
-                    tracing::error!("catch_up failed for {name}: {}", chain(&e));
-                    if let Some(end) = end {
-                        end.log(name);
+                    if let Some(tx) = ready_tx.take() {
+                        return fail_startup(name, tx, e);
                     }
+                    tracing::error!("catch_up failed for {name}: {}", chain(&e));
                 }
                 Exit::Wake(end) => end.log(name),
             }
             if cancel_or_sleep(&token, backoff).await {
-                return Ok(());
+                return;
             }
             backoff = next_backoff(backoff);
         }
@@ -448,13 +441,14 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
 }
 
 /// Await one listen-loop's readiness signal, bounded by `ready_timeout`, mapping
-/// the three outcomes onto the typed handshake errors:
+/// the four outcomes:
 ///
-/// - signal received → `Ok(())`
-/// - sender dropped before signalling → [`Error::ListenLoopDropped`]
+/// - `Ok(())` received → `Ok(())`
+/// - `Err(e)` received → `Err(e)`, the listen loop's startup error
+/// - sender dropped without sending → [`Error::ListenLoopDropped`]
 /// - timeout elapsed first → [`Error::ReadyTimeout`]
 ///
-/// Pure async logic over a `oneshot` — no DB — so the two error paths are
+/// Pure async logic over a `oneshot` — no DB — so every outcome is
 /// unit-testable deterministically (see the tests below). The integration test
 /// can't exercise `ReadyTimeout` reliably: [`tokio::time::timeout`] polls the
 /// inner future before the timer, so a real LIVE-query registration that wins
@@ -462,11 +456,11 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
 /// small the timeout is.
 async fn await_ready(
     name: String,
-    rx: oneshot::Receiver<()>,
+    rx: oneshot::Receiver<Result<()>>,
     ready_timeout: Duration,
 ) -> Result<()> {
     match timeout(ready_timeout, rx).await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(signal)) => signal,
         Ok(Err(_)) => Err(Error::ListenLoopDropped { agent: name }),
         Err(_) => Err(Error::ReadyTimeout {
             agent: name,
@@ -504,10 +498,27 @@ impl std::fmt::Display for Cursor {
 }
 
 /// Log `e` with its source chain as a `listen_loop` failure before readiness
-/// for `agent`, and return it.
-fn startup_failure(agent: &str, e: Error) -> Error {
+/// for `agent`, and send it on `ready_tx`.
+fn fail_startup(agent: &str, ready_tx: oneshot::Sender<Result<()>>, e: Error) {
     tracing::error!("listen_loop for {agent} failed before ready: {}", chain(&e));
-    e
+    let _ = ready_tx.send(Err(e));
+}
+
+/// The persisted cursor for `agent`, or on first run one at the changeset
+/// after the latest one retained in the feed, persisted.
+async fn initial_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Cursor> {
+    if let Some(c) = load_cursor(db, agent).await? {
+        return Ok(c);
+    }
+    let start = Cursor::at(latest_versionstamp(db, agent).await? + 1);
+    save_cursor(db, agent, start).await?;
+    Ok(start)
+}
+
+/// A `surrealdb::Error` carrying `message`, for errors this crate detects in
+/// a datastore reply.
+fn reply_error(message: String) -> Box<surrealdb::Error> {
+    Box::new(surrealdb::Error::internal(message))
 }
 
 /// Pull the `versionstamp` out of a `cursor` record (or a `SHOW CHANGES`
@@ -522,8 +533,8 @@ fn versionstamp_of(v: &Value) -> Option<i64> {
     }
 }
 
-/// Load the persisted cursor for `agent`, if any. A row without a
-/// `change_index` resumes at index 0 of its versionstamp.
+/// Load the persisted cursor for `agent`, if any. Returns
+/// [`Error::CursorLoad`] for a row that does not parse (see [`parse_cursor`]).
 async fn load_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Option<Cursor>> {
     let row: Option<Value> =
         db.select((CURSOR_TABLE, agent))
@@ -532,21 +543,33 @@ async fn load_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Option<Curso
                 agent: agent.to_string(),
                 source: Box::new(source),
             })?;
-    let Some(row) = row else { return Ok(None) };
-    let Some(versionstamp) = versionstamp_of(&row) else {
-        return Ok(None);
+    row.map(|row| parse_cursor(agent, &row)).transpose()
+}
+
+/// Parse a `cursor` row: an object with an integer `versionstamp` and an
+/// optional integer `change_index` (absent → 0). Any other shape returns
+/// [`Error::CursorLoad`] for `agent`.
+fn parse_cursor(agent: &str, row: &Value) -> Result<Cursor> {
+    let malformed = || Error::CursorLoad {
+        agent: agent.to_string(),
+        source: reply_error(format!("malformed cursor row: {row:?}")),
     };
-    let change_index = match &row {
-        Value::Object(o) => match o.get("change_index") {
-            Some(Value::Number(n)) => n.to_int().unwrap_or(0),
-            _ => 0,
-        },
-        _ => 0,
+    let Value::Object(o) = row else {
+        return Err(malformed());
     };
-    Ok(Some(Cursor {
+    let versionstamp = match o.get("versionstamp") {
+        Some(Value::Number(n)) => n.to_int().ok_or_else(malformed)?,
+        _ => return Err(malformed()),
+    };
+    let change_index = match o.get("change_index") {
+        None | Some(Value::None) | Some(Value::Null) => 0,
+        Some(Value::Number(n)) => n.to_int().ok_or_else(malformed)?,
+        Some(_) => return Err(malformed()),
+    };
+    Ok(Cursor {
         versionstamp,
         change_index,
-    }))
+    })
 }
 
 /// Persist `agent`'s cursor (UPSERT so the first save creates the row). The
@@ -656,12 +679,14 @@ impl Wakes {
         }
     }
 
-    /// Record `item`, read from the stream, then every further item the
-    /// stream has ready without waiting. A wake sets `pending`; an error or
-    /// the end of the stream sets `end` and stops reading.
+    /// Record `item`, read from the stream, then up to
+    /// [`WAKE_DRAIN_MAX`] further items the stream has ready without waiting.
+    /// A wake sets `pending`; an error or the end of the stream sets `end` and
+    /// stops reading.
     fn record(&mut self, item: Option<std::result::Result<Notification<Value>, surrealdb::Error>>) {
-        let mut item = item;
-        loop {
+        let mut next = Some(item);
+        let mut drained = 0;
+        while let Some(item) = next.take() {
             match item {
                 Some(Ok(_wake)) => self.pending = true,
                 Some(Err(error)) => {
@@ -673,10 +698,11 @@ impl Wakes {
                     return;
                 }
             }
-            match self.stream.next().now_or_never() {
-                Some(next) => item = next,
-                None => return,
+            if drained == WAKE_DRAIN_MAX {
+                return;
             }
+            drained += 1;
+            next = self.stream.next().now_or_never();
         }
     }
 }
@@ -715,14 +741,29 @@ where
     }
 }
 
+/// Why a page of a [`catch_up`] pass ended early.
+enum PageEnd {
+    /// A delivery was not put on the bus.
+    Stop(Stop),
+    /// A changeset in the reply had no integer versionstamp.
+    Malformed(Error),
+}
+
 /// Drain the durable log from `*cursor` and deliver every message addressed to
-/// `owner` onto the bus, in log order. `SHOW CHANGES` is table-wide, so
-/// non-owner changes are filtered out. After each page, the cursor is set to
-/// the first change not yet handed to the bus, and persisted. `ready_tx`, if
-/// still held, fires after the first page query succeeds and before any send.
-/// Each send is raced against `token`, and `wakes` is read while a send waits
-/// on a full bus. Cancellation, or a bus with no receivers, ends the pass with
-/// `ControlFlow::Break` after persisting the cursor. Returns
+/// `owner` onto the bus, in log order. `SHOW CHANGES` is table-wide; a change
+/// whose record's `out` is not `owner` is passed over without decoding. A
+/// message addressed to `owner` whose record does not decode as `Message<T>`
+/// is logged at warn and skipped. After each page, the cursor is set to the
+/// first change not yet handed to the bus and persisted; `*cursor` changes
+/// only once that save succeeds. `ready_tx`, if still held, receives `Ok(())`
+/// after the first page query succeeds and before any send.
+///
+/// Each page query and each send is raced against `token`, and `wakes` is
+/// read while a send waits on a full bus. Cancellation, or a bus with no
+/// receivers, ends the pass with `ControlFlow::Break`; if the cursor save on
+/// that stop fails, the error is logged and the pass still returns
+/// `ControlFlow::Break`. A changeset without an integer versionstamp returns
+/// [`Error::CatchUp`] after the cursor up to it is saved. Returns
 /// `ControlFlow::Continue` once a short page signals the live edge is reached.
 #[allow(clippy::too_many_arguments)]
 async fn catch_up<T>(
@@ -733,15 +774,19 @@ async fn catch_up<T>(
     inbox_tx: &Sender<Delivery<T>>,
     token: &CancellationToken,
     wakes: &mut Wakes,
-    ready_tx: &mut Option<oneshot::Sender<()>>,
+    ready_tx: &mut Option<oneshot::Sender<Result<()>>>,
 ) -> Result<ControlFlow<Stop>>
 where
     T: SurrealValue + Send + Sync + Unpin + 'static,
 {
     loop {
-        let v = show_changes(db, agent, cursor.versionstamp, CATCHUP_BATCH).await?;
+        let v = tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(ControlFlow::Break(Stop::Cancelled)),
+            v = show_changes(db, agent, cursor.versionstamp, CATCHUP_BATCH) => v?,
+        };
         if let Some(tx) = ready_tx.take() {
-            let _ = tx.send(());
+            let _ = tx.send(Ok(()));
         }
         let Value::Array(changesets) = v else { break };
         let page = changesets.len();
@@ -751,17 +796,21 @@ where
 
         let page_start = *cursor;
         let mut committed = *cursor;
-        let mut stopped = None;
+        let mut ended = None;
         'page: for changeset in changesets.iter() {
-            let Value::Object(obj) = changeset else {
-                continue;
+            let (Value::Object(obj), Some(vs)) = (changeset, versionstamp_of(changeset)) else {
+                ended = Some(PageEnd::Malformed(Error::CatchUp {
+                    agent: agent.to_string(),
+                    source: reply_error(format!(
+                        "SHOW CHANGES returned a changeset without an integer versionstamp: {changeset:?}"
+                    )),
+                }));
+                break 'page;
             };
-            let vs = versionstamp_of(changeset);
-            let skip = match vs {
-                Some(vs) if vs == page_start.versionstamp => {
-                    usize::try_from(page_start.change_index).unwrap_or(0)
-                }
-                _ => 0,
+            let skip = if vs == page_start.versionstamp {
+                usize::try_from(page_start.change_index).unwrap_or(0)
+            } else {
+                0
             };
             let changes = match obj.get("changes") {
                 Some(Value::Array(changes)) => changes.as_slice(),
@@ -774,16 +823,22 @@ where
                 let Some(record) = op.get("update").or_else(|| op.get("create")) else {
                     continue;
                 };
+                let addressed_to_owner = match record {
+                    Value::Object(r) => {
+                        matches!(r.get("out"), Some(Value::RecordId(out)) if out == owner)
+                    }
+                    _ => false,
+                };
+                if !addressed_to_owner {
+                    continue; // table-wide feed — keep only ours
+                }
                 let message = match Message::<T>::from_value(record.clone()) {
                     Ok(m) => m,
                     Err(e) => {
-                        tracing::warn!("skipping undecodable change for {agent}: {}", chain(&e));
+                        tracing::warn!("skipping undecodable message for {agent}: {}", chain(&e));
                         continue;
                     }
                 };
-                if message.out.as_ref() != Some(owner) {
-                    continue; // table-wide feed — keep only ours
-                }
                 let span = tracing::info_span!("deliver", target = %agent, from = ?message.r#in);
                 let delivery = Delivery {
                     recipient: agent.to_string(),
@@ -792,33 +847,48 @@ where
                 match hand_off(inbox_tx, delivery, token, wakes).await {
                     Ok(()) => span.in_scope(|| tracing::info!("message delivered")),
                     Err(stop) => {
-                        if let Some(vs) = vs {
-                            let change_index = i64::try_from(index).unwrap_or(i64::MAX);
-                            committed = committed.max(Cursor {
-                                versionstamp: vs,
-                                change_index,
-                            });
-                        }
-                        stopped = Some(stop);
+                        let change_index = i64::try_from(index).unwrap_or(i64::MAX);
+                        committed = committed.max(Cursor {
+                            versionstamp: vs,
+                            change_index,
+                        });
+                        ended = Some(PageEnd::Stop(stop));
                         break 'page;
                     }
                 }
             }
-            if let Some(vs) = vs {
-                committed = committed.max(Cursor::at(vs + 1));
-            }
+            committed = committed.max(Cursor::at(vs + 1));
         }
 
         if committed > *cursor {
-            *cursor = committed;
-            save_cursor(db, agent, *cursor).await?;
+            match save_cursor(db, agent, committed).await {
+                Ok(()) => *cursor = committed,
+                Err(e) => match ended {
+                    Some(PageEnd::Stop(stop)) => {
+                        tracing::error!(
+                            "catch_up for {agent} could not save cursor {committed} on {stop:?}: {}",
+                            chain(&e)
+                        );
+                        return Ok(ControlFlow::Break(stop));
+                    }
+                    Some(PageEnd::Malformed(m)) => {
+                        tracing::error!("catch_up failed for {agent}: {}", chain(&m));
+                        return Err(e);
+                    }
+                    None => return Err(e),
+                },
+            }
         }
-        if let Some(stop) = stopped {
-            tracing::info!(
-                "catch_up for {agent} stopped at cursor {}: {stop:?}",
-                *cursor
-            );
-            return Ok(ControlFlow::Break(stop));
+        match ended {
+            Some(PageEnd::Stop(stop)) => {
+                tracing::info!(
+                    "catch_up for {agent} stopped at cursor {}: {stop:?}",
+                    *cursor
+                );
+                return Ok(ControlFlow::Break(stop));
+            }
+            Some(PageEnd::Malformed(e)) => return Err(e),
+            None => {}
         }
         if page < CATCHUP_BATCH {
             break;
@@ -1114,9 +1184,64 @@ mod tests {
     #[tokio::test]
     async fn await_ready_succeeds_when_signalled() {
         let (tx, rx) = oneshot::channel();
-        tx.send(()).expect("send ready");
+        tx.send(Ok(())).expect("send ready");
         await_ready("frank".to_string(), rx, Duration::from_secs(30))
             .await
             .expect("a signalled ready must succeed");
+    }
+
+    /// A startup error sent on the ready channel is returned as is.
+    #[tokio::test]
+    async fn await_ready_returns_the_sent_error() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err(Error::LiveQueryIdMissing {
+            agent: "frank".to_string(),
+        }))
+        .expect("send startup error");
+        let err = await_ready("frank".to_string(), rx, Duration::from_secs(30))
+            .await
+            .expect_err("a sent startup error must be returned");
+        assert!(
+            matches!(err, Error::LiveQueryIdMissing { ref agent } if agent == "frank"),
+            "expected the sent LiveQueryIdMissing for 'frank', got {err:?}"
+        );
+    }
+
+    /// [`parse_cursor`] reads `versionstamp` and `change_index`, defaults a
+    /// missing `change_index` to 0, and rejects a row whose `versionstamp` is
+    /// absent or not an integer.
+    #[test]
+    fn parse_cursor_accepts_valid_rows_and_rejects_malformed_ones() {
+        let row = |pairs: Vec<(&str, Value)>| {
+            Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        };
+        let int = |n: i64| n.into_value();
+        let text = |s: &str| s.to_string().into_value();
+        let full = row(vec![("versionstamp", int(7)), ("change_index", int(2))]);
+        assert_eq!(
+            parse_cursor("frank", &full).expect("full row"),
+            Cursor {
+                versionstamp: 7,
+                change_index: 2
+            }
+        );
+        let old = row(vec![("versionstamp", int(7))]);
+        assert_eq!(
+            parse_cursor("frank", &old).expect("row without change_index"),
+            Cursor::at(7)
+        );
+        for bad in [
+            row(vec![("versionstamp", text("7"))]),
+            row(vec![]),
+            row(vec![("versionstamp", int(7)), ("change_index", text("x"))]),
+            int(7),
+        ] {
+            let err =
+                parse_cursor("frank", &bad).expect_err("a malformed cursor row must not parse");
+            assert!(
+                matches!(err, Error::CursorLoad { ref agent, .. } if agent == "frank"),
+                "expected CursorLoad for {bad:?}, got {err:?}"
+            );
+        }
     }
 }

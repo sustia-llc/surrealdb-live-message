@@ -21,21 +21,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Coalition::new` returns when an agent's durable backlog exceeds the bus
   capacity: each listen loop signals readiness after its first LIVE
   subscribe and its first catch-up page query succeed, before any bus send.
-  An error before then is logged with its source chain and fails
-  `Coalition::new` with `Error::ListenLoopDropped`.
+  An error before then is logged with its source chain and returned by
+  `Coalition::new` as that error (for example `Error::CatchUp`,
+  `Error::CursorLoad`, `Error::LiveQuery`); `Error::ListenLoopDropped` is
+  returned only for a listen loop that ends without signalling.
 - Wakes on the LIVE stream are read while a bus send waits on a full bus,
   and every wake read before or during a catch-up pass is served by one
   further pass.
-- `Coalition::shutdown` returns when the bus is full and nothing consumes it:
-  each bus send in the catch-up is raced against the cancellation token.
-- The persisted cursor never passes a message that did not reach the bus. The
-  `cursor` table gains `change_index` (default 0): a catch-up stopped by
-  cancellation, or by a bus with no receivers, saves the cursor at the first
-  change not on the bus, and the next catch-up resumes there. The cursor is
-  persisted once per catch-up page, so a process exit mid-page puts that
-  page's already-sent messages on the bus again. Deliveries already on the bus
-  are not replayed and are lost if the process exits, or every receiver is
-  dropped, before a consumer reads them.
+- `Coalition::shutdown` returns when the bus is full and nothing consumes it,
+  and while a catch-up pages over other agents' changes: each bus send and
+  each catch-up page query is raced against the cancellation token.
+- The persisted cursor passes a message addressed to the agent only once it
+  is on the bus, with one exception: a message whose payload does not decode
+  as `T` is logged and skipped. The `cursor` table gains `change_index`
+  (default 0): a catch-up stopped by cancellation, or by a bus with no
+  receivers, saves the cursor at the first change not on the bus, and the
+  next catch-up resumes there. If that save fails, the error is logged, the
+  loop still stops, and the persisted cursor stays at its previous saved
+  position. The cursor is persisted once per catch-up page, so a process exit
+  mid-page puts that page's already-sent messages on the bus again.
+  Deliveries already on the bus are not replayed and are lost if the process
+  exits, or every receiver is dropped, before a consumer reads them.
+- A `cursor` row whose `versionstamp` or `change_index` is not an integer
+  fails with `Error::CursorLoad` instead of being treated as absent. A
+  `SHOW CHANGES` changeset without an integer versionstamp fails the
+  catch-up with `Error::CatchUp`.
 
 ## [0.3.0] - 2026-10-28
 

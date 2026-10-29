@@ -211,6 +211,7 @@ async fn test_agent_messaging() {
     scenario_startup_backlog().await;
     scenario_full_bus_shutdown_and_replay().await;
     scenario_stop_mid_changeset(db).await;
+    scenario_cancel_while_paging(db).await;
     scenario_first_page_error(db).await;
     scenario_invalid_agent_name().await;
     scenario_bus_close().await;
@@ -687,10 +688,72 @@ async fn scenario_stop_mid_changeset(db: &Surreal<any::Any>) {
     c2.shutdown().await;
 }
 
+/// **Cancellation while paging over other agents' traffic.** A sink whose
+/// cursor predates 10 000 changesets of traffic between two other agents (ten
+/// catch-up pages, none addressed to the sink) is shut down right after
+/// `Coalition::new` returns. `shutdown()` returns within 15 s, and the
+/// persisted cursor stops short of the end of that traffic: changesets after
+/// it remain.
+async fn scenario_cancel_while_paging(db: &Surreal<any::Any>) {
+    const TRAFFIC: usize = 10_000;
+    let c0 = Coalition::<ChatMessage>::new(vec![
+        "qc_sink".to_string(),
+        "qc_a".to_string(),
+        "qc_b".to_string(),
+    ])
+    .await
+    .expect("round-0 coalition");
+    c0.shutdown().await;
+
+    let statement = "RELATE agent:qc_a->message->agent:qc_b \
+                     CONTENT { created: time::now(), payload: { content: 'qc' } };";
+    db.query(statement.repeat(TRAFFIC))
+        .await
+        .and_then(|r| r.check())
+        .expect("other agents' traffic");
+
+    let c1 = Coalition::<ChatMessage>::new(vec!["qc_sink".to_string()])
+        .await
+        .expect("round-1 coalition");
+    timeout(Duration::from_secs(15), c1.shutdown())
+        .await
+        .expect("shutdown hung while the sink paged over other agents' traffic");
+
+    let row: Option<surrealdb_types::Value> = db
+        .select(("cursor", "qc_sink"))
+        .await
+        .expect("read qc_sink cursor");
+    let versionstamp = match &row {
+        Some(surrealdb_types::Value::Object(o)) => match o.get("versionstamp") {
+            Some(surrealdb_types::Value::Number(n)) => n.to_int(),
+            _ => None,
+        },
+        _ => None,
+    }
+    .unwrap_or_else(|| panic!("qc_sink cursor row has no integer versionstamp: {row:?}"));
+    let rest: surrealdb_types::Value = db
+        .query(format!(
+            "SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {versionstamp} LIMIT 10"
+        ))
+        .await
+        .expect("show changes after the cursor")
+        .take(0)
+        .expect("show changes result");
+    let remaining = match &rest {
+        surrealdb_types::Value::Array(a) => a.len(),
+        _ => 0,
+    };
+    assert!(
+        remaining > 0,
+        "the sink's cursor {versionstamp} reached the end of {TRAFFIC} changesets: \
+         its pass did not stop on cancellation"
+    );
+}
+
 /// **First catch-up query error fails startup.** An agent whose persisted
 /// cursor makes the first `SHOW CHANGES` query fail (a negative versionstamp,
-/// which the parser rejects) fails `Coalition::new` with
-/// [`Error::ListenLoopDropped`].
+/// which the parser rejects) fails `Coalition::new` with that query's
+/// [`Error::CatchUp`].
 async fn scenario_first_page_error(db: &Surreal<any::Any>) {
     db.query("UPSERT cursor:pf_agent CONTENT { versionstamp: -1, change_index: 0 }")
         .await
@@ -701,21 +764,30 @@ async fn scenario_first_page_error(db: &Surreal<any::Any>) {
         Duration::from_secs(30),
         Coalition::<ChatMessage>::new(vec!["pf_agent".to_string()]),
     )
-    .await
-    .expect("Coalition::new hung on a failing first catch-up query");
-    match result {
-        Err(Error::ListenLoopDropped { agent }) => assert_eq!(agent, "pf_agent"),
-        Err(e) => panic!("expected ListenLoopDropped for pf_agent, got {e:?}"),
-        Ok(c) => {
+    .await;
+    let started = match &result {
+        Ok(Ok(c)) => {
             c.shutdown().await;
-            panic!("Coalition::new must fail when the first catch-up query fails");
+            true
         }
-    }
-
-    db.query("DELETE cursor:pf_agent")
+        _ => false,
+    };
+    let cleanup = db
+        .query("DELETE cursor:pf_agent")
         .await
-        .and_then(|r| r.check())
-        .expect("remove the negative cursor");
+        .and_then(|r| r.check());
+
+    let result = result.expect("Coalition::new hung on a failing first catch-up query");
+    assert!(
+        !started,
+        "Coalition::new must fail when the first catch-up query fails"
+    );
+    match result {
+        Err(Error::CatchUp { agent, .. }) => assert_eq!(agent, "pf_agent"),
+        Err(e) => panic!("expected CatchUp for pf_agent, got {e:?}"),
+        Ok(_) => unreachable!("checked by the `started` assertion"),
+    }
+    cleanup.expect("remove the negative cursor");
 }
 
 /// **Invalid agent name is rejected.** `Agent::new` (via `Coalition::new`)
