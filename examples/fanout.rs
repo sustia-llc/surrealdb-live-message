@@ -2,8 +2,8 @@
 //! delivery is asserted to land on the bus exactly once.
 //!
 //! Runnable mirror of the "N-agent fan-out" item in `TODO.md`. Exercises the
-//! MPMC delivery bus under more than two producers (one listen-loop per
-//! recipient all forwarding onto the shared inbox).
+//! `async_channel` MPMC delivery bus under more than two producers (one
+//! listen-loop per recipient all forwarding onto the shared inbox).
 //!
 //! - One `hub` agent plus `N` worker agents.
 //! - `hub` sends the same payload to each worker.

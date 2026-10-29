@@ -108,12 +108,6 @@ pub enum Error {
     #[error("agent '{agent}' listen_loop dropped before ready signal")]
     ListenLoopDropped { agent: String },
 
-    #[error("delivery bus closed: no senders remain and the queue is empty")]
-    BusClosed,
-
-    #[error("delivery bus has no receivers")]
-    BusNoReceivers,
-
     #[error("database ready channel closed")]
     ReadyChannelClosed,
 

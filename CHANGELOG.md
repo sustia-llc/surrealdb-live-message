@@ -9,18 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Breaking: the delivery bus is `bus::bounded`, a bounded MPMC channel on
-  `crossbeam_queue::ArrayQueue` with a `tokio::sync::Semaphore` for free slots
-  and a `tokio::sync::Notify` for queued values. `Coalition::inbox` returns
-  `bus::Inbox<Delivery<T>>` in place of `kanal::AsyncReceiver<Delivery<T>>`;
-  `Inbox::recv` is async and `Inbox::blocking_recv` replaces `to_sync()`.
-  After the last sender drops, `recv` returns the queued deliveries and then
-  `Error::BusClosed`.
-- Remove the `kanal` git dependency; add `crossbeam-queue` 0.3.14.
-
-### Added
-
-- `Error::BusClosed` and `Error::BusNoReceivers`.
+- Breaking: the delivery bus is `async_channel::bounded(256)`.
+  `Coalition::inbox` returns `async_channel::Receiver<Delivery<T>>` in place
+  of `kanal::AsyncReceiver<Delivery<T>>`; `Receiver::recv_blocking` replaces
+  `to_sync()`. After the last sender drops, `recv` returns the queued
+  deliveries and then `Err(RecvError)`.
+- Remove the `kanal` git dependency; add `async-channel` 2.5.
 
 ## [0.3.0] - 2026-10-28
 

@@ -4980,9 +4980,9 @@ name = "surrealdb_live_message"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "bollard",
  "config",
- "crossbeam-queue",
  "futures",
  "reqwest 0.13.5",
  "serde",

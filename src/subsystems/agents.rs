@@ -1,5 +1,6 @@
-use std::{collections::HashMap, marker::PhantomData, num::NonZeroUsize, sync::Arc};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
+use async_channel::{Receiver, Sender};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use surrealdb::engine::any;
@@ -11,7 +12,6 @@ use tokio::time::{Duration, sleep, timeout};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Instrument;
 
-use crate::bus::{self, Inbox, Sender};
 use crate::error::{Error, Result, chain};
 use crate::message::{MESSAGE_TABLE, Message};
 use crate::settings::SETTINGS;
@@ -26,7 +26,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Capacity of the shared MPMC delivery bus connecting agent listen loops to
 /// downstream consumers via [`Coalition::inbox`].
-const INBOX_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).expect("invariant: 256 is non-zero");
+const INBOX_CAPACITY: usize = 256;
 
 /// Table holding each agent's durable-log high-water-mark cursor (`cursor:<agent>`).
 pub const CURSOR_TABLE: &str = "cursor";
@@ -42,7 +42,7 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const LIVE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// An inbound message delivered to an agent's listen loop, forwarded onto the
-/// coalition's shared [`bus`]. `recipient` is the agent that received it;
+/// coalition's shared bounded `async_channel`. `recipient` is the agent that received it;
 /// `message.r#in` is the sender.
 #[derive(Debug)]
 pub struct Delivery<T: SurrealValue> {
@@ -307,7 +307,7 @@ pub struct Coalition<T: SurrealValue + Send + Sync + Unpin + 'static> {
     agents: Arc<RwLock<HashMap<String, Agent>>>,
     task_tracker: TaskTracker,
     cancellation_token: CancellationToken,
-    inbox: Inbox<Delivery<T>>,
+    inbox: Receiver<Delivery<T>>,
     _payload: PhantomData<T>,
 }
 
@@ -343,7 +343,7 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         // the sender; the receiver lives on the Coalition and is handed out via
         // inbox(). Dropping our own sender below leaves only agent-held senders,
         // so the bus closes once all agents shut down.
-        let (inbox_tx, inbox_rx) = bus::bounded::<Delivery<T>>(INBOX_CAPACITY);
+        let (inbox_tx, inbox_rx) = async_channel::bounded::<Delivery<T>>(INBOX_CAPACITY);
 
         let mut ready_rxs = Vec::with_capacity(names.len());
         for name in names {
@@ -418,11 +418,11 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         &self.cancellation_token
     }
 
-    /// A receiver on the shared MPMC delivery bus. Each clone receives a
-    /// disjoint share of the deliveries. `recv()` returns `Err` once all
-    /// agents have shut down and the queued deliveries are drained;
-    /// `blocking_recv()` is the same for a blocking thread.
-    pub fn inbox(&self) -> Inbox<Delivery<T>> {
+    /// A receiver on the shared bounded `async_channel` delivery bus. Each
+    /// delivery goes to one receiver clone. `recv()` returns the queued
+    /// deliveries and then `Err` once all agents have shut down;
+    /// `recv_blocking()` does the same while blocking the calling thread.
+    pub fn inbox(&self) -> Receiver<Delivery<T>> {
         self.inbox.clone()
     }
 
