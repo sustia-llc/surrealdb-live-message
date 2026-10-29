@@ -25,8 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `Agent::new` writes the `agent` record and, when absent, its `cursor` row
-  (at the changeset after the latest one retained in the changefeed) in one
-  transaction; an existing cursor is kept. The listen loop only loads the
+  in one transaction; an existing cursor is kept. For a new agent the cursor
+  starts after the highest versionstamp in the first `SHOW CHANGES` page of
+  the changefeed (at most 1000 changesets). For an existing agent without a
+  cursor it starts at versionstamp 0, so the agent's retained backlog is
+  delivered, and a warn is logged. The listen loop only loads the
   cursor; a missing row fails startup with `Error::CursorLoad`. A failed
   changefeed read in `Agent::new` returns `Error::AgentCreate`.
 - `Coalition::new` returns the first error a listen loop sends (including

@@ -75,8 +75,9 @@ impl Agent {
     /// else [`Error::InvalidAgentName`]. An existing `agent` record and an
     /// existing `cursor` row are kept unchanged. When `cursor:<name>` is
     /// absent, it is created in the same transaction that checks for
-    /// `agent:<name>`: for a new agent, at the changeset after the latest one
-    /// retained in the `message` changefeed; for an agent whose record
+    /// `agent:<name>`: for a new agent, after the highest versionstamp in the
+    /// first `SHOW CHANGES` page of the `message` changefeed (at most 1000
+    /// changesets); for an agent whose record
     /// already existed, at versionstamp 0, so the next catch-up reads the
     /// whole retained changefeed, and that start is logged at warn with the
     /// agent and the position as fields. Both records are written in one
@@ -870,9 +871,9 @@ fn max_versionstamp(v: &Value) -> i64 {
     arr.iter().filter_map(versionstamp_of).max().unwrap_or(0)
 }
 
-/// Latest versionstamp currently retained in the message changefeed, for the
-/// first-run "start from now" snapshot. Reads (and discards) the retained window
-/// once; returns 0 when the feed is empty. [`Agent::new`] runs it only when
+/// Highest versionstamp in the first `SHOW CHANGES` page of the message
+/// changefeed (at most 1000 changesets), for a new agent's starting cursor;
+/// 0 when the feed is empty. [`Agent::new`] runs it only when
 /// `cursor:<agent>` is absent. Errors map to [`Error::AgentCreate`] for
 /// `agent`.
 async fn latest_versionstamp(db: &Surreal<any::Any>, agent: &str) -> Result<i64> {
