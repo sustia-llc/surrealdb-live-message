@@ -32,5 +32,5 @@ These were diagnosed fixes; tests lock them in. See docstrings in `src/message.r
 
 ## Conventions
 
-- Library code returns a typed **`thiserror`** enum — `crate::error::Error` / `crate::error::Result`. `anyhow` is used **only** in `src/main.rs` and `tests/` (its `?` absorbs `Error` via the blanket `From`). No `unwrap()` in library code; `.expect()` only at fatal startup points (`sdb::client`, `sdb_task`).
+- Library code returns a typed **`thiserror`** enum — `crate::error::Error` / `crate::error::Result`. `anyhow` is used **only** in `src/main.rs` and `tests/` (its `?` absorbs `Error` via the blanket `From`). No `unwrap()` in library code; `.expect()` only at fatal startup points (`sdb::client`, `sdb_task`) and as `.expect("invariant: …")` where a precondition makes the other branch unreachable and the message states it.
 - Workflow: commit **direct to `main`** (no PR gate). Track TODOs in `TODO.md`.
