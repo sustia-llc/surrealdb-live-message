@@ -211,7 +211,7 @@ async fn test_agent_messaging() {
     scenario_startup_backlog().await;
     scenario_full_bus_shutdown_and_replay().await;
     scenario_stop_mid_changeset(db).await;
-    scenario_cancel_while_paging(db).await;
+    scenario_cancel_before_first_page(db).await;
     scenario_drop_cancels(db).await;
     scenario_malformed_cursor(db).await;
     scenario_wake_during_pass().await;
@@ -691,13 +691,13 @@ async fn scenario_stop_mid_changeset(db: &Surreal<any::Any>) {
     c2.shutdown().await;
 }
 
-/// **Cancellation stops catch-up paging.** A sink whose cursor predates 2 500
-/// changesets of traffic between two other agents (three catch-up pages, none
-/// addressed to the sink) is started under an already-cancelled parent token.
-/// Its listen loop sees the cancellation at its first page query, before
-/// reading any page, so `Coalition::new` returns `ListenLoopDropped` within
-/// 15 s and the persisted cursor still has changesets after it.
-async fn scenario_cancel_while_paging(db: &Surreal<any::Any>) {
+/// **Cancellation before the first page query.** A sink whose cursor predates
+/// 2 500 changesets of traffic between two other agents is started with
+/// `Coalition::new_with_parent` under an already-cancelled parent token. The
+/// scenario asserts that `Coalition::new_with_parent` returns within 15 s with
+/// `ListenLoopDropped` for the sink, and that `SHOW CHANGES` from the sink's
+/// persisted cursor still returns changesets.
+async fn scenario_cancel_before_first_page(db: &Surreal<any::Any>) {
     const TRAFFIC: usize = 2_500;
     let c0 = Coalition::<ChatMessage>::new(vec![
         "qc_sink".to_string(),
@@ -865,9 +865,29 @@ async fn scenario_wake_during_pass() {
 /// [`Error::InvalidAgentName`], and the valid agent's listen loop has ended:
 /// the server's live-query count stays at its earlier value for 5 s.
 async fn scenario_build_failure_teardown(db: &Surreal<any::Any>) {
+    // First run for bt_ok: its listen loop creates cursor:bt_ok before it can
+    // see the cancellation, so the row exists only if the loop was waited for.
+    db.query("DELETE cursor:bt_ok; DELETE agent:bt_ok;")
+        .await
+        .and_then(|r| r.check())
+        .expect("reset bt_ok");
     let before = message_lives(db).await.len();
     let result =
         Coalition::<ChatMessage>::new(vec!["bt_ok".to_string(), "bad name".to_string()]).await;
+    let cursor_row: Option<surrealdb_types::Value> = db
+        .select(("cursor", "bt_ok"))
+        .await
+        .expect("read cursor:bt_ok");
+    let lives_at_return = message_lives(db).await.len();
+    assert!(
+        cursor_row.is_some(),
+        "cursor:bt_ok must exist when Coalition::new returns, which shows bt_ok's \
+         listen loop ran to its end before the return; found {cursor_row:?}"
+    );
+    assert_eq!(
+        lives_at_return, before,
+        "live queries when Coalition::new returned: {lives_at_return}, {before} expected"
+    );
     match &result {
         Err(Error::InvalidAgentName { name }) => assert_eq!(name, "bad name"),
         Err(e) => panic!("expected InvalidAgentName, got {e:?}"),

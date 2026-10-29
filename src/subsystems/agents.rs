@@ -443,13 +443,16 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
                 .instrument(tracing::info_span!("retention_sweep")),
         );
 
-        // Wait until every listen_loop has signalled ready (LIVE query
-        // registered, first catch-up page query succeeded). Each await is
-        // bounded by READY_TIMEOUT.
-        for (name, rx) in ready_rxs {
-            let Err(err) = await_ready(name, rx, ready_timeout).await else {
-                continue;
-            };
+        // Wait, concurrently, until every listen_loop has signalled ready
+        // (LIVE query registered, first catch-up page query succeeded). Each
+        // wait is bounded by ready_timeout.
+        let outcomes = futures::future::join_all(
+            ready_rxs
+                .into_iter()
+                .map(|(name, rx)| await_ready(name, rx, ready_timeout)),
+        )
+        .await;
+        if let Err(err) = first_ready_error(outcomes) {
             abort_build(&cancellation_token, &task_tracker).await;
             return Err(err);
         }
@@ -506,6 +509,24 @@ fn reject_duplicate_names(names: &[String]) -> Result<()> {
         Some(name) => Err(Error::DuplicateAgentName { name: name.clone() }),
         None => Ok(()),
     }
+}
+
+/// Pick the error to return from the readiness outcomes of every listen loop:
+/// the first error a listen loop sent (any variant other than
+/// [`Error::ReadyTimeout`] or [`Error::ListenLoopDropped`]); else the first
+/// `ReadyTimeout` or `ListenLoopDropped`; else `Ok(())`.
+fn first_ready_error(outcomes: Vec<Result<()>>) -> Result<()> {
+    let mut fallback = None;
+    for outcome in outcomes {
+        match outcome {
+            Ok(()) => {}
+            Err(e @ (Error::ReadyTimeout { .. } | Error::ListenLoopDropped { .. })) => {
+                fallback.get_or_insert(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    fallback.map_or(Ok(()), Err)
 }
 
 /// Tear down a coalition whose construction failed: cancel `token`, close
@@ -1292,6 +1313,42 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// [`first_ready_error`] returns a listen loop's sent error over an
+    /// earlier `ReadyTimeout` or `ListenLoopDropped`, falls back to the first
+    /// of those when no loop sent one, and returns `Ok(())` when every loop
+    /// signalled ready.
+    #[test]
+    fn first_ready_error_prefers_a_sent_error() {
+        let timeout_err = || Error::ReadyTimeout {
+            agent: "ann".to_string(),
+            timeout: Duration::from_secs(10),
+        };
+        let dropped = || Error::ListenLoopDropped {
+            agent: "cy".to_string(),
+        };
+        let sent = || Error::LiveQueryIdMissing {
+            agent: "bo".to_string(),
+        };
+
+        let picked = first_ready_error(vec![
+            Err(timeout_err()),
+            Ok(()),
+            Err(sent()),
+            Err(dropped()),
+        ]);
+        assert!(
+            matches!(&picked, Err(Error::LiveQueryIdMissing { agent }) if agent == "bo"),
+            "a sent error must win over an earlier timeout, got {picked:?}"
+        );
+        let picked = first_ready_error(vec![Ok(()), Err(dropped()), Err(timeout_err())]);
+        assert!(
+            matches!(&picked, Err(Error::ListenLoopDropped { agent }) if agent == "cy"),
+            "with no sent error the first fallback must be returned, got {picked:?}"
+        );
+        let picked = first_ready_error(vec![Ok(()), Ok(())]);
+        assert!(picked.is_ok(), "all ready must be Ok, got {picked:?}");
     }
 
     /// [`reject_duplicate_names`] returns [`Error::DuplicateAgentName`] for
