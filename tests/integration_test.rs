@@ -450,9 +450,9 @@ async fn scenario_backpressure() {
     coalition.shutdown().await;
 }
 
-/// Receive from `inbox` until `want` distinct payloads have arrived, a `recv`
-/// waits longer than `per_recv`, or the bus closes. Returns how many times each
-/// payload arrived.
+/// Receive from `inbox`, adding one to `seen[payload]` per delivery, until
+/// `seen` holds `want` distinct payloads, a `recv` waits longer than
+/// `per_recv`, or the bus closes.
 async fn recv_distinct(
     inbox: &async_channel::Receiver<Delivery<ChatMessage>>,
     want: usize,
@@ -518,21 +518,22 @@ async fn scenario_startup_backlog() {
     c2.shutdown().await;
 }
 
-/// **Shutdown with a full bus, then replay.** With no consumer, a sink sent 300
-/// messages fills the bus (256) and its listen loop waits on the next send.
-/// `shutdown()` still returns. The deliveries already on the bus stay readable
-/// from the old inbox; a new coalition for the same agents delivers the rest.
-/// Delivery is at-least-once: every message arrives at least once across the
-/// two inboxes.
+/// **Shutdown with a full bus, then replay.** A sink restarted with a
+/// 300-message backlog and no consumer fills the bus (256) in one catch-up
+/// pass and waits on the next send. `shutdown()` still returns. The
+/// deliveries already on the bus stay readable from the old inbox; a new
+/// coalition for the same agents delivers the rest. Each `Agent::send` here is
+/// its own changeset, so across the two inboxes every message arrives exactly
+/// once.
 async fn scenario_full_bus_shutdown_and_replay() {
     const N: usize = 300;
     let names = || vec!["fb_src".to_string(), "fb_sink".to_string()];
 
-    let c1 = Coalition::<ChatMessage>::new(names())
+    let c0 = Coalition::<ChatMessage>::new(names())
         .await
-        .expect("round-1 coalition");
-    let inbox1 = c1.inbox();
-    let src = c1.agent("fb_src").await.expect("fb_src in coalition");
+        .expect("round-0 coalition");
+    let src = c0.agent("fb_src").await.expect("fb_src in coalition");
+    c0.shutdown().await;
     for i in 0..N {
         src.send(
             "fb_sink",
@@ -541,8 +542,13 @@ async fn scenario_full_bus_shutdown_and_replay() {
             },
         )
         .await
-        .unwrap_or_else(|e| panic!("flood send {i}: {e}"));
+        .unwrap_or_else(|e| panic!("backlog send {i}: {e}"));
     }
+
+    let c1 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-1 coalition");
+    let inbox1 = c1.inbox();
     timeout(Duration::from_secs(15), async {
         while !inbox1.is_full() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -571,10 +577,11 @@ async fn scenario_full_bus_shutdown_and_replay() {
         missing.is_empty(),
         "messages lost across shutdown + restart ({from_old_bus} read from the old bus): {missing:?}"
     );
-    let dups = seen.values().filter(|n| **n > 1).count();
-    eprintln!(
-        "FULL_BUS_REPLAY old_bus={from_old_bus} distinct={} duplicates={dups}",
-        seen.len()
+    let dups: Vec<_> = seen.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(
+        dups.is_empty(),
+        "messages delivered twice across shutdown + restart ({from_old_bus} read from the old bus): {} duplicates {dups:?}",
+        dups.len()
     );
 
     c2.shutdown().await;

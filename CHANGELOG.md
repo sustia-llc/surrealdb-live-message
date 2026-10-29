@@ -20,13 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Coalition::new` returns when an agent's durable backlog exceeds the bus
   capacity: each listen loop signals readiness after its first LIVE
-  subscribe, before the backlog drain.
+  subscribe and a one-row `SHOW CHANGES` probe, before the backlog drain. A
+  failing probe fails `Coalition::new` with `Error::ListenLoopDropped`.
+- Wakes queued on the LIVE stream are merged: one catch-up pass serves every
+  wake ready when the pass starts.
 - `Coalition::shutdown` returns when the bus is full and nothing consumes it:
   each bus send in the catch-up is raced against the cancellation token.
 - The persisted cursor never passes a message that did not reach the bus. A
   catch-up stopped by cancellation, or by a bus with no receivers, saves the
   cursor at the first changeset with an undelivered message, which the next
-  catch-up delivers again.
+  catch-up reads again from its first message, so that changeset's
+  already-sent messages go on the bus again. Delivery onto the bus is
+  at-least-once; deliveries already on the bus are not replayed and are lost
+  if the process exits, or every receiver is dropped, before a consumer reads
+  them.
 
 ## [0.3.0] - 2026-10-28
 
@@ -92,8 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Two-tier durable message bus** — delivery is now at-least-once + idempotent
-  across disconnects *and* restarts, replacing the previous at-most-once LIVE
+- **Two-tier durable message bus** — delivery reads a durable log across
+  disconnects *and* restarts, replacing the previous at-most-once LIVE
   behaviour (a message published while an agent was disconnected was silently
   lost; see the SurrealDB `live-queries` skill, "Delivery guarantees").
   - The `message` edge table is the durable log, backed by a `CHANGEFEED`
@@ -109,7 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Agent::new` is now restart-idempotent (reuses an existing agent record) so a
     restarted coalition resumes its durable cursors.
   - `Message<T>` gains an `id: Option<RecordId>` field, populated on delivery, so
-    consumers can identify/deduplicate under the at-least-once guarantee.
+    consumers can identify/deduplicate a delivery.
   - New setting `sdb.message_retention_secs` (default `86400`).
 
 ### Changed
