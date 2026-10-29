@@ -214,6 +214,8 @@ async fn test_agent_messaging() {
     scenario_cancel_while_paging(db).await;
     scenario_drop_cancels(db).await;
     scenario_malformed_cursor(db).await;
+    scenario_wake_during_pass().await;
+    scenario_build_failure_teardown(db).await;
     scenario_invalid_agent_name().await;
     scenario_bus_close().await;
     scenario_durable_restart().await;
@@ -798,6 +800,91 @@ async fn scenario_drop_cancels(db: &Surreal<any::Any>) {
     );
 }
 
+/// **A wake read during a pass is served.** A sink restarted with a
+/// 300-message backlog and no consumer fills the bus (256) and its pass waits
+/// on the next send. One more message M is sent while that send waits, so M's
+/// wake is read during the pass. After the inbox is drained, M arrives within
+/// 10 s with no further sends.
+async fn scenario_wake_during_pass() {
+    const BACKLOG: usize = 300;
+    let names = || vec!["wd_src".to_string(), "wd_sink".to_string()];
+
+    let c0 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-0 coalition");
+    let src = c0.agent("wd_src").await.expect("wd_src in coalition");
+    c0.shutdown().await;
+    for i in 0..BACKLOG {
+        src.send(
+            "wd_sink",
+            ChatMessage {
+                content: format!("wd{i}"),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("backlog send {i}: {e}"));
+    }
+
+    let c1 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-1 coalition");
+    let inbox = c1.inbox();
+    timeout(Duration::from_secs(15), async {
+        while !inbox.is_full() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("bus never filled; it holds {}", inbox.len()));
+
+    src.send(
+        "wd_sink",
+        ChatMessage {
+            content: "wd_m".to_string(),
+        },
+    )
+    .await
+    .expect("send M");
+    // M's wake reaches the listen loop while its send still waits.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut seen = HashMap::new();
+    recv_distinct(&inbox, BACKLOG + 1, Duration::from_secs(10), &mut seen).await;
+    let got_m = seen.contains_key("wd_m");
+    c1.shutdown().await;
+    assert!(
+        got_m,
+        "message M sent during a blocked pass was not delivered within 10 s \
+         ({} distinct deliveries)",
+        seen.len()
+    );
+}
+
+/// **A failing agent name tears down earlier agents.** `Coalition::new` with
+/// a valid name followed by an invalid one returns
+/// [`Error::InvalidAgentName`], and the valid agent's listen loop has ended:
+/// the server's live-query count stays at its earlier value for 5 s.
+async fn scenario_build_failure_teardown(db: &Surreal<any::Any>) {
+    let before = message_lives(db).await.len();
+    let result =
+        Coalition::<ChatMessage>::new(vec!["bt_ok".to_string(), "bad name".to_string()]).await;
+    match &result {
+        Err(Error::InvalidAgentName { name }) => assert_eq!(name, "bad name"),
+        Err(e) => panic!("expected InvalidAgentName, got {e:?}"),
+        Ok(_) => panic!("a malformed agent name should be rejected"),
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let now = message_lives(db).await.len();
+        assert_eq!(
+            now, before,
+            "bt_ok's listen loop outlived the failed Coalition::new: {now} live queries, \
+             {before} expected"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// **A malformed cursor fails startup with its typed error.** An agent whose
 /// persisted cursor has a negative versionstamp fails `Coalition::new` with
 /// [`Error::CursorLoad`].
@@ -840,10 +927,6 @@ async fn scenario_malformed_cursor(db: &Surreal<any::Any>) {
 /// **Invalid agent name is rejected.** `Agent::new` (via `Coalition::new`)
 /// validates names up front, so a name that isn't a safe record-id key (a space
 /// here) fails with [`Error::InvalidAgentName`] before any DB work.
-///
-/// (This guard plus the parameter-bound LIVE query is why `ListenLoopDropped`
-/// no longer has a cheap trigger — like `AgentCreateEmpty`, it is now only
-/// reachable via fault injection.)
 async fn scenario_invalid_agent_name() {
     match Coalition::<ChatMessage>::new(vec!["ghost rider".to_string()]).await {
         Ok(_) => panic!("a malformed agent name should be rejected"),

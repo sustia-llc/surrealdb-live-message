@@ -32,7 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An error before then is logged with its source chain and returned by
   `Coalition::new` as that error (for example `Error::CatchUp`,
   `Error::CursorLoad`, `Error::LiveQuery`); `Error::ListenLoopDropped` is
-  returned only for a listen loop that ends without signalling.
+  returned only for a listen loop that ends without signalling. If an agent
+  name fails after earlier agents' listen loops were spawned,
+  `Coalition::new` cancels those loops and waits for them before returning
+  the error.
 - Wakes on the LIVE stream are read while a bus send waits on a full bus,
   and every wake read before or during a catch-up pass is served by one
   further pass.
@@ -43,9 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is on the bus. Malformed data follows one rule, log at error level and
   skip: a changeset that is not an object or has no integer versionstamp
   (it has no position; the cursor passes it only by moving to a later
-  changeset), a missing or non-array `changes`, a change or record that is
-  not an object, and a message whose payload does not decode as `T`. The
-  `cursor` table gains `change_index`
+  changeset), a missing or non-array `changes`, a change that is not an
+  object or whose op key is not `update`, `delete` or `define_table`, a
+  record that is not an object, a record whose `out` is missing or not a
+  record id, and a message whose payload does not decode as `T`. `delete`
+  and `define_table` ops and messages for other agents are skipped without a
+  log. A `SHOW CHANGES` reply that is not an array fails the catch-up with
+  `Error::CatchUp`. The `cursor` table gains `change_index`
   (default 0): a catch-up stopped by cancellation, or by a bus with no
   receivers, saves the cursor at the first change not on the bus, and the
   next catch-up resumes there. If that save fails, the error is logged, the

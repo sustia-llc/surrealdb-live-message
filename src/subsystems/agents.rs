@@ -287,7 +287,11 @@ impl Agent {
                     }
                     .await;
                     match pass {
-                        Ok(ControlFlow::Continue(())) => backoff = RECONNECT_BACKOFF_START,
+                        Ok(ControlFlow::Continue(())) => {
+                            backoff = RECONNECT_BACKOFF_START;
+                            // A wake read during the pass set `pending` again.
+                            continue;
+                        }
                         Ok(ControlFlow::Break(stop)) => break Exit::Stop(stop),
                         Err(e) => break Exit::CatchUp(e),
                     }
@@ -401,7 +405,13 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
 
         let mut ready_rxs = Vec::with_capacity(names.len());
         for name in names {
-            let agent = Agent::new(&name).await?;
+            let agent = match Agent::new(&name).await {
+                Ok(agent) => agent,
+                Err(err) => {
+                    abort_build(&cancellation_token, &task_tracker).await;
+                    return Err(err);
+                }
+            };
             agents.write().await.insert(name.clone(), agent.clone());
 
             let token = cancellation_token.child_token();
@@ -437,15 +447,7 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
             let Err(err) = await_ready(name, rx, ready_timeout).await else {
                 continue;
             };
-            // Handshake failed: cancel the already-spawned listen_loops, then
-            // drain them (close + wait) before returning — the same
-            // cancel→close→wait as shutdown(). Cancel alone would leave the
-            // tasks running detached (TaskTracker's Drop neither aborts nor
-            // awaits), racing the caller; and dropping the token here would NOT
-            // cancel the child tokens they hold.
-            cancellation_token.cancel();
-            task_tracker.close();
-            task_tracker.wait().await;
+            abort_build(&cancellation_token, &task_tracker).await;
             return Err(err);
         }
 
@@ -491,6 +493,14 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Drop for Coalition<T> {
     fn drop(&mut self) {
         self.cancellation_token.cancel();
     }
+}
+
+/// Tear down a coalition whose construction failed: cancel `token`, close
+/// `tracker`, and wait for every task it spawned to end.
+async fn abort_build(token: &CancellationToken, tracker: &TaskTracker) {
+    token.cancel();
+    tracker.close();
+    tracker.wait().await;
 }
 
 /// Await one listen-loop's readiness signal, bounded by `ready_timeout`, mapping
@@ -805,9 +815,9 @@ where
 
 /// Fetch the catch-up page that starts at `cursor`: `SHOW CHANGES … SINCE
 /// <cursor.versionstamp> LIMIT CATCHUP_BATCH`, raced against `ctx.token`.
-/// Returns the page's changesets (empty when the reply is not an array, which
-/// is logged at error), or `ControlFlow::Break(Stop::Cancelled)` when the
-/// token is cancelled first.
+/// Returns the page's changesets, `ControlFlow::Break(Stop::Cancelled)` when
+/// the token is cancelled first, or [`Error::CatchUp`] when the query fails or
+/// its reply is not an array.
 async fn fetch_page<T: SurrealValue>(
     ctx: &LoopCtx<'_, T>,
     cursor: Cursor,
@@ -819,24 +829,16 @@ async fn fetch_page<T: SurrealValue>(
     };
     match reply {
         Value::Array(changesets) => Ok(ControlFlow::Continue(changesets.into_iter().collect())),
-        other => {
-            tracing::error!(
-                "catch_up for {}: SHOW CHANGES reply is not an array, skipped: {other:?}",
-                ctx.agent
-            );
-            Ok(ControlFlow::Continue(Vec::new()))
-        }
+        other => Err(Error::CatchUp {
+            agent: ctx.agent.to_string(),
+            source: reply_error(format!("SHOW CHANGES reply is not an array: {other:?}")),
+        }),
     }
 }
 
-/// Convert a change position to the cursor's `i64`, or [`Error::CatchUp`] if
-/// it does not fit.
-fn index_to_i64(agent: &str, index: usize) -> Result<i64> {
-    i64::try_from(index).map_err(|_| Error::CatchUp {
-        agent: agent.to_string(),
-        source: reply_error(format!("change index {index} does not fit the cursor")),
-    })
-}
+/// Change-op keys that `SHOW CHANGES` emits for a change that is not a
+/// message record (`TableMutation::into_value` in surrealdb-datastore 3.3.4).
+const NON_MESSAGE_OPS: [&str; 2] = ["delete", "define_table"];
 
 /// Deliver one catch-up page (`page`, fetched from `*cursor`) onto the bus,
 /// in log order, and persist the cursor.
@@ -844,17 +846,20 @@ fn index_to_i64(agent: &str, index: usize) -> Result<i64> {
 /// Cursor rule: the cursor moves past a changeset once every change in it
 /// has been handled, to the start of the next versionstamp; inside the
 /// changeset at `cursor.versionstamp`, changes before `cursor.change_index`
-/// are not read again. A change is handled when it is not a message for
-/// `ctx.owner` (its record's `out` is compared before any decode), or when
-/// its delivery is on the bus. A changeset with no integer versionstamp has
-/// no position of its own: it is skipped, and the cursor passes it only by
-/// moving to a later changeset's position.
+/// are not read again. A change is handled when it is a `delete` or
+/// `define_table` op, when its `update` record's `out` is another agent (`out`
+/// is compared before any decode), or when its delivery is on the bus. A
+/// changeset with no integer versionstamp has no position of its own: it is
+/// skipped, and the cursor passes it only by moving to a later changeset's
+/// position.
 ///
 /// Malformed-data rule: a changeset that is not an object or has no integer
 /// versionstamp, a `changes` field that is missing or not an array, a change
-/// or record that is not an object, and a message for `ctx.owner` that does
-/// not decode as `Message<T>` are each logged at error level (agent,
-/// versionstamp, what was malformed) and skipped.
+/// that is not an object or has no `update`, `delete` or `define_table` key, a
+/// record that is not an object, a record whose `out` is missing or not a
+/// record id, and a message for `ctx.owner` that does not decode as
+/// `Message<T>` are each logged at error level (agent, versionstamp, what was
+/// malformed) and skipped.
 ///
 /// Each send is raced against `ctx.token`, and `wakes` is read while a send
 /// waits on a full bus. Cancellation, or a bus with no receivers, returns
@@ -885,13 +890,10 @@ where
             continue;
         };
         let skip = if vs == page_start.versionstamp {
-            usize::try_from(page_start.change_index).map_err(|_| Error::CatchUp {
-                agent: agent.to_string(),
-                source: reply_error(format!(
-                    "cursor change index {} is not a valid position",
-                    page_start.change_index
-                )),
-            })?
+            usize::try_from(page_start.change_index).expect(
+                "invariant: change_index is non-negative (parse_cursor rejects negatives; \
+                 catch-up stores usize positions), so it fits a 64-bit usize",
+            )
         } else {
             0
         };
@@ -912,9 +914,16 @@ where
                 );
                 continue;
             };
-            // RELATE-created edges surface as a "create"/"update" op carrying
-            // the full record; "delete" ops (retention sweep) are not messages.
-            let Some(record) = op.get("update").or_else(|| op.get("create")) else {
+            // A RELATE-created edge surfaces as an "update" op carrying the
+            // full record.
+            let Some(record) = op.get("update") else {
+                if !NON_MESSAGE_OPS.iter().any(|k| op.get(*k).is_some()) {
+                    let keys: Vec<&String> = op.keys().collect();
+                    tracing::error!(
+                        "catch_up for {agent}: change {index} of changeset {vs} has an unknown \
+                         op, skipped: keys {keys:?}"
+                    );
+                }
                 continue;
             };
             let Value::Object(fields) = record else {
@@ -924,8 +933,16 @@ where
                 );
                 continue;
             };
-            if !matches!(fields.get("out"), Some(Value::RecordId(out)) if *out == ctx.owner) {
-                continue; // table-wide feed — keep only ours
+            match fields.get("out") {
+                Some(Value::RecordId(out)) if *out == ctx.owner => {}
+                Some(Value::RecordId(_)) => continue, // table-wide feed — keep only ours
+                other => {
+                    tracing::error!(
+                        "catch_up for {agent}: record of change {index} in changeset {vs} has no \
+                         record-id `out`, skipped: {other:?}"
+                    );
+                    continue;
+                }
             }
             let message = match Message::<T>::from_value(record.clone()) {
                 Ok(m) => m,
@@ -948,7 +965,10 @@ where
                 Err(stop) => {
                     committed = committed.max(Cursor {
                         versionstamp: vs,
-                        change_index: index_to_i64(agent, index)?,
+                        change_index: i64::try_from(index).expect(
+                            "invariant: index is below a Vec's length, which is at most \
+                             isize::MAX and so fits i64",
+                        ),
                     });
                     stopped = Some(stop);
                     break 'page;
@@ -1233,6 +1253,102 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// [`deliver_page`] on a crafted page: `delete` and `define_table` ops and a
+    /// message for another agent are skipped without an error line; an
+    /// unknown op key and a record without a record-id `out` are each logged
+    /// at error level and skipped; the message for the owner is put on the
+    /// bus; the cursor moves to the start of the next versionstamp.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deliver_page_skips_non_messages_and_logs_malformed_changes() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let other = RecordId::new(AGENT_TABLE, "grace");
+        let (stream, _live_id) = subscribe_wake(db, &owner, "frank")
+            .await
+            .expect("subscribe");
+        let mut wakes = Wakes::new(stream);
+        let (inbox_tx, inbox_rx) = async_channel::bounded::<Delivery<String>>(4);
+        let ctx = LoopCtx {
+            db,
+            owner: owner.clone(),
+            agent: "frank",
+            inbox_tx,
+            token: CancellationToken::new(),
+        };
+
+        let object = |pairs: Vec<(&str, Value)>| {
+            Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        };
+        let message = |out: Option<RecordId>, text: &str| {
+            Message::<String> {
+                id: None,
+                r#in: Some(other.clone()),
+                out,
+                payload: text.to_string(),
+                created: None,
+            }
+            .into_value()
+        };
+        let changes = vec![
+            object(vec![(
+                "delete",
+                object(vec![("id", owner.clone().into_value())]),
+            )]),
+            object(vec![("define_table", object(vec![]))]),
+            object(vec![("weird_op", 1i64.into_value())]),
+            object(vec![("update", message(Some(other.clone()), "for grace"))]),
+            object(vec![("update", message(None, "no out"))]),
+            object(vec![("update", message(Some(owner.clone()), "for frank"))]),
+        ];
+        let page = vec![object(vec![
+            ("versionstamp", 5i64.into_value()),
+            ("changes", Value::Array(changes.into_iter().collect())),
+        ])];
+
+        let sink = LogSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let mut cursor = Cursor::at(5);
+        let flow = deliver_page(&ctx, &mut cursor, &mut wakes, &page)
+            .await
+            .expect("deliver_page");
+        drop(guard);
+
+        assert_eq!(flow, ControlFlow::Continue(()), "the page must complete");
+        assert_eq!(cursor, Cursor::at(6), "cursor after the page");
+        let delivered = inbox_rx.try_recv().expect("one delivery on the bus");
+        assert_eq!(delivered.message.payload, "for frank");
+        assert!(
+            inbox_rx.try_recv().is_err(),
+            "only the owner's message may reach the bus"
+        );
+
+        let logs =
+            String::from_utf8(sink.0.lock().expect("log sink lock").clone()).expect("utf-8 logs");
+        let errors: Vec<&str> = logs.lines().filter(|l| l.contains("ERROR")).collect();
+        assert_eq!(
+            errors.len(),
+            2,
+            "expected exactly the unknown-op and missing-out errors; got {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|l| l.contains("change 2")
+                && l.contains("unknown op")
+                && l.contains("weird_op")),
+            "no error line for the unknown op; got {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|l| l.contains("change 4") && l.contains("no record-id `out`")),
+            "no error line for the record without `out`; got {errors:?}"
+        );
     }
 
     /// [`end_live`]'s warn line for [`Error::LiveKill`] carries the inner
