@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Breaking: `Error::Cancelled { agent }`. `Coalition::new` returns it when the
+  coalition's token is cancelled before every listen loop is ready,
+  including a `Coalition::new_with_parent` parent that is already cancelled;
+  that token is checked before any database call. `Error::ListenLoopDropped`
+  now means only that a loop ended without a ready signal and without a
+  cancel. When loops fail, an error a loop sent, including
+  `Error::Cancelled`, is returned in preference to `Error::ReadyTimeout` and
+  `Error::ListenLoopDropped`.
+
+### Fixed
+
+- A failed `Coalition::new` keeps backlog deliveries: each listen
+  loop holds at its ready point until `Coalition::new` has every ready
+  signal and sends a start signal, so no delivery reaches the bus before
+  `Coalition::new` returns `Ok`, and a failed `Coalition::new` moves no
+  cursor past a message that was not on the bus. A backlog larger than the
+  bus does not block `Coalition::new`.
+- Every listen-loop await before the ready signal (cursor load, first-run
+  snapshot, first cursor save, LIVE subscribe, first page query) is raced
+  against the loop's token, so a startup database call that never completes
+  does not stop `Coalition::new` returning `Error::ReadyTimeout` or a
+  startup error.
+- Dropping the `Coalition::new` future cancels every spawned listen loop and
+  the retention sweep without waiting for them; a loop whose ready send
+  fails ends.
+
 ## [0.4.1] - 2026-10-29
 
 ### Changed

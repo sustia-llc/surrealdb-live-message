@@ -108,8 +108,11 @@ pub enum Error {
     #[error("agent '{agent}' listen_loop did not signal ready within {timeout:?}")]
     ReadyTimeout { agent: String, timeout: Duration },
 
-    #[error("agent '{agent}' listen_loop dropped before ready signal")]
+    #[error("agent '{agent}' listen_loop ended before its ready signal without a cancel")]
     ListenLoopDropped { agent: String },
+
+    #[error("coalition token was cancelled before agent '{agent}' was ready")]
+    Cancelled { agent: String },
 
     #[error("database ready channel closed")]
     ReadyChannelClosed,
