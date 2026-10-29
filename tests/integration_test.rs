@@ -862,8 +862,9 @@ async fn scenario_wake_during_pass() {
 
 /// **A failing agent name tears down earlier agents.** `Coalition::new` with
 /// a valid name followed by an invalid one returns
-/// [`Error::InvalidAgentName`], and the valid agent's listen loop has ended:
-/// the server's live-query count stays at its earlier value for 5 s.
+/// [`Error::InvalidAgentName`]. When it returns, the valid agent's first-run
+/// `cursor` row exists and the server's live-query count equals its earlier
+/// value; the count stays there for 5 s.
 async fn scenario_build_failure_teardown(db: &Surreal<any::Any>) {
     // First run for bt_ok: its listen loop creates cursor:bt_ok before it can
     // see the cancellation, so the row exists only if the loop was waited for.

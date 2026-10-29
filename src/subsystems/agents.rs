@@ -19,9 +19,8 @@ use crate::subsystems::sdb;
 
 pub const AGENT_TABLE: &str = "agent";
 
-/// Maximum time `Coalition::new` waits for each `listen_loop` to signal that
-/// its LIVE query is registered before giving up. Guards against a DB that
-/// stalls during LIVE registration (so the sender is neither sent nor dropped).
+/// Maximum time `Coalition::new` waits for each `listen_loop` to send its
+/// ready signal.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Capacity of the shared MPMC delivery bus connecting agent listen loops to
@@ -179,14 +178,15 @@ impl Agent {
     /// (log at error, then move on). The cursor is persisted after each
     /// catch-up page and when a pass stops; if that save fails, the persisted
     /// cursor stays at its previous saved position. A message not yet on the
-    /// bus is put on it after a disconnect/restart. After a stop whose cursor
+    /// bus is put on it after a disconnect/restart. Each `update` op of a
+    /// message record addressed to this agent is one delivery, so a message
+    /// record that is updated after it is created is put on the bus again.
+    /// For message records that are only created: after a stop whose cursor
     /// save succeeds, no message is put on the bus twice; after a process exit
     /// mid-page, or a failed save, the messages sent since the last saved
     /// position are put on the bus again. Deliveries already on the bus are
-    /// not replayed: they are lost if the process exits, or every receiver is
-    /// dropped, before a consumer reads them.
-    /// (LIVE alone is at-most-once with no replay; see the `live-queries`
-    /// skill, "Delivery guarantees".)
+    /// not replayed: they are lost if the process exits, or the bus closes,
+    /// before a consumer reads them.
     ///
     /// `ready_tx` receives `Ok(())` once, after the first subscribe and the
     /// first catch-up page query succeed and before that pass puts anything on
@@ -197,11 +197,9 @@ impl Agent {
     /// wake stream is still read. The loop ends when `token` is cancelled (seen
     /// at the next bus send, page query, or wait for a wake), including by
     /// `Coalition::shutdown` or the coalition's `Drop`, or when a send finds
-    /// every bus receiver dropped. Messages are NEVER deleted here — the log is
-    /// aged out by the coalition's retention sweep.
-    ///
-    /// Library-side lifecycle primitive. No `SubsystemHandle`, no signal
-    /// handling. See `rust-practical:async-lifecycle` skill.
+    /// the bus closed: every receiver dropped, or `close()` called on any
+    /// receiver. The loop never deletes messages; the coalition's retention
+    /// sweep ages them out.
     async fn listen_loop<T>(
         self,
         token: CancellationToken,
@@ -361,21 +359,16 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     ///
     /// Waits for every `listen_loop` to signal that its LIVE query is
     /// registered and its first catch-up page query succeeded before
-    /// returning. Each wait is bounded by [`READY_TIMEOUT`]; a stalled or
-    /// dropped listen loop yields an error instead of hanging.
+    /// returning. Each wait is bounded by [`READY_TIMEOUT`]. On any failure it
+    /// cancels every spawned loop and waits for each to end before it returns
+    /// the error; a loop blocked in its cursor load or LIVE subscribe ends only
+    /// when that call returns.
     pub async fn new(names: Vec<String>) -> Result<Self> {
         Self::new_with_ready_timeout(names, READY_TIMEOUT).await
     }
 
-    /// Like [`Coalition::new`] but with a caller-chosen readiness-handshake
-    /// timeout instead of the default [`READY_TIMEOUT`]. Production callers
-    /// should prefer [`Coalition::new`]; the explicit timeout is mainly useful
-    /// for tuning startup against a slow DB.
-    ///
-    /// The per-agent handshake await is factored into [`await_ready`], which is
-    /// unit-tested deterministically (a never-sent receiver → [`Error::ReadyTimeout`],
-    /// a dropped sender → [`Error::ListenLoopDropped`]) without racing a real
-    /// LIVE-query registration.
+    /// Like [`Coalition::new`], with `ready_timeout` in place of
+    /// [`READY_TIMEOUT`] for each readiness wait.
     pub async fn new_with_ready_timeout(
         names: Vec<String>,
         ready_timeout: Duration,
@@ -740,7 +733,8 @@ async fn show_changes(
 enum Stop {
     /// `token` was cancelled.
     Cancelled,
-    /// Every bus receiver is dropped, so a delivery cannot reach the bus.
+    /// The bus is closed (every receiver dropped, or `close()` called on any
+    /// receiver), so a delivery cannot reach the bus.
     NoReceivers,
 }
 
@@ -842,7 +836,7 @@ struct LoopCtx<'a, T: SurrealValue> {
 
 /// Put `delivery` on the bus, reading `wakes` while the bus is full. Returns
 /// `Err` without putting it on the bus when `ctx.token` is cancelled first or
-/// every receiver is dropped.
+/// the bus is closed.
 async fn hand_off<T>(
     ctx: &LoopCtx<'_, T>,
     delivery: Delivery<T>,
@@ -887,7 +881,7 @@ async fn fetch_page<T: SurrealValue>(
 }
 
 /// Change-op keys that `SHOW CHANGES` emits for a change that is not a
-/// message record (`TableMutation::into_value` in surrealdb-datastore 3.3.4).
+/// message record.
 const NON_MESSAGE_OPS: [&str; 2] = ["delete", "define_table"];
 
 /// Deliver one catch-up page (`page`, fetched from `*cursor`) onto the bus,
@@ -912,9 +906,9 @@ const NON_MESSAGE_OPS: [&str; 2] = ["delete", "define_table"];
 /// malformed) and skipped.
 ///
 /// Each send is raced against `ctx.token`, and `wakes` is read while a send
-/// waits on a full bus. Cancellation, or a bus with no receivers, returns
+/// waits on a full bus. Cancellation, or a closed bus, returns
 /// `ControlFlow::Break` with the cursor saved at the change not put on the
-/// bus, so no message is put on the bus twice; if that save fails, the error
+/// bus, so the next pass starts at that change; if that save fails, the error
 /// is logged and `ControlFlow::Break` is still returned. `*cursor` changes
 /// only once a save succeeds; a save failure on a complete page returns that
 /// error.
@@ -1525,10 +1519,8 @@ mod tests {
     /// [`parse_cursor`] reads `versionstamp` and `change_index`, defaults a
     /// missing `change_index` to 0, and rejects a non-object row, a missing,
     /// non-integer or negative `versionstamp`, and a non-integer or negative
-    /// `change_index`. The `usize` bound on `change_index` is checked through
-    /// [`position_within`], which `parse_cursor` calls with `usize::MAX`: a
-    /// 64-bit `i64` cannot exceed that, so the bound is exercised with
-    /// `max = u32::MAX` (a 32-bit `usize::MAX`).
+    /// `change_index`; and [`position_within`] with `max = u32::MAX` accepts
+    /// 0 and `u32::MAX` and rejects `u32::MAX + 1` and -1.
     #[test]
     fn parse_cursor_accepts_valid_rows_and_rejects_malformed_ones() {
         let max = u64::from(u32::MAX);
