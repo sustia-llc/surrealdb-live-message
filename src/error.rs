@@ -111,8 +111,12 @@ pub enum Error {
     #[error("agent '{agent}' listen_loop ended before its ready signal without a cancel")]
     ListenLoopDropped { agent: String },
 
-    #[error("coalition token was cancelled before agent '{agent}' was ready")]
-    Cancelled { agent: String },
+    /// The coalition's token was cancelled before every listen loop was
+    /// ready. `agent` names the agent whose startup the cancel interrupted,
+    /// or is `None` for a cancel `Coalition::new` found outside any one
+    /// agent's startup.
+    #[error("coalition token was cancelled before {who} was ready", who = cancelled_who(.agent))]
+    Cancelled { agent: Option<String> },
 
     #[error("database ready channel closed")]
     ReadyChannelClosed,
@@ -132,6 +136,13 @@ pub enum Error {
 
 /// Crate-wide result alias over [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// `agent 'name'` for `Some(name)`, `every agent` for `None`.
+fn cancelled_who(agent: &Option<String>) -> String {
+    agent
+        .as_deref()
+        .map_or_else(|| "every agent".to_string(), |a| format!("agent '{a}'"))
+}
 
 /// Render `err` and every error in its [`source`](std::error::Error::source)
 /// chain, outermost first, joined with `": "`.

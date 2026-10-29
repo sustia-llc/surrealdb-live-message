@@ -1,6 +1,7 @@
 use std::{collections::HashMap, marker::PhantomData, ops::ControlFlow, sync::Arc};
 
 use async_channel::{Receiver, Sender};
+use futures::stream::{FuturesUnordered, Stream};
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use surrealdb::engine::any;
@@ -67,13 +68,15 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Create (or reuse) an agent record in the `agent` table.
+    /// Create (or reuse) the record `agent:<name>` and its durable-log cursor
+    /// `cursor:<name>`.
     ///
-    /// Validates `name` first: it becomes a SurrealDB record-id key *and* is
-    /// bound into LIVE queries, so it is restricted to a safe character set
-    /// (non-empty, ASCII alphanumeric or underscore). Rejecting at the boundary
-    /// keeps malformed names out of the system rather than relying on downstream
-    /// escaping.
+    /// Validates `name` first: non-empty, ASCII alphanumeric or underscore,
+    /// else [`Error::InvalidAgentName`]. An existing `agent` record and an
+    /// existing `cursor` row are kept unchanged. When `cursor:<name>` is
+    /// absent, it is created at the changeset after the latest one retained in
+    /// the `message` changefeed. Both records are written in one transaction,
+    /// so this never leaves `agent:<name>` without `cursor:<name>`.
     pub async fn new(name: &str) -> Result<Self> {
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(Error::InvalidAgentName {
@@ -82,44 +85,53 @@ impl Agent {
         }
 
         let db = sdb::SurrealDBWrapper::connection().await;
+        let create_err = |source| Error::AgentCreate {
+            agent: name.to_string(),
+            source: Box::new(source),
+        };
+        let agent_id = RecordId::new(AGENT_TABLE, name);
+        let cursor_id = RecordId::new(CURSOR_TABLE, name);
 
-        // Reuse an existing agent record if present. Agents are now durable —
-        // they are NOT deleted on shutdown (the message log persists, so the
-        // agent identity must too), and `create` errors on a duplicate id. A
-        // select-then-create makes coalition *restart* idempotent, which is what
-        // lets a restarted agent resume its durable-log cursor.
-        if let Some(existing) =
-            db.select((AGENT_TABLE, name))
-                .await
-                .map_err(|source| Error::AgentCreate {
-                    agent: name.to_string(),
-                    source: Box::new(source),
-                })?
-        {
-            return Ok(existing);
-        }
-
-        let agent: Agent = db
-            .create((AGENT_TABLE, name))
-            .content(Agent {
-                id: RecordId::new(AGENT_TABLE, name),
-                name: name.to_string(),
-                created: Datetime::default(),
-            })
+        let cursor_present: Option<RecordId> = db
+            .query("SELECT VALUE id FROM ONLY $cursor")
+            .bind(("cursor", cursor_id.clone()))
             .await
-            .map_err(|source| Error::AgentCreate {
-                agent: name.to_string(),
-                source: Box::new(source),
-            })?
-            // Defensive: on a healthy DB `create().content()` returns `Some` on
-            // success or `Err` on a duplicate id, never `Ok(None)`. This branch
-            // is therefore not reachable without a fault-injected connection,
-            // and is intentionally left without a dedicated trigger test.
-            .ok_or_else(|| Error::AgentCreateEmpty {
-                agent: name.to_string(),
-            })?;
+            .map_err(create_err)?
+            .take(0)
+            .map_err(create_err)?;
+        let start = match cursor_present {
+            Some(_) => None,
+            None => Some(Cursor::at(latest_versionstamp(db, name).await? + 1)),
+        };
 
-        Ok(agent)
+        let cursor_stmt = if start.is_some() {
+            "IF (SELECT VALUE id FROM ONLY $cursor) = NONE { CREATE $cursor CONTENT $start };"
+        } else {
+            ""
+        };
+        db.query(format!(
+            "BEGIN TRANSACTION; \
+             IF (SELECT VALUE id FROM ONLY $agent) = NONE {{ \
+                 CREATE $agent CONTENT {{ name: $name, created: time::now() }} \
+             }}; \
+             {cursor_stmt} \
+             COMMIT TRANSACTION;"
+        ))
+        .bind(("agent", agent_id.clone()))
+        .bind(("cursor", cursor_id))
+        .bind(("name", name.to_string()))
+        .bind(("start", start.unwrap_or(Cursor::at(0))))
+        .await
+        .map_err(create_err)?
+        .check()
+        .map_err(create_err)?;
+
+        let agent: Option<Agent> = db.select(agent_id).await.map_err(create_err)?;
+        // Defensive: the transaction above has committed `agent:<name>`, so
+        // `None` is not reachable without a concurrent delete.
+        agent.ok_or_else(|| Error::AgentCreateEmpty {
+            agent: name.to_string(),
+        })
     }
 
     /// Send a typed payload to another agent by creating a RELATE edge in the
@@ -191,15 +203,18 @@ impl Agent {
     /// `ready_tx` receives `Ok(())` once, after the first subscribe and the
     /// first catch-up page query succeed. The loop then waits for `start`
     /// before that pass puts anything on the bus. A failure before the ready
-    /// signal (cursor load, first-run snapshot, first cursor save, first
-    /// subscribe, first page query) is logged with its source chain and sent
-    /// as `Err` on `ready_tx`, and the loop ends. Each of those awaits is raced
-    /// against `token`; a cancel before the ready signal sends
-    /// [`Error::Cancelled`] on `ready_tx`, and the loop ends. A subscribe in
-    /// flight at a cancel is given up to [`LIVE_KILL_TIMEOUT`] to finish, and
-    /// its live query is then ended. The loop ends when its ready send fails,
-    /// or when `token` is cancelled while it waits for `start`. Later failures
-    /// reconnect with capped exponential backoff. While a delivery waits on a
+    /// signal (cursor load, which fails with [`Error::CursorLoad`] when
+    /// `cursor:<agent>` is missing; first subscribe; first page query) is
+    /// logged with its source chain and sent as `Err` on `ready_tx`, and the
+    /// loop ends. Each of those awaits is raced against `token`; a cancel
+    /// before the ready signal sends [`Error::Cancelled`] naming this agent on
+    /// `ready_tx`, before any cleanup await, and the loop ends. A subscribe in
+    /// flight at a cancel is then given up to [`LIVE_KILL_TIMEOUT`] to finish,
+    /// and its live query is ended; a subscribe still in flight after that
+    /// bound, or one that fails after the cancel, is logged at warn. The loop
+    /// ends when its ready send fails, or when `token` is cancelled while it
+    /// waits for `start`. Later failures reconnect with capped exponential
+    /// backoff. While a delivery waits on a
     /// full bus the wake stream is still read. The loop ends when `token` is
     /// cancelled (seen at the next bus send, page query, subscribe, or wait
     /// for a wake), including by `Coalition::shutdown` or the coalition's
@@ -231,9 +246,7 @@ impl Agent {
             token,
         };
 
-        // Cursor: resume from the persisted position, or on first run snapshot
-        // the current latest versionstamp so a brand-new agent starts "from
-        // now" instead of replaying pre-existing backlog.
+        // Cursor: resume from the position `Agent::new` guarantees exists.
         let mut cursor = match ctx
             .token
             .run_until_cancelled(initial_cursor(db, name))
@@ -249,11 +262,8 @@ impl Agent {
 
         loop {
             // (Re)subscribe the LIVE wake-up.
-            let Some(subscribed) = subscribe_unless_cancelled(&ctx).await else {
-                match ready_tx.take() {
-                    Some(tx) => cancel_startup(name, tx),
-                    None => Stop::Cancelled.log(name),
-                }
+            let Some(subscribed) = subscribe_unless_cancelled(&ctx, &mut ready_tx).await else {
+                Stop::Cancelled.log(name);
                 return;
             };
             let (stream, live_id) = match subscribed {
@@ -299,7 +309,7 @@ impl Agent {
                                 return Ok(ControlFlow::Continue(()));
                             }
                             let full = page.len() >= CATCHUP_BATCH;
-                            let start = cursor;
+                            let page_start = cursor;
                             if let ControlFlow::Break(stop) =
                                 deliver_page(&ctx, &mut cursor, &mut wakes, page).await?
                             {
@@ -308,7 +318,7 @@ impl Agent {
                             if !full {
                                 return Ok(ControlFlow::Continue(()));
                             }
-                            if cursor == start {
+                            if cursor == page_start {
                                 tracing::error!(
                                     "catch_up for {name}: a full page left the cursor at {cursor}; \
                                      ending the pass"
@@ -340,27 +350,42 @@ impl Agent {
                 }
             };
 
+            // Before the ready signal, the outcome is sent before any cleanup
+            // await.
+            let exit = match ready_tx.take() {
+                None => Some(exit),
+                Some(tx) => {
+                    match exit {
+                        Exit::Stop(Stop::Cancelled) => cancel_startup(name, tx),
+                        Exit::CatchUp(e) => fail_startup(name, tx, e),
+                        Exit::Stop(Stop::NoReceivers | Stop::NotStarted) | Exit::Wake => {
+                            fail_startup(
+                                name,
+                                tx,
+                                Error::ListenLoopDropped {
+                                    agent: name.to_string(),
+                                },
+                            );
+                        }
+                    }
+                    None
+                }
+            };
             let Wakes { stream, end, .. } = wakes;
             end_live(ctx.db, name, live_id, stream).await;
             if let Some(end) = end {
                 end.log(name);
             }
             match exit {
-                Exit::Stop(stop) => {
-                    // Before the ready signal, only a cancel stops a pass.
-                    match ready_tx.take() {
-                        Some(tx) => cancel_startup(name, tx),
-                        None => stop.log(name),
-                    }
+                None => return,
+                Some(Exit::Stop(stop)) => {
+                    stop.log(name);
                     return;
                 }
-                Exit::CatchUp(e) => {
-                    if let Some(tx) = ready_tx.take() {
-                        return fail_startup(name, tx, e);
-                    }
+                Some(Exit::CatchUp(e)) => {
                     tracing::error!("catch_up failed for {name}: {}", chain(&e));
                 }
-                Exit::Wake => {}
+                Some(Exit::Wake) => {}
             }
             if cancel_or_sleep(&ctx.token, backoff).await {
                 return;
@@ -395,28 +420,34 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// more than once returns [`Error::DuplicateAgentName`] before anything is
     /// created or spawned.
     ///
-    /// Waits for every `listen_loop` to signal that its LIVE query is
-    /// registered and its first catch-up page query succeeded. Each wait is
-    /// bounded by [`READY_TIMEOUT`]. Each loop holds at its ready point, and
-    /// puts nothing on the bus, until every loop has signalled ready; this
-    /// then sends the start signal and returns `Ok`. On any failure it cancels
-    /// every spawned loop and waits for each to end before it returns the
-    /// error. When loops fail, an error a loop sent (including
-    /// [`Error::Cancelled`]) is returned in preference to
-    /// [`Error::ReadyTimeout`] and [`Error::ListenLoopDropped`].
+    /// Each [`Agent::new`] call is bounded by [`READY_TIMEOUT`], which returns
+    /// [`Error::ReadyTimeout`] for that agent, and raced against the
+    /// coalition's token. Waits for every `listen_loop` to signal that its
+    /// LIVE query is registered and its first catch-up page query succeeded.
+    /// Each wait is bounded by [`READY_TIMEOUT`]. Each loop holds at its ready
+    /// point, and puts nothing on the bus, until every loop has signalled
+    /// ready; this then sends the start signal and returns `Ok`. On any
+    /// failure it cancels every spawned loop and waits for each to end before
+    /// it returns the error. The first error a loop sends (including
+    /// [`Error::Cancelled`]) is returned as soon as it arrives, in preference
+    /// to [`Error::ReadyTimeout`] and [`Error::ListenLoopDropped`]; among
+    /// those two, the one for the earliest name in `names` is returned.
     ///
     /// If the coalition's token is cancelled before every loop is ready, this
-    /// returns [`Error::Cancelled`]; the token is checked before any database
-    /// call, and each agent-record call is raced against it. Dropping the
-    /// returned future before it completes cancels the token, which ends
-    /// every spawned loop and the retention sweep; the drop does not wait for
-    /// them.
+    /// returns [`Error::Cancelled`]: with `agent: None` when the token is
+    /// cancelled before any database call (it is checked first) or when it is
+    /// found cancelled after the readiness waits end in `Ok`, `ReadyTimeout`
+    /// or `ListenLoopDropped`; with `agent: Some(name)` when the cancel
+    /// interrupts that agent's `Agent::new` call or its loop's startup.
+    /// Dropping the returned future before it completes cancels the token,
+    /// which ends every spawned loop and the retention sweep; the drop does
+    /// not wait for them.
     pub async fn new(names: Vec<String>) -> Result<Self> {
         Self::new_with_ready_timeout(names, READY_TIMEOUT).await
     }
 
     /// Like [`Coalition::new`], with `ready_timeout` in place of
-    /// [`READY_TIMEOUT`] for each readiness wait.
+    /// [`READY_TIMEOUT`] for each `Agent::new` call and each readiness wait.
     pub async fn new_with_ready_timeout(
         names: Vec<String>,
         ready_timeout: Duration,
@@ -426,8 +457,8 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
 
     /// Like [`Coalition::new`], with a root token that is a child of
     /// `parent`: cancelling `parent` cancels the coalition. A `parent` that is
-    /// already cancelled returns [`Error::Cancelled`] for the first name in
-    /// `names` (an empty name when `names` is empty) before any database call.
+    /// already cancelled returns [`Error::Cancelled`] with `agent: None`
+    /// before any database call.
     pub async fn new_with_parent(names: Vec<String>, parent: &CancellationToken) -> Result<Self> {
         Self::build(names, READY_TIMEOUT, parent.child_token()).await
     }
@@ -439,9 +470,7 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     ) -> Result<Self> {
         reject_duplicate_names(&names)?;
         if cancellation_token.is_cancelled() {
-            return Err(Error::Cancelled {
-                agent: names.first().cloned().unwrap_or_default(),
-            });
+            return Err(Error::Cancelled { agent: None });
         }
         // A dropped `build` future cancels every task it spawned.
         let guard = cancellation_token.clone().drop_guard();
@@ -457,18 +486,27 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
 
         let mut ready_rxs = Vec::with_capacity(names.len());
         for name in names {
-            let agent = match cancellation_token
-                .run_until_cancelled(Agent::new(&name))
-                .await
-            {
-                Some(Ok(agent)) => agent,
-                Some(Err(err)) => {
+            let created = timeout(
+                ready_timeout,
+                cancellation_token.run_until_cancelled(Agent::new(&name)),
+            )
+            .await;
+            let agent = match created {
+                Ok(Some(Ok(agent))) => agent,
+                Ok(Some(Err(err))) => {
                     abort_build(&cancellation_token, &task_tracker).await;
                     return Err(err);
                 }
-                None => {
+                Ok(None) => {
                     abort_build(&cancellation_token, &task_tracker).await;
-                    return Err(Error::Cancelled { agent: name });
+                    return Err(Error::Cancelled { agent: Some(name) });
+                }
+                Err(_elapsed) => {
+                    abort_build(&cancellation_token, &task_tracker).await;
+                    return Err(Error::ReadyTimeout {
+                        agent: name,
+                        timeout: ready_timeout,
+                    });
                 }
             };
             agents.write().await.insert(name.clone(), agent.clone());
@@ -500,15 +538,25 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         );
 
         // Wait, concurrently, until every listen_loop has signalled ready
-        // (LIVE query registered, first catch-up page query succeeded). Each
-        // wait is bounded by ready_timeout.
-        let outcomes = futures::future::join_all(
-            ready_rxs
-                .into_iter()
-                .map(|(name, rx)| await_ready(name, rx, ready_timeout)),
-        )
-        .await;
-        if let Err(err) = first_ready_error(outcomes) {
+        // (LIVE query registered, first catch-up page query succeeded), or
+        // until the first error a loop sent. Each wait is bounded by
+        // ready_timeout.
+        let outcomes: FuturesUnordered<_> = ready_rxs
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, rx))| async move {
+                (index, await_ready(name, rx, ready_timeout).await)
+            })
+            .collect();
+        let outcome = match first_ready_error(outcomes).await {
+            Ok(()) | Err(Error::ReadyTimeout { .. } | Error::ListenLoopDropped { .. })
+                if cancellation_token.is_cancelled() =>
+            {
+                Err(Error::Cancelled { agent: None })
+            }
+            other => other,
+        };
+        if let Err(err) = outcome {
             abort_build(&cancellation_token, &task_tracker).await;
             return Err(err);
         }
@@ -569,23 +617,28 @@ fn reject_duplicate_names(names: &[String]) -> Result<()> {
     }
 }
 
-/// Pick the error to return from the readiness outcomes of every listen loop:
-/// the first error a listen loop sent (any variant other than
-/// [`Error::ReadyTimeout`] or [`Error::ListenLoopDropped`], so including
-/// [`Error::Cancelled`]); else the first `ReadyTimeout` or
-/// `ListenLoopDropped`; else `Ok(())`.
-fn first_ready_error(outcomes: Vec<Result<()>>) -> Result<()> {
-    let mut fallback = None;
-    for outcome in outcomes {
+/// Pick the error to return from `outcomes`, a stream of `(loop index,
+/// readiness outcome)` pairs: the first error a listen loop sent that the
+/// stream yields (any variant other than [`Error::ReadyTimeout`] or
+/// [`Error::ListenLoopDropped`], so including [`Error::Cancelled`]), returned
+/// as soon as it is yielded without reading further outcomes; else the
+/// `ReadyTimeout` or `ListenLoopDropped` with the lowest loop index; else
+/// `Ok(())`.
+async fn first_ready_error(outcomes: impl Stream<Item = (usize, Result<()>)>) -> Result<()> {
+    let mut outcomes = std::pin::pin!(outcomes);
+    let mut fallback: Option<(usize, Error)> = None;
+    while let Some((index, outcome)) = outcomes.next().await {
         match outcome {
             Ok(()) => {}
             Err(e @ (Error::ReadyTimeout { .. } | Error::ListenLoopDropped { .. })) => {
-                fallback.get_or_insert(e);
+                if fallback.as_ref().is_none_or(|(first, _)| index < *first) {
+                    fallback = Some((index, e));
+                }
             }
             Err(e) => return Err(e),
         }
     }
-    fallback.map_or(Ok(()), Err)
+    fallback.map_or(Ok(()), |(_, e)| Err(e))
 }
 
 /// Tear down a coalition whose construction failed: cancel `token`, close
@@ -665,7 +718,7 @@ fn fail_startup(agent: &str, ready_tx: oneshot::Sender<Result<()>>, e: Error) {
 fn cancel_startup(agent: &str, ready_tx: oneshot::Sender<Result<()>>) {
     tracing::info!("listen_loop for {agent} cancelled before ready");
     let _ = ready_tx.send(Err(Error::Cancelled {
-        agent: agent.to_string(),
+        agent: Some(agent.to_string()),
     }));
 }
 
@@ -686,15 +739,15 @@ impl StartGate {
     }
 }
 
-/// The persisted cursor for `agent`, or on first run one at the changeset
-/// after the latest one retained in the feed, persisted.
+/// The persisted cursor for `agent`. A missing row returns
+/// [`Error::CursorLoad`].
 async fn initial_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Cursor> {
-    if let Some(c) = load_cursor(db, agent).await? {
-        return Ok(c);
-    }
-    let start = Cursor::at(latest_versionstamp(db, agent).await? + 1);
-    save_cursor(db, agent, start).await?;
-    Ok(start)
+    load_cursor(db, agent)
+        .await?
+        .ok_or_else(|| Error::CursorLoad {
+            agent: agent.to_string(),
+            source: reply_error(format!("no {CURSOR_TABLE}:{agent} row")),
+        })
 }
 
 /// A `surrealdb::Error` carrying `message`, for errors this crate detects in
@@ -793,8 +846,8 @@ fn max_versionstamp(v: &Value) -> i64 {
 
 /// Latest versionstamp currently retained in the message changefeed, for the
 /// first-run "start from now" snapshot. Reads (and discards) the retained window
-/// once; returns 0 when the feed is empty. Only runs when an agent has no
-/// persisted cursor yet.
+/// once; returns 0 when the feed is empty. [`Agent::new`] runs it only when
+/// `cursor:<agent>` is absent.
 async fn latest_versionstamp(db: &Surreal<any::Any>, agent: &str) -> Result<i64> {
     let v = show_changes(db, agent, 0, 1_000_000).await?;
     Ok(max_versionstamp(&v))
@@ -828,7 +881,7 @@ enum Stop {
     /// The bus is closed (every receiver dropped, or `close()` called on any
     /// receiver), so a delivery cannot reach the bus.
     NoReceivers,
-    /// The ready signal found no receiver: `Coalition::new` has ended.
+    /// The ready send failed: the ready receiver is gone.
     NotStarted,
 }
 
@@ -839,7 +892,7 @@ impl Stop {
             Stop::Cancelled => tracing::info!("listen_loop for {agent} received shutdown"),
             Stop::NoReceivers => tracing::info!("delivery bus has no receivers; {agent} stops"),
             Stop::NotStarted => {
-                tracing::info!("Coalition::new ended before {agent}'s ready signal; {agent} stops");
+                tracing::info!("the ready receiver for {agent} is gone; {agent} stops");
             }
         }
     }
@@ -1221,13 +1274,24 @@ async fn subscribe_wake(
 }
 
 /// [`subscribe_wake`] for `ctx.owner`, raced against `ctx.token`. Returns
-/// `None` when the token is cancelled first. A subscribe in flight at the
-/// cancel is given up to [`LIVE_KILL_TIMEOUT`] to finish, and its live query
-/// is then ended with [`end_live`].
+/// `None` when the token is cancelled first; if `ready_tx` still holds the
+/// ready sender, [`Error::Cancelled`] is sent on it before any further await.
+/// A subscribe in flight at the cancel is then given up to
+/// [`LIVE_KILL_TIMEOUT`] to finish, and its live query is ended with
+/// [`end_live`]. A subscribe still in flight after that bound, and a
+/// subscribe that fails after the cancel, are logged at warn with the agent
+/// and the error chain.
 async fn subscribe_unless_cancelled<T: SurrealValue>(
     ctx: &LoopCtx<'_, T>,
+    ready_tx: &mut Option<oneshot::Sender<Result<()>>>,
 ) -> Option<Result<(QueryStream<Notification<Value>>, Uuid)>> {
+    let cancelled = |ready_tx: &mut Option<oneshot::Sender<Result<()>>>| {
+        if let Some(tx) = ready_tx.take() {
+            cancel_startup(ctx.agent, tx);
+        }
+    };
     if ctx.token.is_cancelled() {
+        cancelled(ready_tx);
         return None;
     }
     let mut subscribe = std::pin::pin!(subscribe_wake(ctx.db, &ctx.owner, ctx.agent));
@@ -1236,8 +1300,19 @@ async fn subscribe_unless_cancelled<T: SurrealValue>(
         subscribed = &mut subscribe => return Some(subscribed),
         () = ctx.token.cancelled() => {}
     }
-    if let Ok(Ok((stream, live_id))) = timeout(LIVE_KILL_TIMEOUT, subscribe).await {
-        end_live(ctx.db, ctx.agent, live_id, stream).await;
+    cancelled(ready_tx);
+    match timeout(LIVE_KILL_TIMEOUT, subscribe).await {
+        Ok(Ok((stream, live_id))) => end_live(ctx.db, ctx.agent, live_id, stream).await,
+        Ok(Err(e)) => tracing::warn!(
+            "subscribe for {} failed after a cancel: {}",
+            ctx.agent,
+            chain(&e)
+        ),
+        Err(_elapsed) => tracing::warn!(
+            "subscribe for {} still in flight {LIVE_KILL_TIMEOUT:?} after a cancel; \
+             its live query, if registered, is not ended",
+            ctx.agent
+        ),
     }
     None
 }
@@ -1428,12 +1503,17 @@ mod tests {
         }
     }
 
+    /// `outcomes` as a stream of `(index, outcome)` pairs in vector order.
+    async fn first_ready_error_of(outcomes: Vec<Result<()>>) -> Result<()> {
+        first_ready_error(futures::stream::iter(outcomes.into_iter().enumerate())).await
+    }
+
     /// [`first_ready_error`] returns a listen loop's sent error over an
-    /// earlier `ReadyTimeout` or `ListenLoopDropped`, falls back to the first
-    /// of those when no loop sent one, and returns `Ok(())` when every loop
-    /// signalled ready.
-    #[test]
-    fn first_ready_error_prefers_a_sent_error() {
+    /// earlier `ReadyTimeout` or `ListenLoopDropped`, falls back to the one
+    /// with the lowest index when no loop sent one, and returns `Ok(())` when
+    /// every loop signalled ready.
+    #[tokio::test]
+    async fn first_ready_error_prefers_a_sent_error() {
         let timeout_err = || Error::ReadyTimeout {
             agent: "ann".to_string(),
             timeout: Duration::from_secs(10),
@@ -1445,34 +1525,73 @@ mod tests {
             agent: "bo".to_string(),
         };
 
-        let picked = first_ready_error(vec![
+        let picked = first_ready_error_of(vec![
             Err(timeout_err()),
             Ok(()),
             Err(sent()),
             Err(dropped()),
-        ]);
+        ])
+        .await;
         assert!(
             matches!(&picked, Err(Error::LiveQueryIdMissing { agent }) if agent == "bo"),
             "a sent error must win over an earlier timeout, got {picked:?}"
         );
-        let picked = first_ready_error(vec![Ok(()), Err(dropped()), Err(timeout_err())]);
+        let picked = first_ready_error_of(vec![Ok(()), Err(dropped()), Err(timeout_err())]).await;
         assert!(
             matches!(&picked, Err(Error::ListenLoopDropped { agent }) if agent == "cy"),
             "with no sent error the first fallback must be returned, got {picked:?}"
         );
-        let picked = first_ready_error(vec![Ok(()), Ok(())]);
+        let picked = first_ready_error(futures::stream::iter(vec![
+            (1, Err(dropped())),
+            (0, Err(timeout_err())),
+        ]))
+        .await;
+        assert!(
+            matches!(&picked, Err(Error::ReadyTimeout { agent, .. }) if agent == "ann"),
+            "the fallback with the lowest index must be returned, got {picked:?}"
+        );
+        let picked = first_ready_error_of(vec![Ok(()), Ok(())]).await;
         assert!(picked.is_ok(), "all ready must be Ok, got {picked:?}");
+    }
+
+    /// [`first_ready_error`] over [`await_ready`] outcomes returns a sent
+    /// error while another loop has not signalled and its 30 s ready timeout
+    /// has not elapsed.
+    #[tokio::test]
+    async fn first_ready_error_returns_a_sent_error_without_waiting() {
+        let (_silent_tx, silent_rx) = oneshot::channel();
+        let (sent_tx, sent_rx) = oneshot::channel();
+        sent_tx
+            .send(Err(Error::LiveQueryIdMissing {
+                agent: "bo".to_string(),
+            }))
+            .expect("send startup error");
+        let outcomes: FuturesUnordered<_> = [("ann", silent_rx), ("bo", sent_rx)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, rx))| async move {
+                (
+                    index,
+                    await_ready(name.to_string(), rx, Duration::from_secs(30)).await,
+                )
+            })
+            .collect();
+        let picked = timeout(Duration::from_secs(1), first_ready_error(outcomes)).await;
+        assert!(
+            matches!(&picked, Ok(Err(Error::LiveQueryIdMissing { agent })) if agent == "bo"),
+            "a sent error must be returned within 1 s while 'ann' is silent, got {picked:?}"
+        );
     }
 
     /// [`first_ready_error`] returns [`Error::Cancelled`] over an earlier
     /// `ReadyTimeout` and an earlier `ListenLoopDropped`, and the first sent
     /// error when a `Cancelled` and another sent error are both present.
-    #[test]
-    fn first_ready_error_prefers_cancelled_over_timeout_and_dropped() {
+    #[tokio::test]
+    async fn first_ready_error_prefers_cancelled_over_timeout_and_dropped() {
         let cancelled = || Error::Cancelled {
-            agent: "di".to_string(),
+            agent: Some("di".to_string()),
         };
-        let picked = first_ready_error(vec![
+        let picked = first_ready_error_of(vec![
             Err(Error::ReadyTimeout {
                 agent: "ann".to_string(),
                 timeout: Duration::from_secs(10),
@@ -1481,17 +1600,19 @@ mod tests {
                 agent: "cy".to_string(),
             }),
             Err(cancelled()),
-        ]);
+        ])
+        .await;
         assert!(
-            matches!(&picked, Err(Error::Cancelled { agent }) if agent == "di"),
+            matches!(&picked, Err(Error::Cancelled { agent: Some(agent) }) if agent == "di"),
             "Cancelled must win over an earlier ReadyTimeout and ListenLoopDropped, got {picked:?}"
         );
-        let picked = first_ready_error(vec![
+        let picked = first_ready_error_of(vec![
             Err(Error::LiveQueryIdMissing {
                 agent: "bo".to_string(),
             }),
             Err(cancelled()),
-        ]);
+        ])
+        .await;
         assert!(
             matches!(&picked, Err(Error::LiveQueryIdMissing { agent }) if agent == "bo"),
             "the first sent error must win over a later Cancelled, got {picked:?}"

@@ -211,18 +211,22 @@ async fn test_agent_messaging() {
     scenario_startup_backlog().await;
     scenario_full_bus_shutdown_and_replay().await;
     scenario_stop_mid_changeset(db).await;
-    scenario_cancel_before_first_page(db).await;
+    scenario_cancelled_parent_leaves_cursor_behind(db).await;
     scenario_drop_cancels(db).await;
     scenario_malformed_cursor(db).await;
     scenario_wake_during_pass().await;
     scenario_build_failure_teardown(db).await;
     scenario_cancelled_parent_makes_no_db_call(db).await;
     scenario_stalled_startup_returns_ready_timeout(db).await;
+    scenario_stalled_agent_record_returns_ready_timeout(db).await;
     scenario_dropped_new_cancels_loops(db).await;
+    scenario_cancel_after_ready_before_start(db).await;
     scenario_failed_new_keeps_backlog(db).await;
+    scenario_failed_new_keeps_fresh_cursor(db).await;
     scenario_invalid_agent_name().await;
     scenario_bus_close().await;
     scenario_durable_restart().await;
+    scenario_cancel_during_first_page(db).await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
     let lives_before = message_lives(db).await;
@@ -695,13 +699,13 @@ async fn scenario_stop_mid_changeset(db: &Surreal<any::Any>) {
     c2.shutdown().await;
 }
 
-/// **Cancellation before the first page query.** A sink whose cursor predates
-/// 2 500 changesets of traffic between two other agents is started with
-/// `Coalition::new_with_parent` under an already-cancelled parent token. The
-/// scenario asserts that `Coalition::new_with_parent` returns within 15 s with
-/// `Cancelled` for the sink, and that `SHOW CHANGES` from the sink's
-/// persisted cursor still returns changesets.
-async fn scenario_cancel_before_first_page(db: &Surreal<any::Any>) {
+/// **An already-cancelled parent returns before any loop runs.** A sink whose
+/// cursor predates 2 500 changesets of traffic between two other agents is
+/// started with `Coalition::new_with_parent` under an already-cancelled parent
+/// token. The scenario asserts that `Coalition::new_with_parent` returns
+/// `Cancelled` with no agent within 15 s, and that `SHOW CHANGES` from the
+/// sink's persisted cursor still returns changesets.
+async fn scenario_cancelled_parent_leaves_cursor_behind(db: &Surreal<any::Any>) {
     const TRAFFIC: usize = 2_500;
     let c0 = Coalition::<ChatMessage>::new(vec![
         "qc_sink".to_string(),
@@ -769,8 +773,8 @@ async fn scenario_cancel_before_first_page(db: &Surreal<any::Any>) {
         "Coalition::new_with_parent must not start under a cancelled parent"
     );
     match started {
-        Err(Error::Cancelled { agent }) => assert_eq!(agent, "qc_sink"),
-        Err(e) => panic!("expected Cancelled for qc_sink, got {e:?}"),
+        Err(Error::Cancelled { agent }) => assert_eq!(agent, None),
+        Err(e) => panic!("expected Cancelled with no agent, got {e:?}"),
         Ok(_) => unreachable!("checked by the `started_ok` assertion"),
     }
 }
@@ -792,24 +796,40 @@ async fn cursor_position(db: &Surreal<any::Any>, agent: &str) -> Option<(i64, i6
     Some((int("versionstamp")?, int("change_index").unwrap_or(0)))
 }
 
-/// Make every server-side read of `cursor:<agent>` wait `secs` seconds,
-/// through a computed field `stall` on the `cursor` table.
-async fn stall_cursor_reads(db: &Surreal<any::Any>, agent: &str, secs: u64) {
+/// Make every server-side read of `<table>:<agent>` wait `secs` seconds,
+/// through a computed field `stall` on `table`.
+async fn stall_reads(db: &Surreal<any::Any>, table: &str, agent: &str, secs: u64) {
     db.query(format!(
-        "DEFINE FIELD OVERWRITE stall ON cursor COMPUTED \
-         IF id = cursor:{agent} {{ sleep({secs}s) }}"
+        "DEFINE FIELD OVERWRITE stall ON {table} COMPUTED \
+         IF id = {table}:{agent} {{ sleep({secs}s) }}"
     ))
     .await
     .and_then(|r| r.check())
-    .expect("define the cursor stall field");
+    .unwrap_or_else(|e| panic!("define the {table} stall field: {e}"));
+}
+
+/// [`stall_reads`] on the `cursor` table.
+async fn stall_cursor_reads(db: &Surreal<any::Any>, agent: &str, secs: u64) {
+    stall_reads(db, "cursor", agent, secs).await;
+}
+
+/// Remove the field [`stall_reads`] defines on `table`.
+async fn remove_stall(db: &Surreal<any::Any>, table: &str) {
+    db.query(format!("REMOVE FIELD IF EXISTS stall ON {table}"))
+        .await
+        .and_then(|r| r.check())
+        .unwrap_or_else(|e| panic!("remove the {table} stall field: {e}"));
 }
 
 /// Remove the field [`stall_cursor_reads`] defines.
 async fn remove_cursor_stall(db: &Surreal<any::Any>) {
-    db.query("REMOVE FIELD IF EXISTS stall ON cursor")
-        .await
-        .and_then(|r| r.check())
-        .expect("remove the cursor stall field");
+    remove_stall(db, "cursor").await;
+}
+
+/// Sleep until `secs` seconds plus 500 ms have passed since `since`, so that a
+/// stalled read started at `since` has ended on the server.
+async fn wait_out_stall(since: tokio::time::Instant, secs: u64) {
+    tokio::time::sleep_until(since + Duration::from_secs(secs) + Duration::from_millis(500)).await;
 }
 
 /// Poll the server's live-query count on `message` every 20 ms until it
@@ -824,12 +844,13 @@ async fn wait_for_lives(db: &Surreal<any::Any>, want: usize, within: Duration) -
     now
 }
 
-/// Seconds a stalled cursor read waits on the server.
-const STALL_SECS: u64 = 60;
+/// Seconds a stalled read waits on the server in the scenarios bounded by a
+/// 1 s ready timeout and a 3 s outer timeout.
+const STALL_SECS: u64 = 4;
 
 /// **An already-cancelled parent makes no database call.** With no `agent`
 /// row for `cp_fresh`, `Coalition::new_with_parent` under a cancelled parent
-/// returns `Cancelled` for `cp_fresh` within 5 s, and `agent:cp_fresh` still
+/// returns `Cancelled` with no agent within 5 s, and `agent:cp_fresh` still
 /// does not exist.
 async fn scenario_cancelled_parent_makes_no_db_call(db: &Surreal<any::Any>) {
     const NAME: &str = "cp_fresh";
@@ -858,8 +879,8 @@ async fn scenario_cancelled_parent_makes_no_db_call(db: &Surreal<any::Any>) {
          agent:{NAME} was created: {row:?}"
     );
     match result {
-        Err(Error::Cancelled { agent }) => assert_eq!(agent, NAME),
-        Err(e) => panic!("expected Cancelled for {NAME}, got {e:?}"),
+        Err(Error::Cancelled { agent }) => assert_eq!(agent, None),
+        Err(e) => panic!("expected Cancelled with no agent, got {e:?}"),
         Ok(_) => panic!("Coalition::new_with_parent must not start under a cancelled parent"),
     }
 }
@@ -867,7 +888,7 @@ async fn scenario_cancelled_parent_makes_no_db_call(db: &Surreal<any::Any>) {
 /// **A stalled startup call does not stop the return.** `st_stall`'s cursor
 /// read waits [`STALL_SECS`] on the server. `Coalition::new_with_ready_timeout`
 /// for `st_ok` and `st_stall` with a 1 s ready timeout returns
-/// `ReadyTimeout` for `st_stall` within 10 s.
+/// `ReadyTimeout` for `st_stall` within 3 s.
 async fn scenario_stalled_startup_returns_ready_timeout(db: &Surreal<any::Any>) {
     let names = || vec!["st_ok".to_string(), "st_stall".to_string()];
     Coalition::<ChatMessage>::new(names())
@@ -888,14 +909,15 @@ async fn scenario_stalled_startup_returns_ready_timeout(db: &Surreal<any::Any>) 
 
     let began = tokio::time::Instant::now();
     let result = timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(3),
         Coalition::<ChatMessage>::new_with_ready_timeout(names(), Duration::from_secs(1)),
     )
     .await;
     let elapsed = began.elapsed();
     remove_cursor_stall(db).await;
+    wait_out_stall(began, STALL_SECS).await;
     let result = result.unwrap_or_else(|_| {
-        panic!("Coalition::new did not return within 10 s with a stalled cursor read ({elapsed:?})")
+        panic!("Coalition::new did not return within 3 s with a stalled cursor read ({elapsed:?})")
     });
     match result {
         Err(Error::ReadyTimeout { agent, .. }) => assert_eq!(agent, "st_stall"),
@@ -922,6 +944,7 @@ async fn scenario_dropped_new_cancels_loops(db: &Surreal<any::Any>) {
     stall_cursor_reads(db, "dn_stall", STALL_SECS).await;
     let before = message_lives(db).await.len();
 
+    let began = tokio::time::Instant::now();
     let mut building = Box::pin(Coalition::<ChatMessage>::new_with_ready_timeout(
         names(),
         Duration::from_secs(30),
@@ -943,6 +966,7 @@ async fn scenario_dropped_new_cancels_loops(db: &Surreal<any::Any>) {
 
     let after = wait_for_lives(db, before, Duration::from_secs(10)).await;
     remove_cursor_stall(db).await;
+    wait_out_stall(began, STALL_SECS).await;
     assert_eq!(
         after, before,
         "dropping the Coalition::new future must end its listen loops: {after} live queries \
@@ -950,12 +974,257 @@ async fn scenario_dropped_new_cancels_loops(db: &Surreal<any::Any>) {
     );
 }
 
+/// **A stalled `Agent::new` is bounded by the ready timeout.** Reads of
+/// `agent:as_stall` wait [`STALL_SECS`] on the server.
+/// `Coalition::new_with_ready_timeout` for `as_ok` and `as_stall` with a 1 s
+/// ready timeout returns `ReadyTimeout` for `as_stall` within 3 s.
+async fn scenario_stalled_agent_record_returns_ready_timeout(db: &Surreal<any::Any>) {
+    let names = || vec!["as_ok".to_string(), "as_stall".to_string()];
+    Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-0 coalition")
+        .shutdown()
+        .await;
+    stall_reads(db, AGENT_TABLE, "as_stall", STALL_SECS).await;
+
+    let began = tokio::time::Instant::now();
+    let result = timeout(
+        Duration::from_secs(3),
+        Coalition::<ChatMessage>::new_with_ready_timeout(names(), Duration::from_secs(1)),
+    )
+    .await;
+    let elapsed = began.elapsed();
+    remove_stall(db, AGENT_TABLE).await;
+    wait_out_stall(began, STALL_SECS).await;
+    let result = result.unwrap_or_else(|_| {
+        panic!("Coalition::new did not return within 3 s with a stalled agent read ({elapsed:?})")
+    });
+    match result {
+        Err(Error::ReadyTimeout { agent, timeout }) => {
+            assert_eq!(
+                (agent.as_str(), timeout),
+                ("as_stall", Duration::from_secs(1))
+            );
+        }
+        Err(e) => panic!("expected ReadyTimeout for as_stall, got {e:?}"),
+        Ok(c) => {
+            c.shutdown().await;
+            panic!("Coalition::new must not start with a stalled agent read");
+        }
+    }
+}
+
+/// **A cancel after every ready signal and before the start signal returns
+/// `Cancelled`.** `ca_b`'s cursor read waits 3 s on the server. The
+/// `Coalition::new_with_parent` future for `ca_b` then `ca_a` is polled until
+/// `ca_a`'s live query is registered (so both loops are spawned), then left
+/// unpolled until `ca_b`'s live query is registered and 500 ms more have
+/// passed, so both loops have sent their ready signal. The parent is then
+/// cancelled, and the future returns `Cancelled` with no agent within 10 s.
+async fn scenario_cancel_after_ready_before_start(db: &Surreal<any::Any>) {
+    const STALL: u64 = 3;
+    let names = || vec!["ca_b".to_string(), "ca_a".to_string()];
+    Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-0 coalition")
+        .shutdown()
+        .await;
+    stall_cursor_reads(db, "ca_b", STALL).await;
+    let before = message_lives(db).await.len();
+    let parent = CancellationToken::new();
+
+    let mut building = Box::pin(Coalition::<ChatMessage>::new_with_parent(names(), &parent));
+    let first = tokio::select! {
+        result = &mut building => {
+            remove_cursor_stall(db).await;
+            panic!("Coalition::new returned while ca_b stalled: {:?}", result.err());
+        }
+        first = wait_for_lives(db, before + 1, Duration::from_secs(10)) => first,
+    };
+    let both = wait_for_lives(db, before + 2, Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    remove_cursor_stall(db).await;
+    assert_eq!(
+        (first, both),
+        (before + 1, before + 2),
+        "precondition: ca_a then ca_b must register a live query ({before} before)"
+    );
+
+    parent.cancel();
+    let result = timeout(Duration::from_secs(10), building)
+        .await
+        .expect("Coalition::new hung after its parent was cancelled");
+    match result {
+        Err(Error::Cancelled { agent }) => assert_eq!(agent, None),
+        Err(e) => panic!("expected Cancelled with no agent, got {e:?}"),
+        Ok(c) => {
+            c.shutdown().await;
+            panic!("Coalition::new returned Ok after its parent was cancelled before start");
+        }
+    }
+}
+
+/// **A failed `Coalition::new` keeps a fresh agent's cursor.** With no
+/// `agent` or `cursor` row for `fk_src` and `fk_x`, `Coalition::new` for
+/// `fk_src`, `fk_x` and the invalid name `bad name` fails with
+/// `InvalidAgentName`. Afterwards `cursor:fk_x` exists; `Agent::new("fk_x")`
+/// leaves it unchanged; a message `fk_src` sends to `fk_x` is then delivered
+/// by a new coalition for `fk_src` and `fk_x` within 5 s.
+async fn scenario_failed_new_keeps_fresh_cursor(db: &Surreal<any::Any>) {
+    db.query("DELETE agent:fk_src; DELETE cursor:fk_src; DELETE agent:fk_x; DELETE cursor:fk_x;")
+        .await
+        .and_then(|r| r.check())
+        .expect("reset fk_src and fk_x");
+    let result = Coalition::<ChatMessage>::new(vec![
+        "fk_src".to_string(),
+        "fk_x".to_string(),
+        "bad name".to_string(),
+    ])
+    .await;
+    match &result {
+        Err(Error::InvalidAgentName { name }) => assert_eq!(name, "bad name"),
+        Err(e) => panic!("expected InvalidAgentName, got {e:?}"),
+        Ok(_) => panic!("a malformed agent name should be rejected"),
+    }
+    let created = cursor_position(db, "fk_x").await;
+    assert!(
+        created.is_some(),
+        "cursor:fk_x must exist after Coalition::new created agent:fk_x and failed; \
+         agent row {:?}, cursor {created:?}",
+        db.select::<Option<surrealdb_types::Value>>((AGENT_TABLE, "fk_x"))
+            .await
+            .ok()
+            .flatten()
+    );
+
+    let src = Agent::new("fk_src").await.expect("fk_src agent");
+    src.send(
+        "fk_x",
+        ChatMessage {
+            content: "fk_m".to_string(),
+        },
+    )
+    .await
+    .expect("fk_src → fk_x send");
+    Agent::new("fk_x").await.expect("reuse fk_x");
+    let reused = cursor_position(db, "fk_x").await;
+    assert_eq!(
+        reused, created,
+        "Agent::new on an existing agent moved cursor:fk_x from {created:?} to {reused:?}"
+    );
+
+    let c = Coalition::<ChatMessage>::new(vec!["fk_src".to_string(), "fk_x".to_string()])
+        .await
+        .expect("restart coalition");
+    let inbox = c.inbox();
+    let mut seen = HashMap::new();
+    recv_distinct(&inbox, 1, Duration::from_secs(5), &mut seen).await;
+    c.shutdown().await;
+    assert!(
+        seen.contains_key("fk_m"),
+        "the message sent to fk_x before its next start was not delivered; got {seen:?}"
+    );
+}
+
+/// **A cancel during the first page query returns `Cancelled` for that
+/// agent.** `pq_sink`'s cursor predates 1 000 changesets of traffic between
+/// two other agents, so its first page query returns 1 000 changesets; a
+/// probe of that page must take at least 25 ms.
+/// `Coalition::new_with_parent` for `pq_sink` is polled while the server's
+/// live-query count is read back to back; once `pq_sink`'s live query is
+/// registered, the parent is cancelled, and the future returns `Cancelled`
+/// for `pq_sink` within 10 s.
+async fn scenario_cancel_during_first_page(db: &Surreal<any::Any>) {
+    const TRAFFIC: usize = 1_000;
+    Coalition::<ChatMessage>::new(vec![
+        "pq_sink".to_string(),
+        "pq_a".to_string(),
+        "pq_b".to_string(),
+    ])
+    .await
+    .expect("round-0 coalition")
+    .shutdown()
+    .await;
+    let relate = "RELATE agent:pq_a->message->agent:pq_b \
+                  CONTENT { created: time::now(), payload: { content: 'pq' } };";
+    db.query(relate.repeat(TRAFFIC))
+        .await
+        .and_then(|r| r.check())
+        .expect("other agents' traffic");
+    let (since, _) = cursor_position(db, "pq_sink")
+        .await
+        .expect("pq_sink cursor");
+    let began = tokio::time::Instant::now();
+    let page: surrealdb_types::Value = db
+        .query(format!(
+            "SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {since} LIMIT 1000"
+        ))
+        .await
+        .expect("probe page")
+        .take(0)
+        .expect("probe page result");
+    let page_time = began.elapsed();
+    let page_len = match &page {
+        surrealdb_types::Value::Array(a) => a.len(),
+        _ => 0,
+    };
+    drop(page);
+    assert!(
+        page_len == TRAFFIC && page_time >= Duration::from_millis(25),
+        "precondition: pq_sink's first page must hold {TRAFFIC} changesets and take at least \
+         25 ms; it held {page_len} and took {page_time:?}"
+    );
+    let before = message_lives(db).await.len();
+    let parent = CancellationToken::new();
+
+    let mut building = Box::pin(Coalition::<ChatMessage>::new_with_parent(
+        vec!["pq_sink".to_string()],
+        &parent,
+    ));
+    let during = tokio::select! {
+        result = &mut building => {
+            let err = result.err();
+            panic!("Coalition::new returned before pq_sink's live query was seen: {err:?}");
+        }
+        during = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut now = message_lives(db).await.len();
+            while now != before + 1 && tokio::time::Instant::now() < deadline {
+                now = message_lives(db).await.len();
+            }
+            now
+        } => during,
+    };
+    parent.cancel();
+    assert_eq!(
+        during,
+        before + 1,
+        "precondition: pq_sink must register one live query ({before} before, {during} during)"
+    );
+    let result = timeout(Duration::from_secs(10), building)
+        .await
+        .expect("Coalition::new hung after its parent was cancelled");
+    match result {
+        Err(Error::Cancelled { agent }) => assert_eq!(
+            agent.as_deref(),
+            Some("pq_sink"),
+            "Cancelled must name pq_sink, cancelled during its first page; got agent {agent:?}"
+        ),
+        Err(e) => panic!("expected Cancelled for pq_sink, got {e:?}"),
+        Ok(c) => {
+            c.shutdown().await;
+            panic!("Coalition::new returned Ok after its parent was cancelled");
+        }
+    }
+}
+
 /// **A failed `Coalition::new` moves no cursor past an undelivered message.**
-/// `fc_a` has a 50-message backlog and `fc_b` has a negative cursor.
-/// `Coalition::new` for `fc_src`, `fc_a` and `fc_b` fails with `CursorLoad`
-/// for `fc_b`; when it returns, the server's live-query count equals its
-/// earlier value and `cursor:fc_a` is unchanged; a new coalition for `fc_src`
-/// and `fc_a` then delivers all 50 messages, each once.
+/// `fc_a` has a 50-message backlog and `fc_b` has a negative cursor whose
+/// read waits 2 s on the server. `Coalition::new` for `fc_src`, `fc_a` and
+/// `fc_b` fails with `CursorLoad` for `fc_b`; when it returns, the server's
+/// live-query count equals its earlier value and `cursor:fc_a` is unchanged; a
+/// new coalition for `fc_src` and `fc_a` then delivers all 50 messages, each
+/// once.
 async fn scenario_failed_new_keeps_backlog(db: &Surreal<any::Any>) {
     const N: usize = 50;
     let pair = || vec!["fc_src".to_string(), "fc_a".to_string()];
@@ -979,6 +1248,7 @@ async fn scenario_failed_new_keeps_backlog(db: &Surreal<any::Any>) {
         .await
         .and_then(|r| r.check())
         .expect("write a negative cursor for fc_b");
+    stall_cursor_reads(db, "fc_b", 2).await;
 
     let mut names = pair();
     names.push("fc_b".to_string());
@@ -991,6 +1261,7 @@ async fn scenario_failed_new_keeps_backlog(db: &Surreal<any::Any>) {
     .expect("Coalition::new hung with a failing agent");
     let lives_at_return = message_lives(db).await.len();
     let after = cursor_position(db, "fc_a").await;
+    remove_cursor_stall(db).await;
     db.query("DELETE cursor:fc_b")
         .await
         .and_then(|r| r.check())
@@ -1119,27 +1390,52 @@ async fn scenario_wake_during_pass() {
     );
 }
 
-/// **A failing agent name tears down earlier agents.** `Coalition::new` with
-/// a valid name followed by an invalid one returns
-/// [`Error::InvalidAgentName`]. When it returns, the server's live-query count
-/// equals its earlier value; the count stays there for 5 s.
+/// **A failed `Coalition::new` has ended its subscribed loops when it
+/// returns.** `bt_bad`'s cursor read waits 3 s on the server.
+/// `Coalition::new_with_ready_timeout` for `bt_ok` and `bt_bad` with a 1 s
+/// ready timeout is polled until `bt_ok`'s live query is registered, then
+/// returns `ReadyTimeout` for `bt_bad` within 5 s. When it returns, the
+/// server's live-query count equals its earlier value; the count stays there
+/// for 5 s.
 async fn scenario_build_failure_teardown(db: &Surreal<any::Any>) {
-    db.query("DELETE cursor:bt_ok; DELETE agent:bt_ok;")
+    let names = || vec!["bt_ok".to_string(), "bt_bad".to_string()];
+    Coalition::<ChatMessage>::new(names())
         .await
-        .and_then(|r| r.check())
-        .expect("reset bt_ok");
+        .expect("round-0 coalition")
+        .shutdown()
+        .await;
+    stall_cursor_reads(db, "bt_bad", 3).await;
     let before = message_lives(db).await.len();
-    let result =
-        Coalition::<ChatMessage>::new(vec!["bt_ok".to_string(), "bad name".to_string()]).await;
+
+    let mut building = Box::pin(Coalition::<ChatMessage>::new_with_ready_timeout(
+        names(),
+        Duration::from_secs(1),
+    ));
+    let during = tokio::select! {
+        result = &mut building => {
+            remove_cursor_stall(db).await;
+            panic!("Coalition::new returned before bt_ok's live query was seen: {:?}", result.err());
+        }
+        during = wait_for_lives(db, before + 1, Duration::from_secs(5)) => during,
+    };
+    let result = timeout(Duration::from_secs(5), building)
+        .await
+        .expect("Coalition::new hung with a stalled bt_bad");
     let lives_at_return = message_lives(db).await.len();
+    remove_cursor_stall(db).await;
+    assert_eq!(
+        during,
+        before + 1,
+        "precondition: bt_ok must register one live query ({before} before, {during} during)"
+    );
     assert_eq!(
         lives_at_return, before,
         "live queries when Coalition::new returned: {lives_at_return}, {before} expected"
     );
     match &result {
-        Err(Error::InvalidAgentName { name }) => assert_eq!(name, "bad name"),
-        Err(e) => panic!("expected InvalidAgentName, got {e:?}"),
-        Ok(_) => panic!("a malformed agent name should be rejected"),
+        Err(Error::ReadyTimeout { agent, .. }) => assert_eq!(agent, "bt_bad"),
+        Err(e) => panic!("expected ReadyTimeout for bt_bad, got {e:?}"),
+        Ok(_) => panic!("Coalition::new must not start with a stalled bt_bad"),
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
