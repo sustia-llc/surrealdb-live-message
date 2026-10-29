@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `to_sync()`. After the last sender drops, `recv` returns the queued
   deliveries and then `Err(RecvError)`.
 - Remove the `kanal` git dependency; add `async-channel` 2.5.
+- Dropping a `Coalition` cancels its root token without waiting;
+  `shutdown().await` cancels it and waits for the listen loops and the
+  retention sweep to end.
+
+### Added
+
+- `Coalition::new_with_parent`, whose root token is a child of a caller's
+  token.
 
 ### Fixed
 
@@ -32,8 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and while a catch-up pages over other agents' changes: each bus send and
   each catch-up page query is raced against the cancellation token.
 - The persisted cursor passes a message addressed to the agent only once it
-  is on the bus, with one exception: a message whose payload does not decode
-  as `T` is logged and skipped. The `cursor` table gains `change_index`
+  is on the bus. Malformed data follows one rule, log at error level and
+  skip: a changeset that is not an object or has no integer versionstamp
+  (it has no position; the cursor passes it only by moving to a later
+  changeset), a missing or non-array `changes`, a change or record that is
+  not an object, and a message whose payload does not decode as `T`. The
+  `cursor` table gains `change_index`
   (default 0): a catch-up stopped by cancellation, or by a bus with no
   receivers, saves the cursor at the first change not on the bus, and the
   next catch-up resumes there. If that save fails, the error is logged, the
@@ -42,10 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-page puts that page's already-sent messages on the bus again.
   Deliveries already on the bus are not replayed and are lost if the process
   exits, or every receiver is dropped, before a consumer reads them.
-- A `cursor` row whose `versionstamp` or `change_index` is not an integer
-  fails with `Error::CursorLoad` instead of being treated as absent. A
-  `SHOW CHANGES` changeset without an integer versionstamp fails the
-  catch-up with `Error::CatchUp`.
+- A `cursor` row whose `versionstamp` or `change_index` is not a
+  non-negative integer fails with `Error::CursorLoad` instead of being
+  treated as absent.
 
 ## [0.3.0] - 2026-10-28
 

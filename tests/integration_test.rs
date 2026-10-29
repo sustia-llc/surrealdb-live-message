@@ -212,7 +212,8 @@ async fn test_agent_messaging() {
     scenario_full_bus_shutdown_and_replay().await;
     scenario_stop_mid_changeset(db).await;
     scenario_cancel_while_paging(db).await;
-    scenario_first_page_error(db).await;
+    scenario_drop_cancels(db).await;
+    scenario_malformed_cursor(db).await;
     scenario_invalid_agent_name().await;
     scenario_bus_close().await;
     scenario_durable_restart().await;
@@ -688,14 +689,14 @@ async fn scenario_stop_mid_changeset(db: &Surreal<any::Any>) {
     c2.shutdown().await;
 }
 
-/// **Cancellation while paging over other agents' traffic.** A sink whose
-/// cursor predates 10 000 changesets of traffic between two other agents (ten
-/// catch-up pages, none addressed to the sink) is shut down right after
-/// `Coalition::new` returns. `shutdown()` returns within 15 s, and the
-/// persisted cursor stops short of the end of that traffic: changesets after
-/// it remain.
+/// **Cancellation stops catch-up paging.** A sink whose cursor predates 2 500
+/// changesets of traffic between two other agents (three catch-up pages, none
+/// addressed to the sink) is started under an already-cancelled parent token.
+/// Its listen loop sees the cancellation at its first page query, before
+/// reading any page, so `Coalition::new` returns `ListenLoopDropped` within
+/// 15 s and the persisted cursor still has changesets after it.
 async fn scenario_cancel_while_paging(db: &Surreal<any::Any>) {
-    const TRAFFIC: usize = 10_000;
+    const TRAFFIC: usize = 2_500;
     let c0 = Coalition::<ChatMessage>::new(vec![
         "qc_sink".to_string(),
         "qc_a".to_string(),
@@ -712,12 +713,21 @@ async fn scenario_cancel_while_paging(db: &Surreal<any::Any>) {
         .and_then(|r| r.check())
         .expect("other agents' traffic");
 
-    let c1 = Coalition::<ChatMessage>::new(vec!["qc_sink".to_string()])
-        .await
-        .expect("round-1 coalition");
-    timeout(Duration::from_secs(15), c1.shutdown())
-        .await
-        .expect("shutdown hung while the sink paged over other agents' traffic");
+    let parent = CancellationToken::new();
+    parent.cancel();
+    let started = timeout(
+        Duration::from_secs(15),
+        Coalition::<ChatMessage>::new_with_parent(vec!["qc_sink".to_string()], &parent),
+    )
+    .await
+    .expect("Coalition::new_with_parent hung under a cancelled parent");
+    let started_ok = match &started {
+        Ok(c) => {
+            c.shutdown().await;
+            true
+        }
+        Err(_) => false,
+    };
 
     let row: Option<surrealdb_types::Value> = db
         .select(("cursor", "qc_sink"))
@@ -748,13 +758,50 @@ async fn scenario_cancel_while_paging(db: &Surreal<any::Any>) {
         "the sink's cursor {versionstamp} reached the end of {TRAFFIC} changesets: \
          its pass did not stop on cancellation"
     );
+    assert!(
+        !started_ok,
+        "Coalition::new_with_parent must not start under a cancelled parent"
+    );
+    match started {
+        Err(Error::ListenLoopDropped { agent }) => assert_eq!(agent, "qc_sink"),
+        Err(e) => panic!("expected ListenLoopDropped for qc_sink, got {e:?}"),
+        Ok(_) => unreachable!("checked by the `started_ok` assertion"),
+    }
 }
 
-/// **First catch-up query error fails startup.** An agent whose persisted
-/// cursor makes the first `SHOW CHANGES` query fail (a negative versionstamp,
-/// which the parser rejects) fails `Coalition::new` with that query's
-/// [`Error::CatchUp`].
-async fn scenario_first_page_error(db: &Surreal<any::Any>) {
+/// **Dropping a coalition ends its listen loops.** A two-agent coalition
+/// adds two LIVE queries on `message`; after it is dropped without
+/// `shutdown()`, its listen loops KILL them, so the server's live-query count
+/// returns to its earlier value within 10 s.
+async fn scenario_drop_cancels(db: &Surreal<any::Any>) {
+    let before = message_lives(db).await.len();
+    let c = Coalition::<ChatMessage>::new(vec!["dr_a".to_string(), "dr_b".to_string()])
+        .await
+        .expect("coalition creation");
+    let during = message_lives(db).await.len();
+    assert_eq!(
+        during,
+        before + 2,
+        "precondition: the coalition must add two live queries ({before} before, {during} during)"
+    );
+
+    drop(c);
+    let mut after = message_lives(db).await.len();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while after != before && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        after = message_lives(db).await.len();
+    }
+    assert_eq!(
+        after, before,
+        "dropping a coalition must end its listen loops: {after} live queries remain, {before} expected"
+    );
+}
+
+/// **A malformed cursor fails startup with its typed error.** An agent whose
+/// persisted cursor has a negative versionstamp fails `Coalition::new` with
+/// [`Error::CursorLoad`].
+async fn scenario_malformed_cursor(db: &Surreal<any::Any>) {
     db.query("UPSERT cursor:pf_agent CONTENT { versionstamp: -1, change_index: 0 }")
         .await
         .and_then(|r| r.check())
@@ -777,14 +824,14 @@ async fn scenario_first_page_error(db: &Surreal<any::Any>) {
         .await
         .and_then(|r| r.check());
 
-    let result = result.expect("Coalition::new hung on a failing first catch-up query");
+    let result = result.expect("Coalition::new hung on a malformed cursor");
     assert!(
         !started,
-        "Coalition::new must fail when the first catch-up query fails"
+        "Coalition::new must fail when the agent's cursor is malformed"
     );
     match result {
-        Err(Error::CatchUp { agent, .. }) => assert_eq!(agent, "pf_agent"),
-        Err(e) => panic!("expected CatchUp for pf_agent, got {e:?}"),
+        Err(Error::CursorLoad { agent, .. }) => assert_eq!(agent, "pf_agent"),
+        Err(e) => panic!("expected CursorLoad for pf_agent, got {e:?}"),
         Ok(_) => unreachable!("checked by the `started` assertion"),
     }
     cleanup.expect("remove the negative cursor");

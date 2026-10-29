@@ -28,7 +28,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// downstream consumers via [`Coalition::inbox`].
 const INBOX_CAPACITY: usize = 256;
 
-/// Table holding each agent's durable-log high-water-mark cursor (`cursor:<agent>`).
+/// Table holding each agent's durable-log position (`cursor:<agent>`): the
+/// `versionstamp` of a changeset and the `change_index` within it of the first
+/// change not yet on the bus.
 pub const CURSOR_TABLE: &str = "cursor";
 
 /// Max changesets pulled per `SHOW CHANGES` page during catch-up.
@@ -172,19 +174,17 @@ impl Agent {
     /// log. **Tier 2** a `LIVE SELECT` acts purely as a low-latency *wake-up*;
     /// every wake (and every reconnect) triggers a `SHOW CHANGES … SINCE
     /// <cursor>` catch-up that is the *sole* delivery path. The persisted
-    /// per-agent cursor is a (versionstamp, change index) pair. It advances
-    /// past a change once that change's delivery is on the bus, or once the
-    /// change is not a message for this agent; a message addressed to this
-    /// agent whose payload does not decode as `T` is logged and skipped. The
-    /// cursor is persisted after each catch-up page and when a pass stops; if
-    /// that save fails, the persisted cursor stays at its previous saved
-    /// position. A message not yet on the bus is put on it after a
-    /// disconnect/restart. After a stop by cancellation or a bus with no
-    /// receivers whose cursor save succeeds, no message is put on the bus
-    /// twice; after a process exit mid-page, or a failed save, the messages
-    /// sent since the last saved position are put on the bus again. Deliveries
-    /// already on the bus are not replayed: they are lost if the process
-    /// exits, or every receiver is dropped, before a consumer reads them.
+    /// per-agent cursor is a (versionstamp, change index) pair; see
+    /// [`deliver_page`] for how it moves, including the malformed-data rule
+    /// (log at error, then move on). The cursor is persisted after each
+    /// catch-up page and when a pass stops; if that save fails, the persisted
+    /// cursor stays at its previous saved position. A message not yet on the
+    /// bus is put on it after a disconnect/restart. After a stop whose cursor
+    /// save succeeds, no message is put on the bus twice; after a process exit
+    /// mid-page, or a failed save, the messages sent since the last saved
+    /// position are put on the bus again. Deliveries already on the bus are
+    /// not replayed: they are lost if the process exits, or every receiver is
+    /// dropped, before a consumer reads them.
     /// (LIVE alone is at-most-once with no replay; see the `live-queries`
     /// skill, "Delivery guarantees".)
     ///
@@ -194,9 +194,11 @@ impl Agent {
     /// subscribe, first page query) is logged with its source chain and sent
     /// as `Err` on `ready_tx`, and the loop ends; later failures reconnect with
     /// capped exponential backoff. While a delivery waits on a full bus the
-    /// wake stream is still read. Cancellation of `token` ends the loop at the
-    /// next bus send, page query, or wait for a wake. Messages are NEVER
-    /// deleted here — the log is aged out by the coalition's retention sweep.
+    /// wake stream is still read. The loop ends when `token` is cancelled (seen
+    /// at the next bus send, page query, or wait for a wake), including by
+    /// `Coalition::shutdown` or the coalition's `Drop`, or when a send finds
+    /// every bus receiver dropped. Messages are NEVER deleted here — the log is
+    /// aged out by the coalition's retention sweep.
     ///
     /// Library-side lifecycle primitive. No `SubsystemHandle`, no signal
     /// handling. See `rust-practical:async-lifecycle` skill.
@@ -209,14 +211,19 @@ impl Agent {
         T: SurrealValue + Send + Sync + Unpin + 'static,
     {
         tracing::info!("listen_loop starting for {}", self.name);
-        let db = sdb::SurrealDBWrapper::connection().await;
-        let owner = RecordId::new(AGENT_TABLE, self.name.clone());
-        let name = self.name.as_str();
+        let ctx = LoopCtx {
+            db: sdb::SurrealDBWrapper::connection().await,
+            owner: RecordId::new(AGENT_TABLE, self.name.clone()),
+            agent: self.name.as_str(),
+            inbox_tx,
+            token,
+        };
+        let name = ctx.agent;
 
         // Cursor: resume from the persisted position, or on first run snapshot
         // the current latest versionstamp so a brand-new agent starts "from
         // now" instead of replaying pre-existing backlog.
-        let mut cursor = match initial_cursor(db, name).await {
+        let mut cursor = match initial_cursor(ctx.db, name).await {
             Ok(c) => c,
             Err(e) => return fail_startup(name, ready_tx, e),
         };
@@ -226,14 +233,14 @@ impl Agent {
 
         loop {
             // (Re)subscribe the LIVE wake-up.
-            let (stream, live_id) = match subscribe_wake(db, &owner, name).await {
+            let (stream, live_id) = match subscribe_wake(ctx.db, &ctx.owner, name).await {
                 Ok(s) => s,
                 Err(e) => {
                     if let Some(tx) = ready_tx.take() {
                         return fail_startup(name, tx, e);
                     }
                     tracing::error!("resubscribe failed for {name}: {}", chain(&e));
-                    if cancel_or_sleep(&token, backoff).await {
+                    if cancel_or_sleep(&ctx.token, backoff).await {
                         return;
                     }
                     backoff = next_backoff(backoff);
@@ -247,16 +254,37 @@ impl Agent {
             let exit = loop {
                 if wakes.pending {
                     wakes.pending = false;
-                    let pass = catch_up::<T>(
-                        db,
-                        &owner,
-                        name,
-                        &mut cursor,
-                        &inbox_tx,
-                        &token,
-                        &mut wakes,
-                        &mut ready_tx,
-                    )
+                    let pass = async {
+                        loop {
+                            let page = match fetch_page(&ctx, cursor).await? {
+                                ControlFlow::Continue(page) => page,
+                                ControlFlow::Break(stop) => return Ok(ControlFlow::Break(stop)),
+                            };
+                            if let Some(tx) = ready_tx.take() {
+                                let _ = tx.send(Ok(()));
+                            }
+                            if page.is_empty() {
+                                return Ok(ControlFlow::Continue(()));
+                            }
+                            let full = page.len() >= CATCHUP_BATCH;
+                            let start = cursor;
+                            if let ControlFlow::Break(stop) =
+                                deliver_page(&ctx, &mut cursor, &mut wakes, &page).await?
+                            {
+                                return Ok(ControlFlow::Break(stop));
+                            }
+                            if !full {
+                                return Ok(ControlFlow::Continue(()));
+                            }
+                            if cursor == start {
+                                tracing::error!(
+                                    "catch_up for {name}: a full page left the cursor at {cursor}; \
+                                     ending the pass"
+                                );
+                                return Ok(ControlFlow::Continue(()));
+                            }
+                        }
+                    }
                     .await;
                     match pass {
                         Ok(ControlFlow::Continue(())) => backoff = RECONNECT_BACKOFF_START,
@@ -264,20 +292,20 @@ impl Agent {
                         Err(e) => break Exit::CatchUp(e),
                     }
                 }
-                if let Some(end) = wakes.end.take() {
-                    break Exit::Wake(end);
+                if wakes.end.is_some() {
+                    break Exit::Wake;
                 }
                 tokio::select! {
                     // `biased`: cancellation takes strict priority so a hot
                     // stream can't starve shutdown.
                     biased;
-                    _ = token.cancelled() => break Exit::Stop(Stop::Cancelled),
+                    _ = ctx.token.cancelled() => break Exit::Stop(Stop::Cancelled),
                     item = wakes.stream.next() => wakes.record(item),
                 }
             };
 
             let Wakes { stream, end, .. } = wakes;
-            end_live(db, name, live_id, stream).await;
+            end_live(ctx.db, name, live_id, stream).await;
             if let Some(end) = end {
                 end.log(name);
             }
@@ -292,9 +320,9 @@ impl Agent {
                     }
                     tracing::error!("catch_up failed for {name}: {}", chain(&e));
                 }
-                Exit::Wake(end) => end.log(name),
+                Exit::Wake => {}
             }
-            if cancel_or_sleep(&token, backoff).await {
+            if cancel_or_sleep(&ctx.token, backoff).await {
                 return;
             }
             backoff = next_backoff(backoff);
@@ -308,9 +336,11 @@ impl Agent {
 
 /// A scoped group of agents all exchanging payloads of type `T`.
 ///
-/// Library-first lifecycle — exposes `cancellation_token()` so callers wire
-/// their own top-level shutdown, and `shutdown().await` for the
-/// cancel-close-drain three-step. See `rust-practical:async-lifecycle` skill.
+/// Exposes `cancellation_token()` so callers wire their own top-level
+/// shutdown, and `shutdown().await`, which cancels the root token and waits
+/// for every listen loop and the retention sweep to end. Dropping a
+/// `Coalition` cancels its root token without waiting. The library installs
+/// no signal handling.
 pub struct Coalition<T: SurrealValue + Send + Sync + Unpin + 'static> {
     agents: Arc<RwLock<HashMap<String, Agent>>>,
     task_tracker: TaskTracker,
@@ -344,9 +374,24 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         names: Vec<String>,
         ready_timeout: Duration,
     ) -> Result<Self> {
+        Self::build(names, ready_timeout, CancellationToken::new()).await
+    }
+
+    /// Like [`Coalition::new`], with a root token that is a child of
+    /// `parent`: cancelling `parent` cancels the coalition. A `parent` that is
+    /// already cancelled ends each listen loop before its first catch-up page
+    /// query, so this returns [`Error::ListenLoopDropped`].
+    pub async fn new_with_parent(names: Vec<String>, parent: &CancellationToken) -> Result<Self> {
+        Self::build(names, READY_TIMEOUT, parent.child_token()).await
+    }
+
+    async fn build(
+        names: Vec<String>,
+        ready_timeout: Duration,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self> {
         let agents = Arc::new(RwLock::new(HashMap::new()));
         let task_tracker = TaskTracker::new();
-        let cancellation_token = CancellationToken::new();
 
         // Shared MPMC delivery bus. Each agent's listen_loop holds a clone of
         // the sender; the receiver lives on the Coalition and is handed out via
@@ -432,11 +477,19 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         self.inbox.clone()
     }
 
-    /// Three-step shutdown: cancel → close → drain.
+    /// Cancel the root token, then wait until every listen loop and the
+    /// retention sweep have ended.
     pub async fn shutdown(&self) {
         self.cancellation_token.cancel();
         self.task_tracker.close();
         self.task_tracker.wait().await;
+    }
+}
+
+impl<T: SurrealValue + Send + Sync + Unpin + 'static> Drop for Coalition<T> {
+    /// Cancel the root token without waiting for the tasks to end.
+    fn drop(&mut self) {
+        self.cancellation_token.cancel();
     }
 }
 
@@ -546,9 +599,9 @@ async fn load_cursor(db: &Surreal<any::Any>, agent: &str) -> Result<Option<Curso
     row.map(|row| parse_cursor(agent, &row)).transpose()
 }
 
-/// Parse a `cursor` row: an object with an integer `versionstamp` and an
-/// optional integer `change_index` (absent → 0). Any other shape returns
-/// [`Error::CursorLoad`] for `agent`.
+/// Parse a `cursor` row: an object with a non-negative integer `versionstamp`
+/// and an optional non-negative integer `change_index` (absent → 0). Any
+/// other shape returns [`Error::CursorLoad`] for `agent`.
 fn parse_cursor(agent: &str, row: &Value) -> Result<Cursor> {
     let malformed = || Error::CursorLoad {
         agent: agent.to_string(),
@@ -557,13 +610,14 @@ fn parse_cursor(agent: &str, row: &Value) -> Result<Cursor> {
     let Value::Object(o) = row else {
         return Err(malformed());
     };
+    let non_negative = |v: Option<i64>| v.filter(|n| *n >= 0).ok_or_else(malformed);
     let versionstamp = match o.get("versionstamp") {
-        Some(Value::Number(n)) => n.to_int().ok_or_else(malformed)?,
+        Some(Value::Number(n)) => non_negative(n.to_int())?,
         _ => return Err(malformed()),
     };
     let change_index = match o.get("change_index") {
         None | Some(Value::None) | Some(Value::Null) => 0,
-        Some(Value::Number(n)) => n.to_int().ok_or_else(malformed)?,
+        Some(Value::Number(n)) => non_negative(n.to_int())?,
         Some(_) => return Err(malformed()),
     };
     Ok(Cursor {
@@ -621,7 +675,7 @@ async fn show_changes(
         .map_err(catch_up_err)
 }
 
-/// Why a [`catch_up`] pass stopped before reaching the live edge.
+/// Why a catch-up pass stopped before reaching the live edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stop {
     /// `token` was cancelled.
@@ -713,186 +767,218 @@ enum Exit {
     Stop(Stop),
     /// A catch-up pass failed.
     CatchUp(Error),
-    /// The wake stream errored or ended.
-    Wake(WakeEnd),
+    /// The wake stream errored or ended; the end is in [`Wakes::end`].
+    Wake,
+}
+
+/// What one listen loop works with for its whole run.
+struct LoopCtx<'a, T: SurrealValue> {
+    db: &'static Surreal<any::Any>,
+    owner: RecordId,
+    agent: &'a str,
+    inbox_tx: Sender<Delivery<T>>,
+    token: CancellationToken,
 }
 
 /// Put `delivery` on the bus, reading `wakes` while the bus is full. Returns
-/// `Err` without putting it on the bus when `token` is cancelled first or
+/// `Err` without putting it on the bus when `ctx.token` is cancelled first or
 /// every receiver is dropped.
 async fn hand_off<T>(
-    inbox_tx: &Sender<Delivery<T>>,
+    ctx: &LoopCtx<'_, T>,
     delivery: Delivery<T>,
-    token: &CancellationToken,
     wakes: &mut Wakes,
 ) -> std::result::Result<(), Stop>
 where
     T: SurrealValue + Send + Sync + Unpin + 'static,
 {
-    let send = inbox_tx.send(delivery);
+    let send = ctx.inbox_tx.send(delivery);
     tokio::pin!(send);
     loop {
         tokio::select! {
             biased;
-            _ = token.cancelled() => return Err(Stop::Cancelled),
+            _ = ctx.token.cancelled() => return Err(Stop::Cancelled),
             result = &mut send => return result.map_err(|_| Stop::NoReceivers),
             item = wakes.stream.next(), if wakes.end.is_none() => wakes.record(item),
         }
     }
 }
 
-/// Why a page of a [`catch_up`] pass ended early.
-enum PageEnd {
-    /// A delivery was not put on the bus.
-    Stop(Stop),
-    /// A changeset in the reply had no integer versionstamp.
-    Malformed(Error),
+/// Fetch the catch-up page that starts at `cursor`: `SHOW CHANGES … SINCE
+/// <cursor.versionstamp> LIMIT CATCHUP_BATCH`, raced against `ctx.token`.
+/// Returns the page's changesets (empty when the reply is not an array, which
+/// is logged at error), or `ControlFlow::Break(Stop::Cancelled)` when the
+/// token is cancelled first.
+async fn fetch_page<T: SurrealValue>(
+    ctx: &LoopCtx<'_, T>,
+    cursor: Cursor,
+) -> Result<ControlFlow<Stop, Vec<Value>>> {
+    let reply = tokio::select! {
+        biased;
+        _ = ctx.token.cancelled() => return Ok(ControlFlow::Break(Stop::Cancelled)),
+        v = show_changes(ctx.db, ctx.agent, cursor.versionstamp, CATCHUP_BATCH) => v?,
+    };
+    match reply {
+        Value::Array(changesets) => Ok(ControlFlow::Continue(changesets.into_iter().collect())),
+        other => {
+            tracing::error!(
+                "catch_up for {}: SHOW CHANGES reply is not an array, skipped: {other:?}",
+                ctx.agent
+            );
+            Ok(ControlFlow::Continue(Vec::new()))
+        }
+    }
 }
 
-/// Drain the durable log from `*cursor` and deliver every message addressed to
-/// `owner` onto the bus, in log order. `SHOW CHANGES` is table-wide; a change
-/// whose record's `out` is not `owner` is passed over without decoding. A
-/// message addressed to `owner` whose record does not decode as `Message<T>`
-/// is logged at warn and skipped. After each page, the cursor is set to the
-/// first change not yet handed to the bus and persisted; `*cursor` changes
-/// only once that save succeeds. `ready_tx`, if still held, receives `Ok(())`
-/// after the first page query succeeds and before any send.
+/// Convert a change position to the cursor's `i64`, or [`Error::CatchUp`] if
+/// it does not fit.
+fn index_to_i64(agent: &str, index: usize) -> Result<i64> {
+    i64::try_from(index).map_err(|_| Error::CatchUp {
+        agent: agent.to_string(),
+        source: reply_error(format!("change index {index} does not fit the cursor")),
+    })
+}
+
+/// Deliver one catch-up page (`page`, fetched from `*cursor`) onto the bus,
+/// in log order, and persist the cursor.
 ///
-/// Each page query and each send is raced against `token`, and `wakes` is
-/// read while a send waits on a full bus. Cancellation, or a bus with no
-/// receivers, ends the pass with `ControlFlow::Break`; if the cursor save on
-/// that stop fails, the error is logged and the pass still returns
-/// `ControlFlow::Break`. A changeset without an integer versionstamp returns
-/// [`Error::CatchUp`] after the cursor up to it is saved. Returns
-/// `ControlFlow::Continue` once a short page signals the live edge is reached.
-#[allow(clippy::too_many_arguments)]
-async fn catch_up<T>(
-    db: &Surreal<any::Any>,
-    owner: &RecordId,
-    agent: &str,
+/// Cursor rule: the cursor moves past a changeset once every change in it
+/// has been handled, to the start of the next versionstamp; inside the
+/// changeset at `cursor.versionstamp`, changes before `cursor.change_index`
+/// are not read again. A change is handled when it is not a message for
+/// `ctx.owner` (its record's `out` is compared before any decode), or when
+/// its delivery is on the bus. A changeset with no integer versionstamp has
+/// no position of its own: it is skipped, and the cursor passes it only by
+/// moving to a later changeset's position.
+///
+/// Malformed-data rule: a changeset that is not an object or has no integer
+/// versionstamp, a `changes` field that is missing or not an array, a change
+/// or record that is not an object, and a message for `ctx.owner` that does
+/// not decode as `Message<T>` are each logged at error level (agent,
+/// versionstamp, what was malformed) and skipped.
+///
+/// Each send is raced against `ctx.token`, and `wakes` is read while a send
+/// waits on a full bus. Cancellation, or a bus with no receivers, returns
+/// `ControlFlow::Break` with the cursor saved at the change not put on the
+/// bus, so no message is put on the bus twice; if that save fails, the error
+/// is logged and `ControlFlow::Break` is still returned. `*cursor` changes
+/// only once a save succeeds; a save failure on a complete page returns that
+/// error.
+async fn deliver_page<T>(
+    ctx: &LoopCtx<'_, T>,
     cursor: &mut Cursor,
-    inbox_tx: &Sender<Delivery<T>>,
-    token: &CancellationToken,
     wakes: &mut Wakes,
-    ready_tx: &mut Option<oneshot::Sender<Result<()>>>,
+    page: &[Value],
 ) -> Result<ControlFlow<Stop>>
 where
     T: SurrealValue + Send + Sync + Unpin + 'static,
 {
-    loop {
-        let v = tokio::select! {
-            biased;
-            _ = token.cancelled() => return Ok(ControlFlow::Break(Stop::Cancelled)),
-            v = show_changes(db, agent, cursor.versionstamp, CATCHUP_BATCH) => v?,
+    let agent = ctx.agent;
+    let page_start = *cursor;
+    let mut committed = *cursor;
+    let mut stopped = None;
+    'page: for changeset in page {
+        let (Value::Object(obj), Some(vs)) = (changeset, versionstamp_of(changeset)) else {
+            tracing::error!(
+                "catch_up for {agent}: changeset is not an object with an integer \
+                 versionstamp, skipped: {changeset:?}"
+            );
+            continue;
         };
-        if let Some(tx) = ready_tx.take() {
-            let _ = tx.send(Ok(()));
-        }
-        let Value::Array(changesets) = v else { break };
-        let page = changesets.len();
-        if page == 0 {
-            break;
-        }
-
-        let page_start = *cursor;
-        let mut committed = *cursor;
-        let mut ended = None;
-        'page: for changeset in changesets.iter() {
-            let (Value::Object(obj), Some(vs)) = (changeset, versionstamp_of(changeset)) else {
-                ended = Some(PageEnd::Malformed(Error::CatchUp {
-                    agent: agent.to_string(),
-                    source: reply_error(format!(
-                        "SHOW CHANGES returned a changeset without an integer versionstamp: {changeset:?}"
-                    )),
-                }));
-                break 'page;
-            };
-            let skip = if vs == page_start.versionstamp {
-                usize::try_from(page_start.change_index).unwrap_or(0)
-            } else {
-                0
-            };
-            let changes = match obj.get("changes") {
-                Some(Value::Array(changes)) => changes.as_slice(),
-                _ => &[],
-            };
-            for (index, change) in changes.iter().enumerate().skip(skip) {
-                let Value::Object(op) = change else { continue };
-                // RELATE-created edges surface as a "create"/"update" op carrying
-                // the full record; "delete" ops (retention sweep) are skipped.
-                let Some(record) = op.get("update").or_else(|| op.get("create")) else {
-                    continue;
-                };
-                let addressed_to_owner = match record {
-                    Value::Object(r) => {
-                        matches!(r.get("out"), Some(Value::RecordId(out)) if out == owner)
-                    }
-                    _ => false,
-                };
-                if !addressed_to_owner {
-                    continue; // table-wide feed — keep only ours
-                }
-                let message = match Message::<T>::from_value(record.clone()) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!("skipping undecodable message for {agent}: {}", chain(&e));
-                        continue;
-                    }
-                };
-                let span = tracing::info_span!("deliver", target = %agent, from = ?message.r#in);
-                let delivery = Delivery {
-                    recipient: agent.to_string(),
-                    message,
-                };
-                match hand_off(inbox_tx, delivery, token, wakes).await {
-                    Ok(()) => span.in_scope(|| tracing::info!("message delivered")),
-                    Err(stop) => {
-                        let change_index = i64::try_from(index).unwrap_or(i64::MAX);
-                        committed = committed.max(Cursor {
-                            versionstamp: vs,
-                            change_index,
-                        });
-                        ended = Some(PageEnd::Stop(stop));
-                        break 'page;
-                    }
-                }
-            }
-            committed = committed.max(Cursor::at(vs + 1));
-        }
-
-        if committed > *cursor {
-            match save_cursor(db, agent, committed).await {
-                Ok(()) => *cursor = committed,
-                Err(e) => match ended {
-                    Some(PageEnd::Stop(stop)) => {
-                        tracing::error!(
-                            "catch_up for {agent} could not save cursor {committed} on {stop:?}: {}",
-                            chain(&e)
-                        );
-                        return Ok(ControlFlow::Break(stop));
-                    }
-                    Some(PageEnd::Malformed(m)) => {
-                        tracing::error!("catch_up failed for {agent}: {}", chain(&m));
-                        return Err(e);
-                    }
-                    None => return Err(e),
-                },
-            }
-        }
-        match ended {
-            Some(PageEnd::Stop(stop)) => {
-                tracing::info!(
-                    "catch_up for {agent} stopped at cursor {}: {stop:?}",
-                    *cursor
+        let skip = if vs == page_start.versionstamp {
+            usize::try_from(page_start.change_index).map_err(|_| Error::CatchUp {
+                agent: agent.to_string(),
+                source: reply_error(format!(
+                    "cursor change index {} is not a valid position",
+                    page_start.change_index
+                )),
+            })?
+        } else {
+            0
+        };
+        let changes = match obj.get("changes") {
+            Some(Value::Array(changes)) => changes.as_slice(),
+            other => {
+                tracing::error!(
+                    "catch_up for {agent}: changeset {vs} has no `changes` array, skipped: {other:?}"
                 );
-                return Ok(ControlFlow::Break(stop));
+                &[]
             }
-            Some(PageEnd::Malformed(e)) => return Err(e),
-            None => {}
+        };
+        for (index, change) in changes.iter().enumerate().skip(skip) {
+            let Value::Object(op) = change else {
+                tracing::error!(
+                    "catch_up for {agent}: change {index} of changeset {vs} is not an object, \
+                     skipped: {change:?}"
+                );
+                continue;
+            };
+            // RELATE-created edges surface as a "create"/"update" op carrying
+            // the full record; "delete" ops (retention sweep) are not messages.
+            let Some(record) = op.get("update").or_else(|| op.get("create")) else {
+                continue;
+            };
+            let Value::Object(fields) = record else {
+                tracing::error!(
+                    "catch_up for {agent}: record of change {index} in changeset {vs} is not \
+                     an object, skipped: {record:?}"
+                );
+                continue;
+            };
+            if !matches!(fields.get("out"), Some(Value::RecordId(out)) if *out == ctx.owner) {
+                continue; // table-wide feed — keep only ours
+            }
+            let message = match Message::<T>::from_value(record.clone()) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(
+                        "catch_up for {agent}: message in change {index} of changeset {vs} does \
+                         not decode, skipped: {}",
+                        chain(&e)
+                    );
+                    continue;
+                }
+            };
+            let span = tracing::info_span!("deliver", target = %agent, from = ?message.r#in);
+            let delivery = Delivery {
+                recipient: agent.to_string(),
+                message,
+            };
+            match hand_off(ctx, delivery, wakes).await {
+                Ok(()) => span.in_scope(|| tracing::info!("message delivered")),
+                Err(stop) => {
+                    committed = committed.max(Cursor {
+                        versionstamp: vs,
+                        change_index: index_to_i64(agent, index)?,
+                    });
+                    stopped = Some(stop);
+                    break 'page;
+                }
+            }
         }
-        if page < CATCHUP_BATCH {
-            break;
+        committed = committed.max(Cursor::at(vs + 1));
+    }
+
+    if committed > *cursor {
+        match save_cursor(ctx.db, agent, committed).await {
+            Ok(()) => *cursor = committed,
+            Err(e) => match stopped {
+                Some(stop) => {
+                    tracing::error!(
+                        "catch_up for {agent} could not save cursor {committed} on {stop:?}: {}",
+                        chain(&e)
+                    );
+                    return Ok(ControlFlow::Break(stop));
+                }
+                None => return Err(e),
+            },
         }
+    }
+    if let Some(stop) = stopped {
+        tracing::info!(
+            "catch_up for {agent} stopped at cursor {}: {stop:?}",
+            *cursor
+        );
+        return Ok(ControlFlow::Break(stop));
     }
     Ok(ControlFlow::Continue(()))
 }
@@ -1208,8 +1294,9 @@ mod tests {
     }
 
     /// [`parse_cursor`] reads `versionstamp` and `change_index`, defaults a
-    /// missing `change_index` to 0, and rejects a row whose `versionstamp` is
-    /// absent or not an integer.
+    /// missing `change_index` to 0, and rejects a non-object row, a missing,
+    /// non-integer or negative `versionstamp`, and a non-integer or negative
+    /// `change_index`.
     #[test]
     fn parse_cursor_accepts_valid_rows_and_rejects_malformed_ones() {
         let row = |pairs: Vec<(&str, Value)>| {
@@ -1234,6 +1321,8 @@ mod tests {
             row(vec![("versionstamp", text("7"))]),
             row(vec![]),
             row(vec![("versionstamp", int(7)), ("change_index", text("x"))]),
+            row(vec![("versionstamp", int(-1))]),
+            row(vec![("versionstamp", int(7)), ("change_index", int(-1))]),
             int(7),
         ] {
             let err =
