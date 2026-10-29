@@ -76,7 +76,7 @@ impl Agent {
     /// existing `cursor` row are kept unchanged. When `cursor:<name>` is
     /// absent, it is created at the changeset after the latest one retained in
     /// the `message` changefeed. Both records are written in one transaction,
-    /// so this never leaves `agent:<name>` without `cursor:<name>`.
+    /// so this does not write `agent:<name>` without `cursor:<name>`.
     ///
     /// Errors: [`Error::InvalidAgentName`] for a rejected `name`;
     /// [`Error::AgentCreate`] when a database call fails (the cursor

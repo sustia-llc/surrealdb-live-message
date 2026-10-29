@@ -13,19 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returns it when the coalition's token is cancelled before every listen
   loop is ready. `agent` is `None` for a `Coalition::new_with_parent`
   parent that is already cancelled (checked before any database call) and
-  for a cancel found after every readiness wait ended in `Ok`,
-  `Error::ReadyTimeout` or `Error::ListenLoopDropped`; it names the agent
-  whose `Agent::new` call or loop startup the cancel interrupted otherwise.
-  A loop sends `Error::Cancelled` before any cleanup await.
-  `Error::ListenLoopDropped` now means only that a loop ended without a
-  ready signal and without a cancel.
+  for a cancel found after every readiness wait ended in `Ok` or
+  `Error::ReadyTimeout`; it names the agent whose `Agent::new` call or loop
+  startup the cancel interrupted otherwise. A loop sends `Error::Cancelled`
+  before any cleanup await. `Error::ListenLoopDropped` now means only that a
+  loop ended without a ready signal and without a cancel.
+- Breaking: `Error::AgentCreateTimeout { agent, timeout }`. `Coalition::new`
+  returns it when an `Agent::new` call does not finish within the ready
+  timeout.
 
 ### Changed
 
 - `Agent::new` writes the `agent` record and, when absent, its `cursor` row
   (at the changeset after the latest one retained in the changefeed) in one
   transaction; an existing cursor is kept. The listen loop only loads the
-  cursor; a missing row fails startup with `Error::CursorLoad`.
+  cursor; a missing row fails startup with `Error::CursorLoad`. A failed
+  changefeed read in `Agent::new` returns `Error::AgentCreate`.
 - `Coalition::new` returns the first error a listen loop sends (including
   `Error::Cancelled`) as soon as it arrives, in preference to
   `Error::ReadyTimeout` and `Error::ListenLoopDropped`; among those two, the
@@ -39,15 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop holds at its ready point until `Coalition::new` has every ready
   signal and sends a start signal, so no delivery reaches the bus before
   `Coalition::new` returns `Ok`, and a failed `Coalition::new` moves no
-  cursor past a message that was not on the bus. A failed or cancelled
-  `Coalition::new` never leaves an agent record without its cursor. A
-  backlog larger than the bus does not block `Coalition::new`.
-- Every listen-loop await before the ready signal (cursor load, LIVE
-  subscribe, first page query) is raced against the loop's token, and each
-  `Agent::new` call in `Coalition::new` is bounded by the ready timeout
-  (`Error::ReadyTimeout` for that agent) and raced against the token, so a
-  startup database call that never completes does not stop
-  `Coalition::new` returning `Error::ReadyTimeout` or a startup error.
+  cursor past a message that was not on the bus. `Agent::new` does not write
+  an agent record without its cursor. A backlog larger than the bus does not
+  block `Coalition::new`.
+- Every listen-loop await before the ready signal (connection, cursor load,
+  LIVE subscribe, first page query) is raced against the loop's token, and
+  each `Agent::new` call in `Coalition::new` is bounded by the ready timeout
+  (`Error::AgentCreateTimeout` for that agent) and raced against the token.
+  A startup database call that never completes therefore does not stop
+  `Coalition::new` from returning an error.
 - Dropping the `Coalition::new` future cancels every spawned listen loop and
   the retention sweep without waiting for them; a loop whose ready send
   fails ends.
