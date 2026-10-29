@@ -168,18 +168,22 @@ impl Agent {
     /// log. **Tier 2** a `LIVE SELECT` acts purely as a low-latency *wake-up*;
     /// every wake (and every reconnect) triggers a `SHOW CHANGES … SINCE
     /// <cursor>` catch-up that is the *sole* delivery path. Catch-up advances a
-    /// persisted per-agent versionstamp cursor (`cursor = max_seen + 1`), so a
-    /// message is delivered once per cursor advance and never lost across a
-    /// disconnect/restart — at-least-once with idempotent, monotonic resume.
+    /// persisted per-agent versionstamp cursor past a changeset only once every
+    /// delivery in it is on the bus, so a message not yet on the bus is
+    /// replayed after a disconnect/restart — at-least-once with monotonic
+    /// resume.
     /// (LIVE alone is at-most-once with no replay; see the `live-queries`
     /// skill, "Delivery guarantees".)
     ///
-    /// `ready_tx` fires after the first successful subscribe + backlog drain, so
-    /// `Agent::send` calls issued after `Coalition::new` returns cannot race the
-    /// subscription. A startup-phase failure (before `ready_tx` fires) returns
-    /// `Err`, dropping the sender so `Coalition::new` surfaces it; failures after
-    /// readiness reconnect with capped exponential backoff. Messages are NEVER
-    /// deleted here — the log is aged out by the coalition's retention sweep.
+    /// `ready_tx` fires after the first successful subscribe and before the
+    /// backlog drain, so `Agent::send` calls issued after `Coalition::new`
+    /// returns cannot race the subscription, and a backlog larger than the bus
+    /// does not block startup. A failure before `ready_tx` fires (cursor load or
+    /// first subscribe) returns `Err`, dropping the sender so `Coalition::new`
+    /// surfaces it; later failures reconnect with capped exponential backoff.
+    /// Cancellation of `token` ends the loop, including while a delivery waits
+    /// on a full bus. Messages are NEVER deleted here — the log is aged out by
+    /// the coalition's retention sweep.
     ///
     /// Library-side lifecycle primitive. No `SubsystemHandle`, no signal
     /// handling. See `rust-practical:async-lifecycle` skill.
@@ -226,25 +230,36 @@ impl Agent {
                 }
             };
 
+            // First successful subscribe: signal readiness once, before the
+            // drain.
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(());
+            }
+
             // Drain the durable log up to the live edge. Anything published
             // during the drain is buffered by the live stream and handled by the
             // next catch_up in the inner loop.
-            if let Err(e) = catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx).await {
-                end_live(db, &self.name, live_id, stream).await;
-                if ready_tx.is_some() {
-                    return Err(e); // startup failure
-                }
-                tracing::error!("catch_up failed for {}: {}", self.name, chain(&e));
-                if cancel_or_sleep(&token, backoff).await {
+            match catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx, &token).await {
+                Ok(Drain::Complete) => {}
+                Ok(Drain::Cancelled) => {
+                    tracing::info!("listen_loop for {} received shutdown", self.name);
+                    end_live(db, &self.name, live_id, stream).await;
                     return Ok(());
                 }
-                backoff = next_backoff(backoff);
-                continue;
-            }
-
-            // First successful subscribe + drain: signal readiness once.
-            if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(());
+                Ok(Drain::NoReceivers) => {
+                    tracing::info!("delivery bus has no receivers; {} stops", self.name);
+                    end_live(db, &self.name, live_id, stream).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    end_live(db, &self.name, live_id, stream).await;
+                    tracing::error!("catch_up failed for {}: {}", self.name, chain(&e));
+                    if cancel_or_sleep(&token, backoff).await {
+                        return Ok(());
+                    }
+                    backoff = next_backoff(backoff);
+                    continue;
+                }
             }
             backoff = RECONNECT_BACKOFF_START;
 
@@ -262,11 +277,22 @@ impl Agent {
                     }
                     maybe = stream.next() => match maybe {
                         Some(Ok(_wake)) => {
-                            if let Err(e) =
-                                catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx).await
-                            {
-                                tracing::error!("catch_up failed for {}: {}", self.name, chain(&e));
-                                break;
+                            match catch_up::<T>(db, &owner, &self.name, &mut cursor, &inbox_tx, &token).await {
+                                Ok(Drain::Complete) => {}
+                                Ok(Drain::Cancelled) => {
+                                    tracing::info!("listen_loop for {} received shutdown", self.name);
+                                    end_live(db, &self.name, live_id, stream).await;
+                                    return Ok(());
+                                }
+                                Ok(Drain::NoReceivers) => {
+                                    tracing::info!("delivery bus has no receivers; {} stops", self.name);
+                                    end_live(db, &self.name, live_id, stream).await;
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    tracing::error!("catch_up failed for {}: {}", self.name, chain(&e));
+                                    break;
+                                }
                             }
                         }
                         Some(Err(error)) => {
@@ -537,18 +563,33 @@ async fn latest_versionstamp(db: &Surreal<any::Any>, agent: &str) -> Result<i64>
     Ok(max_versionstamp(&v))
 }
 
+/// How a [`catch_up`] pass ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    /// The log is drained up to the live edge.
+    Complete,
+    /// `token` was cancelled before a delivery reached the bus.
+    Cancelled,
+    /// Every bus receiver is dropped, so a delivery cannot reach the bus.
+    NoReceivers,
+}
+
 /// Drain the durable log from `*cursor` and deliver every message addressed to
-/// `owner`, advancing + persisting the cursor past everything seen. Bounded and
-/// resumable; loops until a short page signals the live edge is reached. Because
-/// `cursor = max_seen + 1`, a delivered message is never re-read (no dedup set
-/// needed); `SHOW CHANGES` is table-wide, so non-owner changes are filtered out.
+/// `owner` onto the bus, in versionstamp order. `SHOW CHANGES` is table-wide,
+/// so non-owner changes are filtered out. The cursor is set to one past the
+/// last changeset whose deliveries all reached the bus, and persisted; a
+/// changeset holding an undelivered message is read again by the next pass.
+/// Each bus send is raced against `token`: cancellation, or a bus with no
+/// receivers, stops the pass after persisting the cursor. Loops until a short
+/// page signals the live edge is reached.
 async fn catch_up<T>(
     db: &Surreal<any::Any>,
     owner: &RecordId,
     agent: &str,
     cursor: &mut i64,
     inbox_tx: &Sender<Delivery<T>>,
-) -> Result<()>
+    token: &CancellationToken,
+) -> Result<Drain>
 where
     T: SurrealValue + Send + Sync + Unpin + 'static,
 {
@@ -575,18 +616,17 @@ where
             break;
         }
 
-        let mut max_vs = *cursor - 1;
-        for changeset in changesets.iter() {
+        let mut committed = *cursor;
+        let mut outcome = Drain::Complete;
+        'page: for changeset in changesets.iter() {
             let Value::Object(obj) = changeset else {
                 continue;
             };
-            if let Some(vs) = versionstamp_of(changeset) {
-                max_vs = max_vs.max(vs);
-            }
-            let Some(Value::Array(changes)) = obj.get("changes") else {
-                continue;
+            let changes = match obj.get("changes") {
+                Some(Value::Array(changes)) => changes.iter().as_slice(),
+                _ => &[],
             };
-            for change in changes.iter() {
+            for change in changes {
                 let Value::Object(op) = change else { continue };
                 // RELATE-created edges surface as a "create"/"update" op carrying
                 // the full record; "delete" ops (retention sweep) are skipped.
@@ -603,28 +643,46 @@ where
                 if message.out.as_ref() != Some(owner) {
                     continue; // table-wide feed — keep only ours
                 }
-                tracing::info!(target = %agent, from = ?message.r#in, "message delivered");
-                if let Err(e) = inbox_tx
-                    .send(Delivery {
-                        recipient: agent.to_string(),
-                        message,
-                    })
-                    .await
-                {
-                    tracing::debug!("inbox bus closed for {agent}: {e}");
+                let from = message.r#in.clone();
+                let delivery = Delivery {
+                    recipient: agent.to_string(),
+                    message,
+                };
+                let sent = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => Drain::Cancelled,
+                    result = inbox_tx.send(delivery) => match result {
+                        Ok(()) => Drain::Complete,
+                        Err(_) => Drain::NoReceivers,
+                    },
+                };
+                if sent != Drain::Complete {
+                    outcome = sent;
+                    break 'page;
                 }
+                tracing::info!(target = %agent, from = ?from, "message delivered");
+            }
+            if let Some(vs) = versionstamp_of(changeset) {
+                committed = committed.max(vs + 1);
             }
         }
 
-        if max_vs >= *cursor {
-            *cursor = max_vs + 1;
+        if committed > *cursor {
+            *cursor = committed;
             save_cursor(db, agent, *cursor).await?;
+        }
+        if outcome != Drain::Complete {
+            tracing::info!(
+                "catch_up for {agent} stopped at cursor {}: {outcome:?}",
+                *cursor
+            );
+            return Ok(outcome);
         }
         if page < CATCHUP_BATCH {
             break;
         }
     }
-    Ok(())
+    Ok(Drain::Complete)
 }
 
 /// Periodic age-out sweep: delete message rows older than the retention window.

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::any;
@@ -206,6 +208,8 @@ async fn test_agent_messaging() {
     scenario_handshake_race().await;
     scenario_fanout().await;
     scenario_backpressure().await;
+    scenario_startup_backlog().await;
+    scenario_full_bus_shutdown_and_replay().await;
     scenario_invalid_agent_name().await;
     scenario_bus_close().await;
     scenario_durable_restart().await;
@@ -444,6 +448,136 @@ async fn scenario_backpressure() {
     );
 
     coalition.shutdown().await;
+}
+
+/// Receive from `inbox` until `want` distinct payloads have arrived, a `recv`
+/// waits longer than `per_recv`, or the bus closes. Returns how many times each
+/// payload arrived.
+async fn recv_distinct(
+    inbox: &async_channel::Receiver<Delivery<ChatMessage>>,
+    want: usize,
+    per_recv: Duration,
+    seen: &mut HashMap<String, usize>,
+) {
+    while seen.len() < want {
+        match timeout(per_recv, inbox.recv()).await {
+            Ok(Ok(d)) => *seen.entry(d.message.payload.content).or_default() += 1,
+            _ => break,
+        }
+    }
+}
+
+/// **Startup with a backlog above bus capacity.** An agent restarted with
+/// more unread durable messages than the bus holds (300 > 256) still lets
+/// `Coalition::new` return, and the whole backlog is then delivered exactly
+/// once to a consumer that starts after `Coalition::new` returns.
+async fn scenario_startup_backlog() {
+    const N: usize = 300;
+    let names = || vec!["bl_src".to_string(), "bl_sink".to_string()];
+
+    let c1 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-1 coalition");
+    let src = c1.agent("bl_src").await.expect("bl_src in coalition");
+    c1.shutdown().await;
+    for i in 0..N {
+        src.send(
+            "bl_sink",
+            ChatMessage {
+                content: format!("bl{i}"),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("backlog send {i}: {e}"));
+    }
+
+    let c2 = timeout(
+        Duration::from_secs(30),
+        Coalition::<ChatMessage>::new(names()),
+    )
+    .await
+    .expect("Coalition::new hung with a 300-message backlog")
+    .unwrap_or_else(|e| panic!("Coalition::new with a 300-message backlog failed: {e:?}"));
+
+    let inbox = c2.inbox();
+    let mut seen = HashMap::new();
+    recv_distinct(&inbox, N, Duration::from_secs(15), &mut seen).await;
+    let missing: Vec<usize> = (0..N)
+        .filter(|i| !seen.contains_key(&format!("bl{i}")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "backlog messages never delivered after startup: {missing:?}"
+    );
+    let dups: Vec<_> = seen.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(
+        dups.is_empty(),
+        "backlog messages delivered twice: {dups:?}"
+    );
+
+    c2.shutdown().await;
+}
+
+/// **Shutdown with a full bus, then replay.** With no consumer, a sink sent 300
+/// messages fills the bus (256) and its listen loop waits on the next send.
+/// `shutdown()` still returns. The deliveries already on the bus stay readable
+/// from the old inbox; a new coalition for the same agents delivers the rest.
+/// Delivery is at-least-once: every message arrives at least once across the
+/// two inboxes.
+async fn scenario_full_bus_shutdown_and_replay() {
+    const N: usize = 300;
+    let names = || vec!["fb_src".to_string(), "fb_sink".to_string()];
+
+    let c1 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-1 coalition");
+    let inbox1 = c1.inbox();
+    let src = c1.agent("fb_src").await.expect("fb_src in coalition");
+    for i in 0..N {
+        src.send(
+            "fb_sink",
+            ChatMessage {
+                content: format!("fb{i}"),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("flood send {i}: {e}"));
+    }
+    timeout(Duration::from_secs(15), async {
+        while !inbox1.is_full() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("bus never filled; it holds {}", inbox1.len()));
+
+    timeout(Duration::from_secs(15), c1.shutdown())
+        .await
+        .expect("shutdown hung with a full bus and no consumer");
+
+    let mut seen = HashMap::new();
+    recv_distinct(&inbox1, N, Duration::from_secs(1), &mut seen).await;
+    let from_old_bus = seen.len();
+
+    let c2 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-2 coalition (restart)");
+    let inbox2 = c2.inbox();
+    recv_distinct(&inbox2, N, Duration::from_secs(15), &mut seen).await;
+    let missing: Vec<usize> = (0..N)
+        .filter(|i| !seen.contains_key(&format!("fb{i}")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "messages lost across shutdown + restart ({from_old_bus} read from the old bus): {missing:?}"
+    );
+    let dups = seen.values().filter(|n| **n > 1).count();
+    eprintln!(
+        "FULL_BUS_REPLAY old_bus={from_old_bus} distinct={} duplicates={dups}",
+        seen.len()
+    );
+
+    c2.shutdown().await;
 }
 
 /// **Invalid agent name is rejected.** `Agent::new` (via `Coalition::new`)

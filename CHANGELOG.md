@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliveries and then `Err(RecvError)`.
 - Remove the `kanal` git dependency; add `async-channel` 2.5.
 
+### Fixed
+
+- `Coalition::new` returns when an agent's durable backlog exceeds the bus
+  capacity: each listen loop signals readiness after its first LIVE
+  subscribe, before the backlog drain.
+- `Coalition::shutdown` returns when the bus is full and nothing consumes it:
+  each bus send in the catch-up is raced against the cancellation token.
+- The persisted cursor never passes a message that did not reach the bus. A
+  catch-up stopped by cancellation, or by a bus with no receivers, saves the
+  cursor at the first changeset with an undelivered message, which the next
+  catch-up delivers again.
+
 ## [0.3.0] - 2026-10-28
 
 ### Changed
