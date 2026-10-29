@@ -99,8 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Two-tier durable message bus** — delivery reads a durable log across
-  disconnects *and* restarts, replacing the previous at-most-once LIVE
+- **Two-tier durable message bus** — delivery is now at-least-once + idempotent
+  across disconnects *and* restarts, replacing the previous at-most-once LIVE
   behaviour (a message published while an agent was disconnected was silently
   lost; see the SurrealDB `live-queries` skill, "Delivery guarantees").
   - The `message` edge table is the durable log, backed by a `CHANGEFEED`
@@ -116,7 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Agent::new` is now restart-idempotent (reuses an existing agent record) so a
     restarted coalition resumes its durable cursors.
   - `Message<T>` gains an `id: Option<RecordId>` field, populated on delivery, so
-    consumers can identify/deduplicate a delivery.
+    consumers can identify/deduplicate under the at-least-once guarantee.
   - New setting `sdb.message_retention_secs` (default `86400`).
 
 ### Changed
