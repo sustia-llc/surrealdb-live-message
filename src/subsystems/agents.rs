@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use surrealdb::engine::any;
 use surrealdb::method::QueryStream;
 use surrealdb::{Notification, Surreal};
-use surrealdb_types::{Datetime, RecordId, SurrealValue, Uuid, Value};
+use surrealdb_types::{Datetime, Object, RecordId, SurrealValue, Uuid, Value};
 use tokio::sync::{RwLock, oneshot};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -396,10 +396,7 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         ready_timeout: Duration,
         cancellation_token: CancellationToken,
     ) -> Result<Self> {
-        let mut unique = std::collections::HashSet::with_capacity(names.len());
-        if let Some(name) = names.iter().find(|n| !unique.insert(n.as_str())) {
-            return Err(Error::DuplicateAgentName { name: name.clone() });
-        }
+        reject_duplicate_names(&names)?;
         let agents = Arc::new(RwLock::new(HashMap::new()));
         let task_tracker = TaskTracker::new();
 
@@ -501,6 +498,16 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Drop for Coalition<T> {
     }
 }
 
+/// Return [`Error::DuplicateAgentName`] for the first name in `names` that
+/// appears earlier in `names`, else `Ok(())`.
+fn reject_duplicate_names(names: &[String]) -> Result<()> {
+    let mut unique = std::collections::HashSet::with_capacity(names.len());
+    match names.iter().find(|n| !unique.insert(n.as_str())) {
+        Some(name) => Err(Error::DuplicateAgentName { name: name.clone() }),
+        None => Ok(()),
+    }
+}
+
 /// Tear down a coalition whose construction failed: cancel `token`, close
 /// `tracker`, and wait for every task it spawned to end.
 async fn abort_build(token: &CancellationToken, tracker: &TaskTracker) {
@@ -594,10 +601,15 @@ fn reply_error(message: String) -> Box<surrealdb::Error> {
 /// changeset) `Value::Object`.
 fn versionstamp_of(v: &Value) -> Option<i64> {
     match v {
-        Value::Object(o) => match o.get("versionstamp") {
-            Some(Value::Number(n)) => n.to_int(),
-            _ => None,
-        },
+        Value::Object(o) => object_versionstamp(o),
+        _ => None,
+    }
+}
+
+/// The integer `versionstamp` field of `o`, if present.
+fn object_versionstamp(o: &Object) -> Option<i64> {
+    match o.get("versionstamp") {
+        Some(Value::Number(n)) => n.to_int(),
         _ => None,
     }
 }
@@ -899,16 +911,22 @@ where
     let mut committed = *cursor;
     let mut stopped = None;
     'page: for mut changeset in page {
-        // `versionstamp_of` returns `None` for anything but an object.
-        let Some(vs) = versionstamp_of(&changeset) else {
+        let obj = match &mut changeset {
+            Value::Object(obj) => obj,
+            other => {
+                tracing::error!(
+                    "catch_up for {agent}: changeset is not an object with an integer \
+                     versionstamp, skipped: {other:?}"
+                );
+                continue;
+            }
+        };
+        let Some(vs) = object_versionstamp(obj) else {
             tracing::error!(
                 "catch_up for {agent}: changeset is not an object with an integer \
-                 versionstamp, skipped: {changeset:?}"
+                 versionstamp, skipped: {obj:?}"
             );
             continue;
-        };
-        let Value::Object(obj) = &mut changeset else {
-            unreachable!("invariant: versionstamp_of returned Some, so the changeset is an object");
         };
         let skip = if vs == page_start.versionstamp {
             usize::try_from(page_start.change_index).expect(
@@ -1276,23 +1294,21 @@ mod tests {
         }
     }
 
-    /// A repeated name fails [`Coalition::new`] with
-    /// [`Error::DuplicateAgentName`] before any database call: no SurrealDB
-    /// server runs for this test, so reaching `Agent::new` does not return
-    /// `DuplicateAgentName`.
-    #[tokio::test]
-    async fn coalition_rejects_a_duplicate_name_before_any_work() {
-        let result = timeout(
-            Duration::from_secs(5),
-            Coalition::<String>::new(vec!["ann".to_string(), "bo".to_string(), "ann".to_string()]),
-        )
-        .await
-        .expect("Coalition::new reached the database instead of rejecting the duplicate");
-        match result {
-            Err(Error::DuplicateAgentName { name }) => assert_eq!(name, "ann"),
-            Err(e) => panic!("expected DuplicateAgentName for 'ann', got {e:?}"),
-            Ok(_) => panic!("a duplicate name must be rejected"),
-        }
+    /// [`reject_duplicate_names`] returns [`Error::DuplicateAgentName`] for
+    /// the first repeated name and `Ok(())` when every name is distinct.
+    #[test]
+    fn reject_duplicate_names_finds_the_first_repeat() {
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let repeated = reject_duplicate_names(&names(&["ann", "bo", "cy", "bo", "ann"]));
+        assert!(
+            matches!(&repeated, Err(Error::DuplicateAgentName { name }) if name == "bo"),
+            "expected DuplicateAgentName for 'bo', got {repeated:?}"
+        );
+        let distinct = reject_duplicate_names(&names(&["ann", "bo", "cy"]));
+        assert!(
+            distinct.is_ok(),
+            "distinct names must be accepted, got {distinct:?}"
+        );
     }
 
     /// [`deliver_page`] on a crafted page: `delete` and `define_table` ops and a
