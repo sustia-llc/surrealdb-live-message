@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- If the `RELATE` statement fails, `Agent::send` returns `Error::Send`. It
+  previously returned `Ok(())` and no edge existed.
 - For a new agent, the cursor starts after the highest versionstamp in the
   whole `message` changefeed. The read ends on a page with fewer than 1000
   changesets. This needs a database where `message` is the one table with a

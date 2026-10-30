@@ -20,8 +20,8 @@ use crate::subsystems::sdb;
 
 pub const AGENT_TABLE: &str = "agent";
 
-/// Maximum time `Coalition::new` waits for each `listen_loop` to send its
-/// ready signal.
+/// Maximum time `Coalition::new` waits for each database call of `Agent::new`,
+/// and for each `listen_loop` to send its ready signal.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Capacity of the shared MPMC delivery bus connecting agent listen loops to
@@ -93,7 +93,7 @@ impl Agent {
     /// [`Error::AgentCreate`] when a database call fails (the cursor or agent
     /// existence check, a changefeed page, the transaction, or the read of
     /// the agent record), with that call's error as its source, or when a
-    /// changefeed page is not an array, is a full page with no integer
+    /// changefeed page is not an array, is a full page with no numeric
     /// versionstamp, or ends below its `SINCE` or at `i64::MAX`, in which case
     /// neither record is written;
     /// [`Error::AgentCreateEmpty`] when the agent record reads back as absent.
@@ -227,7 +227,8 @@ impl Agent {
     ///
     /// Rejects unknown recipients: if no `agent` record exists for `to`, returns
     /// [`Error::UnknownRecipient`] instead of creating an edge with a dangling
-    /// `out` pointer.
+    /// `out` pointer. Returns [`Error::Send`] when the recipient lookup or the
+    /// `RELATE` fails, as a call or as a statement.
     pub async fn send<T>(&self, to: &str, payload: T) -> Result<()>
     where
         T: SurrealValue + Send + Sync + Unpin + 'static,
@@ -258,6 +259,7 @@ impl Agent {
             .bind(("to", to_id))
             .bind(("payload", payload))
             .await
+            .and_then(|r| r.check())
             .map_err(|source| Error::Send {
                 to: to.to_string(),
                 source: Box::new(source),
@@ -500,7 +502,7 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// created or spawned.
     ///
     /// Each database call of [`Agent::new`] (each changefeed page among them)
-    /// is bounded by the 10 s ready timeout, which returns
+    /// is bounded by `READY_TIMEOUT`, which returns
     /// [`Error::AgentCreateTimeout`] for that agent, and raced against the
     /// coalition's token. The changefeed is read at most once, for the first
     /// new agent, and that result starts each later new agent. After the last
@@ -510,15 +512,16 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// point, and puts nothing on the bus, until every loop has signalled
     /// ready; this then sends the start signal and returns `Ok`. On any
     /// failure it cancels every spawned loop and waits for each to end before
-    /// it returns the error. The first error these waits see (including
-    /// [`Error::Cancelled`]) ends the waits and is returned after that teardown,
-    /// in preference to [`Error::ReadyTimeout`] and [`Error::ListenLoopDropped`]; among
-    /// those two, the one for the earliest name in `names` is returned.
+    /// it returns the error. The first error a loop sent that these waits see
+    /// (including [`Error::Cancelled`]) ends the waits and is returned after
+    /// that teardown, in preference to [`Error::ReadyTimeout`] and
+    /// [`Error::ListenLoopDropped`]; among those two, the one for the earliest
+    /// name in `names` is returned.
     ///
-    /// A token cancelled before every loop is ready returns, unless the waits
-    /// see another sent error or `ListenLoopDropped`, [`Error::Cancelled`]: with `agent: None` when the token is
-    /// cancelled before any database call (it is checked first) or when it is
-    /// found cancelled after the readiness waits end in `Ok` or
+    /// For names that pass validation, a token cancelled before every loop is
+    /// ready returns, unless the waits see another sent error or
+    /// `ListenLoopDropped`, [`Error::Cancelled`]: with `agent: None` when the
+    /// token is cancelled before any database call or when it is found cancelled after the readiness waits end in `Ok` or
     /// `ReadyTimeout`; with `agent: Some(name)` when the cancel
     /// interrupts that agent's `Agent::new` call or its loop's startup.
     /// Dropping the returned future before it completes cancels the token,
@@ -528,9 +531,9 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         Self::new_with_ready_timeout(names, READY_TIMEOUT).await
     }
 
-    /// Like [`Coalition::new`], with `ready_timeout` in place of the 10 s
-    /// ready timeout for each database call of `Agent::new` and each readiness
-    /// wait.
+    /// Like [`Coalition::new`], with `ready_timeout` in place of
+    /// `READY_TIMEOUT` for each database call of `Agent::new` and each
+    /// readiness wait.
     pub async fn new_with_ready_timeout(
         names: Vec<String>,
         ready_timeout: Duration,
@@ -539,9 +542,9 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     }
 
     /// Like [`Coalition::new`], with a root token that is a child of
-    /// `parent`: cancelling `parent` cancels the coalition. A `parent` that is
-    /// already cancelled returns [`Error::Cancelled`] with `agent: None`
-    /// before any database call.
+    /// `parent`: cancelling `parent` cancels the coalition. With no repeated
+    /// name, a `parent` that is already cancelled returns [`Error::Cancelled`]
+    /// with `agent: None` before any database call.
     pub async fn new_with_parent(names: Vec<String>, parent: &CancellationToken) -> Result<Self> {
         Self::build(names, READY_TIMEOUT, parent.child_token()).await
     }
@@ -875,7 +878,7 @@ fn versionstamp_of(v: &Value) -> Option<i64> {
     }
 }
 
-/// The numeric `versionstamp` field of `o`, truncated to `i64`, if present.
+/// The numeric `versionstamp` field of `o`, if present.
 fn object_versionstamp(o: &Object) -> Option<i64> {
     match o.get("versionstamp") {
         Some(Value::Number(n)) => n.to_int(),
@@ -904,8 +907,8 @@ fn position_within(index: i64, max: u64) -> Option<i64> {
         .map(|_| index)
 }
 
-/// Parse a `cursor` row: an object with a non-negative integer `versionstamp`
-/// and an optional non-negative integer `change_index` (absent → 0) that fits
+/// Parse a `cursor` row: an object with a non-negative numeric `versionstamp`
+/// and an optional non-negative numeric `change_index` (absent → 0) that fits
 /// `usize`. Any other shape returns [`Error::CursorLoad`] for `agent`.
 fn parse_cursor(agent: &str, row: &Value) -> Result<Cursor> {
     let malformed = || Error::CursorLoad {
@@ -948,7 +951,7 @@ async fn save_cursor(db: &Surreal<any::Any>, agent: &str, cursor: Cursor) -> Res
     Ok(())
 }
 
-/// What [`page_highest`] reads from one snapshot page: its highest integer
+/// What [`page_highest`] reads from one snapshot page: its highest numeric
 /// versionstamp, and whether it holds [`CATCHUP_BATCH`] changesets or more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotPage {
@@ -1239,7 +1242,7 @@ const NON_MESSAGE_OPS: [&str; 2] = ["delete", "define_table"];
 /// skipped, and the cursor passes it only by moving to a later changeset's
 /// position.
 ///
-/// Malformed-data rule: a changeset that is not an object or has no integer
+/// Malformed-data rule: a changeset that is not an object or has no numeric
 /// versionstamp, a `changes` field that is missing or not an array, a change
 /// that is not an object or has no `update`, `delete` or `define_table` key, a
 /// record that is not an object, a record whose `out` is missing or not a
@@ -1901,8 +1904,8 @@ mod tests {
         }
     }
 
-    /// [`page_highest`] logs each changeset with no integer versionstamp at
-    /// error level and skips it. With no integer versionstamp in a full page
+    /// [`page_highest`] logs each changeset with no numeric versionstamp at
+    /// error level and skips it. With no numeric versionstamp in a full page
     /// it returns [`Error::AgentCreate`]; in a short page it returns no
     /// position.
     #[test]
@@ -1989,7 +1992,7 @@ mod tests {
     /// above the last highest, and ends on a short or an empty page: pages of
     /// 1000, 1000 and 3 changesets take 3 reads, a feed of exactly one full
     /// page takes 2, an empty feed takes 1, and a feed that gains a changeset
-    /// before each read still ends. A short page with no integer versionstamp
+    /// before each read still ends. A short page with no numeric versionstamp
     /// logs at error and ends the read at the last position.
     #[tokio::test(flavor = "current_thread")]
     async fn latest_versionstamp_pages_until_a_short_reply() {
@@ -2189,7 +2192,7 @@ mod tests {
     }
 
     /// [`Agent::create_on`] with a snapshot reply that is not an array, or a
-    /// full one that holds no integer versionstamp, returns
+    /// full one that holds no numeric versionstamp, returns
     /// [`Error::AgentCreate`] and writes neither record; with a well-formed
     /// feed it writes both, the cursor 1 above the feed's highest
     /// versionstamp.
@@ -3088,7 +3091,7 @@ mod tests {
 
     /// [`parse_cursor`] reads `versionstamp` and `change_index`, defaults a
     /// missing `change_index` to 0, and rejects a non-object row, a missing,
-    /// non-integer or negative `versionstamp`, and a non-integer or negative
+    /// non-numeric or negative `versionstamp`, and a non-numeric or negative
     /// `change_index`; and [`position_within`] with `max = u32::MAX` accepts
     /// 0 and `u32::MAX` and rejects `u32::MAX + 1` and -1.
     #[test]

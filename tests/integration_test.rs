@@ -206,6 +206,7 @@ async fn test_agent_messaging() {
     scenario_lost_cursor_replays_backlog(db).await;
     scenario_unknown_agent(db, &alice).await;
     scenario_schema_enforcement(db).await;
+    scenario_statement_failure_fails_send(db).await;
     scenario_handshake_race().await;
     scenario_fanout().await;
     scenario_backpressure().await;
@@ -334,6 +335,82 @@ async fn scenario_schema_enforcement(db: &Surreal<any::Any>) {
         Err(_) => true,
     };
     assert!(rejected, "non-datetime `created` must be rejected");
+}
+
+/// Number of `message` edges from `agent:sf_src` whose payload is `content`.
+async fn sf_edges(db: &Surreal<any::Any>, content: &str) -> usize {
+    let edges: Vec<Message<ChatMessage>> = db
+        .query(
+            "SELECT *, in, out FROM message WHERE in = agent:sf_src AND payload.content = $content",
+        )
+        .bind(("content", content.to_string()))
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    edges.len()
+}
+
+/// **A `RELATE` statement that fails fails the send.** A `DEFINE EVENT` on
+/// `message` throws for one marked payload. `Agent::send` of that payload
+/// returns [`Error::Send`] with the thrown text in its source chain and creates
+/// no edge. A send of another payload under the same event creates its edge.
+async fn scenario_statement_failure_fails_send(db: &Surreal<any::Any>) {
+    const MARKED: &str = "sf_marked";
+    const UNMARKED: &str = "sf_unmarked";
+    const THROWN: &str = "sf_statement_failed";
+
+    let src = Agent::new("sf_src").await.expect("create sf_src");
+    Agent::new("sf_dst").await.expect("create sf_dst");
+
+    db.query(format!(
+        "DEFINE EVENT OVERWRITE reject_marked ON {MESSAGE_TABLE} \
+         WHEN $after.payload.content = '{MARKED}' THEN {{ THROW '{THROWN}' }}"
+    ))
+    .await
+    .and_then(|r| r.check())
+    .expect("define the rejecting event");
+
+    let chat = |content: &str| ChatMessage {
+        content: content.to_string(),
+    };
+    let marked = src.send("sf_dst", chat(MARKED)).await;
+    let unmarked = src.send("sf_dst", chat(UNMARKED)).await;
+
+    db.query(format!(
+        "REMOVE EVENT IF EXISTS reject_marked ON {MESSAGE_TABLE}"
+    ))
+    .await
+    .and_then(|r| r.check())
+    .expect("remove the rejecting event");
+
+    let err = match marked {
+        Ok(()) => panic!(
+            "a send whose RELATE statement fails must return Error::Send; it returned Ok(()) \
+             and {} edges exist",
+            sf_edges(db, MARKED).await
+        ),
+        Err(e) => e,
+    };
+    let Error::Send { to, .. } = &err else {
+        panic!("expected Error::Send, got {err:?}");
+    };
+    assert_eq!(to, "sf_dst");
+    let chain: Vec<String> = std::iter::successors(std::error::Error::source(&err), |e| e.source())
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        chain.iter().any(|m| m.contains(THROWN)),
+        "the source chain must hold the statement's error `{THROWN}`; it is {chain:?}"
+    );
+
+    assert_eq!(sf_edges(db, MARKED).await, 0, "edges for the rejected send");
+    unmarked.expect("a send the event does not reject");
+    assert_eq!(
+        sf_edges(db, UNMARKED).await,
+        1,
+        "edges for the accepted send"
+    );
 }
 
 /// **Delivery races the handshake.** Send *immediately* after `Coalition::new`

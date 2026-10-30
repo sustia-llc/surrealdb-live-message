@@ -5,7 +5,7 @@
 //! - `sdb_task` spawned with a `child_token()` so the database lifecycle is
 //!   independently cancellable.
 //! - A three-arm startup `select!` that races DB readiness, sdb task failure,
-//!   and a hard startup timeout — no path can hang forever.
+//!   and a hard startup timeout, so the wait for the DB ends.
 //! - Correct shutdown ORDER: `coalition.shutdown()` first (agent listen-loops
 //!   that hold a subscribed stream persist their cursors and KILL their live
 //!   queries while the DB is still up), then cancel the sdb
