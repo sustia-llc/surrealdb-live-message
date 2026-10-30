@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changesets. This needs a database where `message` is the one table with a
   changefeed. It previously used the first page, at most 1000 changesets, so a
   longer feed replayed its remainder. A `Coalition::new` reads the feed at most
-  once. An existing agent with no cursor reads no feed.
+  once. An agent that the existence check finds, with no cursor, reads no feed.
 - `Agent::new` returns `Error::AgentCreate` for a changefeed page that is not
   an array, a full page with no numeric versionstamp, and a page whose highest
   versionstamp is below its `SINCE` or is `i64::MAX`. It writes neither record.

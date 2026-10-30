@@ -83,8 +83,8 @@ impl Agent {
     /// the whole `message` changefeed at the time of the read (1 for an empty
     /// feed), read in pages until a page holds fewer than 1000 changesets, in
     /// a database where `message` is the one table with a changefeed; for an
-    /// agent whose record already existed, at versionstamp 0 with no changefeed
-    /// read, so the next catch-up reads the whole retained changefeed, and
+    /// agent whose record already existed, at versionstamp 0, with no changefeed
+    /// read if the existence check finds it, so the next catch-up reads the whole retained changefeed, and
     /// that start is logged at warn with the agent and the position as fields.
     /// Both records are written in one transaction, so this does not write
     /// `agent:<name>` without `cursor:<name>`.
@@ -521,8 +521,8 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// For names that pass validation, a token cancelled before every loop is
     /// ready returns, unless the waits see another sent error or
     /// `ListenLoopDropped`, [`Error::Cancelled`]: with `agent: None` when the
-    /// token is cancelled before any database call or when it is found cancelled after the readiness waits end in `Ok` or
-    /// `ReadyTimeout`; with `agent: Some(name)` when the cancel
+    /// token is cancelled before any database call or when it is found
+    /// cancelled after the readiness waits end in `Ok` or `ReadyTimeout`; with `agent: Some(name)` when the cancel
     /// interrupts that agent's `Agent::new` call or its loop's startup.
     /// Dropping the returned future before it completes cancels the token,
     /// which ends every spawned loop and the retention sweep; the drop does
@@ -907,9 +907,9 @@ fn position_within(index: i64, max: u64) -> Option<i64> {
         .map(|_| index)
 }
 
-/// Parse a `cursor` row: an object with a non-negative numeric `versionstamp`
-/// and an optional non-negative numeric `change_index` (absent → 0) that fits
-/// `usize`. Any other shape returns [`Error::CursorLoad`] for `agent`.
+/// Parse a `cursor` row: an object with a `versionstamp` number and an optional
+/// `change_index` number (absent → 0), each non-negative after
+/// `Number::to_int`, with `change_index` fitting `usize`. Any other shape returns [`Error::CursorLoad`] for `agent`.
 fn parse_cursor(agent: &str, row: &Value) -> Result<Cursor> {
     let malformed = || Error::CursorLoad {
         agent: agent.to_string(),
@@ -3091,7 +3091,7 @@ mod tests {
 
     /// [`parse_cursor`] reads `versionstamp` and `change_index`, defaults a
     /// missing `change_index` to 0, and rejects a non-object row, a missing,
-    /// non-numeric or negative `versionstamp`, and a non-numeric or negative
+    /// non-numeric or -1 `versionstamp`, and a non-numeric or -1
     /// `change_index`; and [`position_within`] with `max = u32::MAX` accepts
     /// 0 and `u32::MAX` and rejects `u32::MAX + 1` and -1.
     #[test]
