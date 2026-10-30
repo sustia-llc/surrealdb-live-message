@@ -2,18 +2,80 @@
 
 A light message layer for multi-agent interaction, built on SurrealDB. Messages are first-class graph edges: agents send to one another by establishing a `RELATE` relation.
 
-Delivery is a **two-tier durable bus**: the `message` table is a `CHANGEFEED`-backed durable log, a `LIVE SELECT` is a low-latency *wake-up*, and the sole delivery path is a `SHOW CHANGES … SINCE <cursor>` catch-up that advances a **persisted per-agent cursor** (versionstamp, change index). The cursor passes a message addressed to the agent only after its delivery is on the in-process bus, so a message published while an agent is offline is put on the bus on reconnect, where plain `LIVE` alone is at-most-once with no replay. Malformed data follows one rule, log at error level and skip: a changeset that is not an object or has no numeric versionstamp (it has no position; the cursor passes it only by moving to a later changeset), a missing or non-array `changes`, a change that is not an object or whose op key is not `update`, `delete` or `define_table`, a record that is not an object, a record whose `out` is missing or not a record id, and a message whose payload does not decode as `T`. `delete` and `define_table` ops and messages for other agents are skipped without a log. Each `update` op of a message record for the agent is one delivery, so a message record updated after creation is delivered again. A stop by cancellation, or by a closed bus, persists the cursor at the first change not on the bus, so for message records that are only created the next run neither skips nor repeats a message; if that save fails, the persisted cursor stays at its previous saved position and the messages sent since then are put on the bus again. The cursor is persisted once per catch-up page: if the process exits mid-page, that page's already-sent messages are put on the bus again after restart. Deliveries already on the bus are **not** replayed: they are lost if the process exits, or every receiver is dropped, before a consumer reads them. `close()` on any receiver stops further sends, and the queued deliveries stay readable. (See the SurrealDB `live-queries` skill, "Delivery guarantees".)
+Delivery is a **two-tier durable bus** with three parts:
 
-As of the 2026-04 library-first refactor, the library exposes a `Coalition<T: SurrealValue>` surface rather than a `tokio-graceful-shutdown` subsystem. Callers wire their own top-level shutdown (bare `tokio::signal::ctrl_c`, parent token, or wrap in their preferred framework); the library hands back a `CancellationToken` and a three-step `shutdown().await`.
+- The `message` table is a `CHANGEFEED`-backed durable log.
+- A `LIVE SELECT` is a low-latency *wake-up*.
+- The sole delivery path is a `SHOW CHANGES … SINCE <cursor>` catch-up. It advances a **persisted per-agent cursor** (versionstamp, change index).
+
+The cursor passes a message addressed to the agent only after its delivery is on the in-process bus. So a message published while an agent is offline is put on the bus on reconnect. Plain `LIVE` alone is at-most-once with no replay.
+
+Malformed data follows one rule: log at error level and skip. The rule covers these cases:
+
+- A changeset that is not an object or has no numeric versionstamp. Such a changeset has no position, so the cursor passes it only by moving to a later changeset.
+- A missing or non-array `changes`.
+- A change that is not an object, or whose op key is not `update`, `delete` or `define_table`.
+- A record that is not an object.
+- A record whose `out` is missing or not a record id.
+- A message whose payload does not decode as `T`.
+
+`delete` and `define_table` ops and messages for other agents are skipped without a log. Each `update` op of a message record for the agent is one delivery, so a message record updated after creation is delivered again.
+
+A stop by cancellation or by a closed bus persists the cursor at the first change not on the bus. For message records that are only created, the next run then neither skips nor repeats a message. If that save fails, the persisted cursor stays at its previous saved position, and the messages sent since then are put on the bus again.
+
+The cursor is persisted once per catch-up page. If the process exits mid-page, that page's already-sent messages are put on the bus again after restart.
+
+Deliveries already on the bus are **not** replayed. If the process exits, or every receiver is dropped, before a consumer reads them, they are lost. `close()` on any receiver stops further sends, and the queued deliveries stay readable. (See the SurrealDB `live-queries` skill, "Delivery guarantees".)
+
+Since the 2026-04 library-first refactor, the library exposes a `Coalition<T: SurrealValue>` surface in place of a `tokio-graceful-shutdown` subsystem. Callers wire their own top-level shutdown: bare `tokio::signal::ctrl_c`, a parent token, or their preferred framework. The library hands back a `CancellationToken` and a three-step `shutdown().await`.
 
 ## Architecture
 
-- **`Message<T: SurrealValue>`** — payload-generic edge record. `T` is the caller's typed payload; `id` is populated on delivery (from the changefeed record) so consumers can identify and deduplicate a delivery put on the bus more than once.
-- **`Agent::new(name)`** — validates `name` (non-empty, ASCII alphanumeric or `_`; rejects with `Error::InvalidAgentName`), then **reuses an existing `agent` record or creates one** (restart-idempotent, so a restarted coalition resumes its durable cursors). When `cursor:<name>` is absent it creates it: for a new agent, after the highest versionstamp in the whole `message` changefeed, read in pages until a page holds fewer than 1000 changesets, in a database where `message` is the one table with a changefeed; for an existing agent, at versionstamp 0, with no changefeed read if the existence check finds it, so its retained backlog is delivered, with a warn log. An existing cursor is kept. The agent record and the cursor are written in one transaction, so `Agent::new` does not write an `agent` record without its cursor.
-- **`Agent::send<T>(to, payload)`** — issues a typed `RELATE $from -> message -> $to CONTENT { ... }`. Rejects unknown recipients (`Error::UnknownRecipient`) instead of creating a dangling `out` edge. Returns `Error::Send` when the `RELATE` fails, as a call or as a statement.
-- **`Agent::listen_loop<T>(token, ready_tx, start, inbox_tx)`** (private; spawned by `Coalition::new`) — the two-tier durable bus. A `LIVE SELECT … WHERE out = $owner` (owner bound as a parameter, never string-interpolated) acts as a wake-up; each wake (and each **reconnect**, with capped exponential backoff) runs a `SHOW CHANGES FOR TABLE message SINCE <versionstamp>` catch-up that sends every message addressed to the agent onto `inbox_tx`, logging at error level and skipping malformed data (see above). Its cursor (`cursor:<agent>`: `versionstamp`, `change_index`) is persisted after each page at the first change not yet on the bus. It loads its cursor (a missing `cursor:<agent>` row fails with `Error::CursorLoad`). `ready_tx` receives `Ok(())` after the first catch-up page query succeeds, or the startup error if one occurs first, or `Error::Cancelled` naming the agent if the token is cancelled first; every await before then is raced against the token, and a cancel is sent before any cleanup await. After `Ok(())` the loop puts nothing on the bus until `Coalition::new` opens the `start` signal, and it ends if its ready send fails. Runs until `token.cancelled()`; messages are **never deleted here**.
-- **`Coalition<T>`** — registry + `TaskTracker` + root `CancellationToken` + per-spawn `child_token()`. `new()` performs a oneshot readiness handshake with every listen loop before returning, so the first `Agent::send` after `Coalition::new()` is guaranteed to be observed. No delivery reaches the bus before `new()` returns `Ok`: each loop waits at its ready point for a start signal that `new()` sends once every loop is ready, and a failed `new()` moves no cursor past a message that was not on the bus. For names that pass validation, if the token is cancelled before every loop is ready, and the waits see no other sent error or `Error::ListenLoopDropped`, `new()` returns `Error::Cancelled`: `agent: None` for a `new_with_parent` parent that is already cancelled (checked before any database call) or a cancel found after every readiness wait ended in `Ok` or `Error::ReadyTimeout`, `agent: Some(name)` when the cancel interrupts that agent's `Agent::new` or its loop's startup. Each database call of `Agent::new`, each changefeed page among them, is bounded by the ready timeout (`Error::AgentCreateTimeout`), and each listen-loop startup await is raced against the token and covered by the readiness wait (`Error::ReadyTimeout`), so a startup database call that never completes does not stop `new()` from returning an error. The readiness waits start after the last `Agent::new` call. The first error a loop sent that those waits see (including `Error::Cancelled`) ends them and is returned after the teardown, in preference to `Error::ReadyTimeout` and `Error::ListenLoopDropped`; `Error::ListenLoopDropped` means a loop ended without a ready signal and without a cancel. Dropping the `new()` future cancels every spawned loop and the retention sweep without waiting for them. It also spawns one **retention sweep** task that ages out the durable log (`DELETE message WHERE created < now - sdb.message_retention_secs`, default 24h). `shutdown().await` cancels the root token and waits for these tasks; dropping a `Coalition` cancels the root token without waiting. `new_with_parent(names, &parent)` makes the root token a child of `parent`.
-- **`sdb_task(token)`** — SurrealDB container/connection lifecycle as a plain async task. Defines the schema, including the `message` `CHANGEFEED` window and the `cursor` table.
+**`Message<T: SurrealValue>`** is a payload-generic edge record. `T` is the caller's typed payload. `id` is populated on delivery from the changefeed record, so consumers can identify and deduplicate a delivery put on the bus more than once.
+
+**`Agent::new(name)`** works in these steps:
+
+- It validates `name`, which must be non-empty ASCII alphanumeric or `_`. A rejected name returns `Error::InvalidAgentName`.
+- It **reuses an existing `agent` record or creates one**. It is restart-idempotent, so a restarted coalition resumes its durable cursors.
+- If `cursor:<name>` is absent, it creates that cursor. An existing cursor is kept.
+- A new agent starts after the highest versionstamp in the whole `message` changefeed. The read goes in pages until a page holds fewer than 1000 changesets. This needs a database where `message` is the one table with a changefeed.
+- An existing agent starts at versionstamp 0, so its retained backlog is delivered, with a warn log. If the first lookup finds the agent, there is no changefeed read.
+- The agent record and the cursor are written in one transaction, so `Agent::new` does not write an `agent` record without its cursor.
+
+**`Agent::send<T>(to, payload)`** issues a typed `RELATE $from -> message -> $to CONTENT { ... }`. It rejects unknown recipients with `Error::UnknownRecipient` in place of a dangling `out` edge. If the `RELATE` fails, as a call or as a statement, it returns `Error::Send`.
+
+**`Agent::listen_loop<T>(token, ready_tx, start, inbox_tx)`** is private, and `Coalition::new` spawns it. It is the two-tier durable bus:
+
+- A `LIVE SELECT … WHERE out = $owner` acts as a wake-up. The owner is bound as a parameter and is never string-interpolated.
+- Each wake, and each **reconnect** with capped exponential backoff, runs a `SHOW CHANGES FOR TABLE message SINCE <versionstamp>` catch-up. The catch-up sends every message addressed to the agent onto `inbox_tx`. It logs malformed data at error level and skips it, as described above.
+- The cursor (`cursor:<agent>`: `versionstamp`, `change_index`) is persisted after each page at the first change not yet on the bus.
+- A missing `cursor:<agent>` row fails with `Error::CursorLoad`.
+- `ready_tx` receives `Ok(())` after the first catch-up page query succeeds. If a startup error occurs first, it receives that error. If the token is cancelled first, it receives `Error::Cancelled` naming the agent.
+- Every await before then is raced against the token, and a cancel is sent before any cleanup await.
+- After `Ok(())`, the loop puts nothing on the bus until `Coalition::new` opens the `start` signal. If its ready send fails, the loop ends.
+- It runs until `token.cancelled()`. Messages are **never deleted here**.
+
+**`Coalition<T>`** holds a registry, a `TaskTracker`, a root `CancellationToken` and a per-spawn `child_token()`. Its startup and shutdown follow these rules:
+
+- `new()` performs a oneshot readiness handshake with every listen loop before it returns, so the first `Agent::send` after `Coalition::new()` is guaranteed to be observed.
+- No delivery reaches the bus before `new()` returns `Ok`. Each loop waits at its ready point for a start signal, which `new()` sends once every loop is ready.
+- A failed `new()` moves no cursor past a message that was not on the bus.
+- Each database call of `Agent::new`, each changefeed page among them, is bounded by the ready timeout (`Error::AgentCreateTimeout`).
+- Each listen-loop startup await is raced against the token and covered by the readiness wait (`Error::ReadyTimeout`). So a startup database call that never completes does not stop `new()` from returning an error.
+- The readiness waits start after the last `Agent::new` call. The first error a loop sent that those waits see (including `Error::Cancelled`) ends them. That error is returned after the teardown, in preference to `Error::ReadyTimeout` and `Error::ListenLoopDropped`.
+- `Error::ListenLoopDropped` means a loop ended without a ready signal and without a cancel.
+- Dropping the `new()` future cancels every spawned loop and the retention sweep without waiting for them.
+- `new()` also spawns one **retention sweep** task that ages out the durable log (`DELETE message WHERE created < now - sdb.message_retention_secs`, default 24h).
+- `shutdown().await` cancels the root token and waits for these tasks. Dropping a `Coalition` cancels the root token without waiting.
+- `new_with_parent(names, &parent)` makes the root token a child of `parent`.
+
+For names that pass validation, a cancel before every loop is ready returns `Error::Cancelled`, unless the waits see another sent error or `Error::ListenLoopDropped`. The `agent` field is set as follows:
+
+- `agent: None` for a `new_with_parent` parent that is already cancelled, found before any database call.
+- `agent: None` for a cancel found after every readiness wait ended in `Ok` or `Error::ReadyTimeout`.
+- `agent: Some(name)` for a cancel that interrupts the `Agent::new` of that agent or the startup of its loop.
+
+**`sdb_task(token)`** runs the SurrealDB container and connection lifecycle as a plain async task. It defines the schema, including the `message` `CHANGEFEED` window and the `cursor` table.
 
 See the integration test for an end-to-end library-first usage.
 
@@ -86,15 +148,15 @@ SELECT *, in, out FROM message;
 
 ## Examples
 
-`cargo run` (above) is the minimal demo — bare `ctrl_c`. Seven runnable examples
-live in `examples/` (each needs Docker; each spins up and tears down its own
-SurrealDB container).
+`cargo run` (above) is the minimal demo, with bare `ctrl_c`. Seven runnable
+examples live in `examples/`. Each needs Docker, and each spins up and tears
+down its own SurrealDB container.
 
 ### Durability
 
-The headline of the two-tier durable bus — a message sent to an agent while it
-is **fully shut down** is replayed on restart, where plain at-most-once LIVE
-would lose it:
+This is the headline of the two-tier durable bus. A message sent to an agent
+while it is **fully shut down** is replayed on restart. Plain at-most-once LIVE
+loses that message.
 
 ```sh
 # Round 1: bring alice + bob up, then shut the coalition down (bob offline).
@@ -105,8 +167,8 @@ cargo run --example durable_restart
 
 ### Messaging
 
-These exercise the `Coalition<T>` / `inbox()` surface and self-terminate — run
-each to completion:
+These exercise the `Coalition<T>` / `inbox()` surface and self-terminate. Run
+each to completion.
 
 ```sh
 # Request/response round-trip: alice → bob → alice, both legs observed off
@@ -149,12 +211,12 @@ cargo run --example parent_token
 
 This repo is the reference implementation for several transferable patterns, each documented in a corresponding cc-polymath skill:
 
-- **Two-tier durable message bus** (`surrealdb:live-queries`, "Delivery guarantees") — `LIVE` is at-most-once with no replay, so it is used only as a low-latency wake-up over a durable, `CHANGEFEED`-backed log. The sole delivery path is `SHOW CHANGES … SINCE <cursor>` catch-up, advancing a persisted per-agent (versionstamp, change index) cursor past a change only once its delivery is on the bus. The listen loop reconnects with backoff and re-drains on every (re)connect; a per-coalition retention sweep ages out the log. Result: a message is put on the bus after disconnects and restarts; a stop whose cursor save succeeds repeats none, a process exit mid-page repeats that page's sent messages, and deliveries already on the bus are not replayed.
-- **Library-first async lifecycle** (`rust-v2:async-lifecycle`) — expose `CancellationToken` + `TaskTracker`, not `SubsystemHandle`; let callers wire their top-level shutdown. Readiness handshake in `Coalition::new` for subscription-registering spawns. `DropGuard` in the integration test for panic-safe container teardown.
-- **`#[surreal(rename)]` for raw-identifier fields** (`surrealdb:repository-patterns`) — the `SurrealValue` derive ignores `#[serde(rename)]`. Fields like `r#in` must carry `#[surreal(rename = "in")]` or round-trip as `None`.
-- **Explicit edge-pointer projection on edge records** (`surrealdb:live-queries`) — a bare `SELECT *` / `LIVE SELECT *` on `RELATE`-created edges omits `in`/`out`; read them with `SELECT *, in, out FROM message ...` (as the integration test asserts). The durable-bus delivery path sidesteps this — `SHOW CHANGES` changeset records carry `id`/`in`/`out` natively — so the wake-up subscription only needs `LIVE SELECT id`.
-- **Sync/async delivery bus** — each agent forwards durable-log messages (delivered via catch-up) onto a shared bounded [async-channel](https://crates.io/crates/async-channel) MPMC channel as `Delivery<T> { recipient, message }`. Consume with `coalition.inbox()`; clone for multiple workers, or call `recv_blocking()` from a synchronous agent handler on a blocking thread (see `examples/worker_pool.rs`). This is the seam a framework hangs agent logic off of.
-- **Validate at the boundary, parameterize at the query** (`surrealdb:graph-operations`) — agent names are validated in `Agent::new` (`InvalidAgentName`) and bound into the LIVE query as `$owner` rather than interpolated, so a name can never alter the SQL. `Agent::send` checks the recipient exists (`UnknownRecipient`) instead of writing a dangling edge.
+- **Two-tier durable message bus** (`surrealdb:live-queries`, "Delivery guarantees"). `LIVE` is at-most-once with no replay, so it is only a low-latency wake-up over a durable, `CHANGEFEED`-backed log. The sole delivery path is `SHOW CHANGES … SINCE <cursor>` catch-up. It advances a persisted per-agent (versionstamp, change index) cursor past a change only once its delivery is on the bus. The listen loop reconnects with backoff and re-drains on every (re)connect. A per-coalition retention sweep ages out the log. As a result, a message is put on the bus after disconnects and restarts. A stop whose cursor save succeeds repeats no message. A process exit mid-page repeats the sent messages of that page. Deliveries already on the bus are not replayed.
+- **Library-first async lifecycle** (`rust-v2:async-lifecycle`). Expose `CancellationToken` + `TaskTracker`, not `SubsystemHandle`, and let callers wire their top-level shutdown. `Coalition::new` has a readiness handshake for subscription-registering spawns. The integration test uses `DropGuard` for panic-safe container teardown.
+- **`#[surreal(rename)]` for raw-identifier fields** (`surrealdb:repository-patterns`). The `SurrealValue` derive ignores `#[serde(rename)]`. Fields like `r#in` must carry `#[surreal(rename = "in")]` or round-trip as `None`.
+- **Explicit edge-pointer projection on edge records** (`surrealdb:live-queries`). A bare `SELECT *` / `LIVE SELECT *` on `RELATE`-created edges omits `in`/`out`. Read them with `SELECT *, in, out FROM message ...`, as the integration test asserts. The durable-bus delivery path sidesteps this because `SHOW CHANGES` changeset records carry `id`/`in`/`out` natively. So the wake-up subscription only needs `LIVE SELECT id`.
+- **Sync/async delivery bus**. Each agent forwards durable-log messages, delivered via catch-up, onto a shared bounded [async-channel](https://crates.io/crates/async-channel) MPMC channel as `Delivery<T> { recipient, message }`. Consume with `coalition.inbox()`. Clone it for multiple workers, or call `recv_blocking()` from a synchronous agent handler on a blocking thread (see `examples/worker_pool.rs`). This is the seam that a framework hangs agent logic off of.
+- **Validate at the boundary, parameterize at the query** (`surrealdb:graph-operations`). `Agent::new` validates agent names (`InvalidAgentName`). The LIVE query binds them as `$owner` in place of interpolation, so a name can never alter the SQL. `Agent::send` makes sure that the recipient exists (`UnknownRecipient`) in place of writing a dangling edge.
 
 ## Documentation
 
@@ -162,12 +224,12 @@ For detailed documentation on SurrealDB, visit [SurrealDB's Documentation](https
 
 ## Contributors
 
-- [@tsondru](https://github.com/tsondru) — original design, daemon-shape POC, SurrealDB integration.
-- Claude Opus 4.7 (1M context, via [Claude Code](https://claude.com/claude-code)) — library-first refactor (2026-04): `Coalition<T>`, generic `Message<T>`, readiness handshake, panic-safe test via `DropGuard`, and the three SDK-gotcha diagnoses (subscription race, `#[surreal(rename)]`, edge-pointer projection).
-- Claude Opus 4.8 (1M context, via [Claude Code](https://claude.com/claude-code)) — two-tier durable bus (2026-06): `CHANGEFEED` + `SHOW CHANGES` catch-up over a persisted per-agent versionstamp cursor, LIVE-as-wake-up, reconnect/backoff, retention sweep, restart-idempotent `Agent::new`, restart-replay integration test; surrealdb 3.1.4 → 3.1.5.
+- [@tsondru](https://github.com/tsondru): original design, daemon-shape POC, SurrealDB integration.
+- Claude Opus 4.7 (1M context, via [Claude Code](https://claude.com/claude-code)): library-first refactor (2026-04). This work added `Coalition<T>`, generic `Message<T>`, the readiness handshake and a panic-safe test via `DropGuard`. It also made the three SDK-gotcha diagnoses: subscription race, `#[surreal(rename)]` and edge-pointer projection.
+- Claude Opus 4.8 (1M context, via [Claude Code](https://claude.com/claude-code)): two-tier durable bus (2026-06). This work added `CHANGEFEED` + `SHOW CHANGES` catch-up over a persisted per-agent versionstamp cursor, and LIVE as a wake-up. It also added reconnect with backoff, the retention sweep, a restart-idempotent `Agent::new` and a restart-replay integration test, and moved surrealdb 3.1.4 → 3.1.5.
 
 ## Acknowledgments
 
-- [SurrealDB](https://github.com/surrealdb/surrealdb) — the graph + live-query database underneath.
-- [tokio-util](https://docs.rs/tokio-util) — `CancellationToken`, `TaskTracker`, `DropGuard`.
-- [tokio-graceful-shutdown](https://github.com/Finomnis/tokio-graceful-shutdown) — the prior subsystem framework this repo used before the 2026-04 library-first refactor; excellent for binary-level shutdown, intentionally dropped at the library level.
+- [SurrealDB](https://github.com/surrealdb/surrealdb): the graph + live-query database underneath.
+- [tokio-util](https://docs.rs/tokio-util): `CancellationToken`, `TaskTracker`, `DropGuard`.
+- [tokio-graceful-shutdown](https://github.com/Finomnis/tokio-graceful-shutdown): the subsystem framework that this repo used before the 2026-04 library-first refactor. It suits binary-level shutdown, and the library level dropped it on purpose.
