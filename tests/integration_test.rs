@@ -227,6 +227,7 @@ async fn test_agent_messaging() {
     scenario_bus_close().await;
     scenario_durable_restart().await;
     scenario_cancel_during_first_page(db).await;
+    scenario_new_agent_skips_a_long_feed(db).await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
     let lives_before = message_lives(db).await;
@@ -1199,6 +1200,97 @@ async fn scenario_cancel_during_first_page(db: &Surreal<any::Any>) {
             panic!("Coalition::new returned Ok after its parent was cancelled");
         }
     }
+}
+
+/// Highest versionstamp in the `message` changefeed and the length of its
+/// first page, read in pages from `SINCE 0` until a page holds no changeset.
+async fn feed_end(db: &Surreal<any::Any>) -> (i64, usize) {
+    let (mut highest, mut first_page, mut since) = (0, None, 0);
+    loop {
+        let page: surrealdb_types::Value = db
+            .query(format!(
+                "SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {since} LIMIT 1000"
+            ))
+            .await
+            .expect("read a feed page")
+            .take(0)
+            .expect("feed page result");
+        let surrealdb_types::Value::Array(changesets) = page else {
+            panic!("SHOW CHANGES reply is not an array: {page:?}");
+        };
+        first_page.get_or_insert(changesets.len());
+        if changesets.is_empty() {
+            return (highest, first_page.unwrap_or(0));
+        }
+        for changeset in changesets.iter() {
+            let versionstamp = match changeset {
+                surrealdb_types::Value::Object(o) => match o.get("versionstamp") {
+                    Some(surrealdb_types::Value::Number(n)) => n.to_int(),
+                    _ => None,
+                },
+                _ => None,
+            };
+            highest = highest.max(versionstamp.expect("integer versionstamp"));
+        }
+        since = highest + 1;
+    }
+}
+
+/// **A new agent starts after a feed longer than one page.** The changefeed
+/// holds more than 1 000 changesets, the last 1 100 of them messages addressed
+/// to `ls_new`, which has no `agent` or `cursor` row. After `Coalition::new`
+/// for `ls_new` and `ls_src`, `cursor:ls_new` is 1 above the feed's last
+/// versionstamp, no delivery arrives within 2 s, and a message sent afterwards
+/// is the one delivery.
+async fn scenario_new_agent_skips_a_long_feed(db: &Surreal<any::Any>) {
+    const BACKLOG: usize = 1_100;
+    db.query("DELETE agent:ls_new; DELETE cursor:ls_new;")
+        .await
+        .and_then(|r| r.check())
+        .expect("reset ls_new");
+    let relate = "RELATE agent:ls_src->message->agent:ls_new \
+                  CONTENT { created: time::now(), payload: { content: 'ls_backlog' } };";
+    db.query(relate.repeat(BACKLOG))
+        .await
+        .and_then(|r| r.check())
+        .expect("backlog for ls_new");
+    let (last, first_page) = feed_end(db).await;
+    assert_eq!(
+        first_page, 1_000,
+        "precondition: the feed must be longer than one page; its first page holds {first_page}"
+    );
+
+    let c = Coalition::<ChatMessage>::new(vec!["ls_new".to_string(), "ls_src".to_string()])
+        .await
+        .expect("coalition with a new agent");
+    let inbox = c.inbox();
+    let cursor = cursor_position(db, "ls_new").await;
+    let backlog_delivery = timeout(Duration::from_secs(2), inbox.recv()).await;
+    let src = c.agent("ls_src").await.expect("ls_src in coalition");
+    src.send(
+        "ls_new",
+        ChatMessage {
+            content: "ls_after".to_string(),
+        },
+    )
+    .await
+    .expect("ls_src → ls_new send");
+    let after = timeout(Duration::from_secs(5), inbox.recv()).await;
+    c.shutdown().await;
+
+    assert_eq!(
+        cursor,
+        Some((last + 1, 0)),
+        "cursor:ls_new must be 1 above the feed's last versionstamp {last}"
+    );
+    assert!(
+        backlog_delivery.is_err(),
+        "a new agent must get nothing from the backlog; got {backlog_delivery:?}"
+    );
+    let after = after
+        .expect("the message sent after startup was not delivered within 5 s")
+        .expect("inbox bus closed unexpectedly");
+    assert_eq!(after.message.payload.content, "ls_after");
 }
 
 /// **A failed `Coalition::new` moves no cursor past an undelivered message.**

@@ -33,9 +33,9 @@ pub enum Error {
     #[error("creating agent '{agent}' returned no record")]
     AgentCreateEmpty { agent: String },
 
-    /// `Agent::new` for `agent`, called by `Coalition::new`, did not finish
-    /// within `timeout`.
-    #[error("creating agent '{agent}' did not finish within {timeout:?}")]
+    /// A database call of `Agent::new` for `agent`, under `Coalition::new`,
+    /// did not finish within `timeout`.
+    #[error("a database call creating agent '{agent}' did not finish within {timeout:?}")]
     AgentCreateTimeout { agent: String, timeout: Duration },
 
     #[error(
@@ -71,8 +71,14 @@ pub enum Error {
         source: Box<surrealdb::Error>,
     },
 
+    /// The read of the live-query id failed, with that error as `source`, or
+    /// returned a value that is not a uuid, named in `source`.
     #[error("LIVE SELECT for agent '{agent}' returned no live-query id")]
-    LiveQueryIdMissing { agent: String },
+    LiveQueryIdMissing {
+        agent: String,
+        #[source]
+        source: Box<surrealdb::Error>,
+    },
 
     #[error("failed to KILL live query {live_id} for agent '{agent}'")]
     LiveKill {

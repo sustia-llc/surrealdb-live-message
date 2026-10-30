@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking: `Error::LiveQueryIdMissing` gains a `source`: the failed read, or
+  a message that names the value that is not a uuid.
+- `Coalition::new` bounds each database call of `Agent::new`, each changefeed
+  page among them, by the ready timeout. The whole `Agent::new` has no fixed
+  bound. The `Error::AgentCreateTimeout` message now says "a database call".
+- A subscribe in flight at a cancel moves to a spawned task. The loop and
+  `Coalition::shutdown` do not wait for it.
+
+### Fixed
+
+- For a new agent, the cursor starts after the highest versionstamp in the
+  whole `message` changefeed, read in pages until a page holds no changeset,
+  in a database where `message` is the one table with a changefeed. It
+  previously used the first page, at most 1000 changesets, so a longer feed
+  replayed its remainder.
+- `Agent::new` returns `Error::AgentCreate` for a changefeed page that is not
+  an array, a page with changesets and no integer versionstamp, and a page
+  whose highest versionstamp is below its `SINCE` or is `i64::MAX`. It writes
+  neither record. A changeset with no integer versionstamp is logged at error
+  level.
+- When the reply arrives, a subscribe that a cancel interrupted ends its live
+  query. A failed `KILL` call or a failed subscribe is logged at warn.
+- When the wake stream cannot be opened, `subscribe_wake` ends the live query
+  with a `KILL` before it returns `Error::Stream`.
+
 ## [0.5.0] - 2026-10-29
 
 ### Added
