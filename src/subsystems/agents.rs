@@ -510,8 +510,8 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// point, and puts nothing on the bus, until every loop has signalled
     /// ready; this then sends the start signal and returns `Ok`. On any
     /// failure it cancels every spawned loop and waits for each to end before
-    /// it returns the error. The first error a loop sends (including
-    /// [`Error::Cancelled`]) is returned as soon as these waits see it, in
+    /// it returns the error. The first error these waits see (including
+    /// [`Error::Cancelled`]) is returned at once, in
     /// preference to [`Error::ReadyTimeout`] and [`Error::ListenLoopDropped`]; among
     /// those two, the one for the earliest name in `names` is returned.
     ///
