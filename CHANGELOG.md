@@ -20,19 +20,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - For a new agent, the cursor starts after the highest versionstamp in the
-  whole `message` changefeed, read in pages until a page holds no changeset,
-  in a database where `message` is the one table with a changefeed. It
-  previously used the first page, at most 1000 changesets, so a longer feed
-  replayed its remainder.
+  whole `message` changefeed. The read ends on a page with fewer than 1000
+  changesets. This needs a database where `message` is the one table with a
+  changefeed. It previously used the first page, at most 1000 changesets, so a
+  longer feed replayed its remainder. A `Coalition::new` reads the feed at most
+  once. An existing agent with no cursor reads no feed.
 - `Agent::new` returns `Error::AgentCreate` for a changefeed page that is not
-  an array, a page with changesets and no integer versionstamp, and a page
-  whose highest versionstamp is below its `SINCE` or is `i64::MAX`. It writes
-  neither record. A changeset with no integer versionstamp is logged at error
-  level.
-- When the reply arrives, a subscribe that a cancel interrupted ends its live
-  query. A failed `KILL` call or a failed subscribe is logged at warn.
-- When the wake stream cannot be opened, `subscribe_wake` ends the live query
-  with a `KILL` before it returns `Error::Stream`.
+  an array, a full page with no integer versionstamp, and a page whose highest
+  versionstamp is below its `SINCE` or is `i64::MAX`. It writes neither record.
+  A changeset with no integer versionstamp is logged at error level.
+- When the reply arrives, a subscribe that a cancel interrupted sends a `KILL`
+  of its live query. A failed subscribe and a failed or timed-out `KILL` call
+  are logged at warn. A reply still missing after `LIVE_KILL_TIMEOUT` is logged
+  at warn, and so is a drop of that task before it finishes.
+- When the wake stream cannot be opened, `subscribe_wake` sends a `KILL` of the
+  live query before it returns `Error::Stream`.
+
+### Removed
+
+- The warn for a subscribe still in flight `LIVE_KILL_TIMEOUT` after a cancel
+  no longer says that its live query is not ended. The task keeps waiting.
 
 ## [0.5.0] - 2026-10-29
 

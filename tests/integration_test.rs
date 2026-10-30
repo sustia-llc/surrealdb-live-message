@@ -228,6 +228,7 @@ async fn test_agent_messaging() {
     scenario_durable_restart().await;
     scenario_cancel_during_first_page(db).await;
     scenario_new_agent_skips_a_long_feed(db).await;
+    scenario_new_agents_share_one_walk(db).await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
     let lives_before = message_lives(db).await;
@@ -895,8 +896,8 @@ async fn scenario_dropped_new_cancels_loops(db: &Surreal<any::Any>) {
     );
 }
 
-/// **A stalled `Agent::new` is bounded by the ready timeout.** Reads of
-/// `agent:as_stall` wait [`STALL_SECS`] on the server.
+/// **A stalled database call of `Agent::new` is bounded by the ready
+/// timeout.** Reads of `agent:as_stall` wait [`STALL_SECS`] on the server.
 /// `Coalition::new_with_ready_timeout` for `as_ok` and `as_stall` with a 1 s
 /// ready timeout returns `AgentCreateTimeout` for `as_stall` within 3 s.
 async fn scenario_stalled_agent_record_returns_create_timeout(db: &Surreal<any::Any>) {
@@ -1291,6 +1292,52 @@ async fn scenario_new_agent_skips_a_long_feed(db: &Surreal<any::Any>) {
         .expect("the message sent after startup was not delivered within 5 s")
         .expect("inbox bus closed unexpectedly");
     assert_eq!(after.message.payload.content, "ls_after");
+}
+
+/// **One `Coalition::new` walks the changefeed once.** `wo_a` and `wo_b` have
+/// no `agent` or `cursor` row. Writing `agent:wo_a` waits 2 s on the server,
+/// after the walk that `wo_a` runs, and a message to `wo_b` is created during
+/// that wait. `wo_b` starts from `wo_a`'s walk, so the message is delivered
+/// within 5 s.
+async fn scenario_new_agents_share_one_walk(db: &Surreal<any::Any>) {
+    db.query("DELETE agent:wo_a; DELETE cursor:wo_a; DELETE agent:wo_b; DELETE cursor:wo_b;")
+        .await
+        .and_then(|r| r.check())
+        .expect("reset wo_a and wo_b");
+    db.query(format!(
+        "DEFINE FIELD OVERWRITE stall ON {AGENT_TABLE} VALUE IF name = 'wo_a' {{ sleep(2s) }}"
+    ))
+    .await
+    .and_then(|r| r.check())
+    .expect("define the agent write stall field");
+
+    let relate = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        db.query(format!(
+            "RELATE agent:{AGENT_ALICE}->message->agent:wo_b \
+             CONTENT {{ created: time::now(), payload: {{ content: 'wo_during' }} }}"
+        ))
+        .await
+        .and_then(|r| r.check())
+    };
+    let names = vec!["wo_a".to_string(), "wo_b".to_string()];
+    let (built, related) = tokio::join!(Coalition::<ChatMessage>::new(names), relate);
+    remove_stall(db, AGENT_TABLE).await;
+    related.expect("message to wo_b during the walk's coalition");
+    let c = built.expect("coalition with two new agents");
+
+    let delivered = timeout(Duration::from_secs(5), c.inbox().recv()).await;
+    c.shutdown().await;
+    let delivered = delivered
+        .expect("wo_b must start from wo_a's walk; no delivery within 5 s")
+        .expect("inbox bus closed unexpectedly");
+    assert_eq!(
+        (
+            delivered.recipient.as_str(),
+            delivered.message.payload.content.as_str()
+        ),
+        ("wo_b", "wo_during")
+    );
 }
 
 /// **A failed `Coalition::new` moves no cursor past an undelivered message.**
