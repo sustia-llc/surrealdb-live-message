@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page among them, by the ready timeout. The whole `Agent::new` has no fixed
   bound. The `Error::AgentCreateTimeout` message now says "a database call".
 - A subscribe in flight at a cancel moves to a spawned task. The loop and
-  `Coalition::shutdown` do not wait for it.
+  `Coalition::shutdown` do not wait for it. The task keeps waiting after its
+  warn for a reply still missing at `LIVE_KILL_TIMEOUT`, and that warn now says
+  "not yet ended".
 
 ### Fixed
 
@@ -35,11 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at warn, and so is a drop of that task before it finishes.
 - When the wake stream cannot be opened, `subscribe_wake` sends a `KILL` of the
   live query before it returns `Error::Stream`.
-
-### Removed
-
-- The warn for a subscribe still in flight `LIVE_KILL_TIMEOUT` after a cancel
-  no longer says that its live query is not ended. The task keeps waiting.
 
 ## [0.5.0] - 2026-10-29
 

@@ -1475,9 +1475,9 @@ fn live_id_of(agent: &str, taken: std::result::Result<Value, surrealdb::Error>) 
     }
 }
 
-/// The stream in `opened`. When `opened` is an error, ends live query
-/// `live_id` through [`kill_live`], then returns [`Error::Stream`] with that
-/// error as its source.
+/// The stream in `opened`. When `opened` is an error, sends a `KILL` of live
+/// query `live_id` through [`kill_live`], then returns [`Error::Stream`] with
+/// that error as its source.
 async fn stream_or_kill(
     db: &Surreal<any::Any>,
     agent: &str,
@@ -1541,53 +1541,58 @@ where
     None
 }
 
-/// Await `subscribe`, in flight when `agent`'s loop was cancelled, then end
-/// the returned live query with [`end_live`]. A failed `subscribe` is logged
-/// at warn with the agent and the error chain; a failed `KILL` call is logged
-/// by [`kill_live`]. With no reply after [`LIVE_KILL_TIMEOUT`], this logs a
-/// warn with the agent and keeps waiting, with no bound. If this is dropped
-/// before it finishes, [`UnfinishedSubscribe`] logs a warn with the agent.
-async fn finish_subscribe<F>(db: &Surreal<any::Any>, agent: String, subscribe: F)
+/// A future that awaits `subscribe`, in flight when `agent`'s loop was
+/// cancelled, then sends a `KILL` of the returned live query with [`end_live`].
+/// A failed `subscribe` is logged at warn with the agent and the error chain;
+/// a failed `KILL` call is logged by [`kill_live`]. With no reply after
+/// [`LIVE_KILL_TIMEOUT`], the future logs a warn with the agent and keeps
+/// waiting, with no bound. If the future is dropped before it finishes, polled
+/// or not, [`UnfinishedSubscribe`] logs a warn with the agent.
+fn finish_subscribe<F>(
+    db: &Surreal<any::Any>,
+    agent: String,
+    subscribe: F,
+) -> impl Future<Output = ()>
 where
     F: Future<Output = Subscribed>,
 {
-    let unfinished = UnfinishedSubscribe {
-        agent: &agent,
-        armed: true,
-    };
-    let mut subscribe = std::pin::pin!(subscribe);
-    let subscribed = match timeout(LIVE_KILL_TIMEOUT, &mut subscribe).await {
-        Ok(subscribed) => subscribed,
-        Err(_elapsed) => {
-            tracing::warn!(
-                "subscribe for {agent} has no reply {LIVE_KILL_TIMEOUT:?} after a cancel; the \
-                 live query, if registered, is not yet ended"
-            );
-            subscribe.await
+    let unfinished = UnfinishedSubscribe { agent, armed: true };
+    async move {
+        let agent = unfinished.agent.as_str();
+        let mut subscribe = std::pin::pin!(subscribe);
+        let subscribed = match timeout(LIVE_KILL_TIMEOUT, &mut subscribe).await {
+            Ok(subscribed) => subscribed,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "subscribe for {agent} has no reply {LIVE_KILL_TIMEOUT:?} after a cancel; the \
+                     live query, if registered, is not yet ended"
+                );
+                subscribe.await
+            }
+        };
+        match subscribed {
+            Ok((stream, live_id)) => end_live(db, agent, live_id, stream).await,
+            Err(e) => tracing::warn!("subscribe for {agent} failed after a cancel: {}", chain(&e)),
         }
-    };
-    match subscribed {
-        Ok((stream, live_id)) => end_live(db, &agent, live_id, stream).await,
-        Err(e) => tracing::warn!("subscribe for {agent} failed after a cancel: {}", chain(&e)),
+        unfinished.disarm();
     }
-    unfinished.disarm();
 }
 
 /// Logs a warn for `agent` on drop, unless [`UnfinishedSubscribe::disarm`]
 /// consumed it.
-struct UnfinishedSubscribe<'a> {
-    agent: &'a str,
+struct UnfinishedSubscribe {
+    agent: String,
     armed: bool,
 }
 
-impl UnfinishedSubscribe<'_> {
+impl UnfinishedSubscribe {
     /// Drop this with no log.
     fn disarm(mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for UnfinishedSubscribe<'_> {
+impl Drop for UnfinishedSubscribe {
     fn drop(&mut self) {
         if self.armed {
             tracing::warn!(
@@ -1599,7 +1604,8 @@ impl Drop for UnfinishedSubscribe<'_> {
     }
 }
 
-/// End live query `live_id` through [`kill_live`], then drop `stream`.
+/// Send a `KILL` of live query `live_id` through [`kill_live`], then drop
+/// `stream`.
 async fn end_live(
     db: &Surreal<any::Any>,
     agent: &str,
@@ -2556,9 +2562,32 @@ mod tests {
         logged(&sink)
     }
 
-    /// A [`finish_subscribe`] dropped before it finishes logs at warn with the
-    /// agent, for each way it can be dropped: an abort, a panic in the
-    /// subscribe it awaits, and the exit of its runtime.
+    /// A [`finish_subscribe`] future dropped with no poll logs at warn with the
+    /// agent, when dropped directly and when queued on a runtime that exits.
+    #[test]
+    fn finish_subscribe_logs_when_dropped_with_no_poll() {
+        let direct = logs_of_finisher_drop(std::future::pending(), |_runtime, finisher| {
+            drop(finisher);
+        });
+        let queued = logs_of_finisher_drop(std::future::pending(), |runtime, finisher| {
+            runtime.spawn(finisher);
+            drop(runtime);
+        });
+        let silent: Vec<&str> = [("direct drop", direct), ("queued at exit", queued)]
+            .iter()
+            .filter(|(_, logs)| {
+                !logs.lines().any(|l| {
+                    l.contains("WARN") && l.contains("frank") && l.contains(DROPPED_WARNING)
+                })
+            })
+            .map(|(cause, _)| *cause)
+            .collect();
+        assert_eq!(silent, Vec::<&str>::new(), "drops with no warn line");
+    }
+
+    /// A [`finish_subscribe`] dropped after its first poll logs at warn with
+    /// the agent, on an abort, a panic in the subscribe it awaits, and the
+    /// exit of its runtime.
     #[test]
     fn finish_subscribe_logs_when_dropped_before_it_finishes() {
         let abort = logs_of_finisher_drop(std::future::pending(), |runtime, finisher| {
