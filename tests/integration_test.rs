@@ -206,6 +206,7 @@ async fn test_agent_messaging() {
     scenario_lost_cursor_replays_backlog(db).await;
     scenario_unknown_agent(db, &alice).await;
     scenario_schema_enforcement(db).await;
+    scenario_statement_failure_fails_send(db).await;
     scenario_handshake_race().await;
     scenario_fanout().await;
     scenario_backpressure().await;
@@ -227,6 +228,8 @@ async fn test_agent_messaging() {
     scenario_bus_close().await;
     scenario_durable_restart().await;
     scenario_cancel_during_first_page(db).await;
+    scenario_new_agent_skips_a_long_feed(db).await;
+    scenario_new_agents_share_one_walk(db).await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
     let lives_before = message_lives(db).await;
@@ -332,6 +335,82 @@ async fn scenario_schema_enforcement(db: &Surreal<any::Any>) {
         Err(_) => true,
     };
     assert!(rejected, "non-datetime `created` must be rejected");
+}
+
+/// Number of `message` edges from `agent:sf_src` whose payload is `content`.
+async fn sf_edges(db: &Surreal<any::Any>, content: &str) -> usize {
+    let edges: Vec<Message<ChatMessage>> = db
+        .query(
+            "SELECT *, in, out FROM message WHERE in = agent:sf_src AND payload.content = $content",
+        )
+        .bind(("content", content.to_string()))
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    edges.len()
+}
+
+/// **A `RELATE` statement that fails fails the send.** A `DEFINE EVENT` on
+/// `message` throws for one marked payload. `Agent::send` of that payload
+/// returns [`Error::Send`] with the thrown text in its source chain and creates
+/// no edge. A send of another payload under the same event creates its edge.
+async fn scenario_statement_failure_fails_send(db: &Surreal<any::Any>) {
+    const MARKED: &str = "sf_marked";
+    const UNMARKED: &str = "sf_unmarked";
+    const THROWN: &str = "sf_statement_failed";
+
+    let src = Agent::new("sf_src").await.expect("create sf_src");
+    Agent::new("sf_dst").await.expect("create sf_dst");
+
+    db.query(format!(
+        "DEFINE EVENT OVERWRITE reject_marked ON {MESSAGE_TABLE} \
+         WHEN $after.payload.content = '{MARKED}' THEN {{ THROW '{THROWN}' }}"
+    ))
+    .await
+    .and_then(|r| r.check())
+    .expect("define the rejecting event");
+
+    let chat = |content: &str| ChatMessage {
+        content: content.to_string(),
+    };
+    let marked = src.send("sf_dst", chat(MARKED)).await;
+    let unmarked = src.send("sf_dst", chat(UNMARKED)).await;
+
+    db.query(format!(
+        "REMOVE EVENT IF EXISTS reject_marked ON {MESSAGE_TABLE}"
+    ))
+    .await
+    .and_then(|r| r.check())
+    .expect("remove the rejecting event");
+
+    let err = match marked {
+        Ok(()) => panic!(
+            "a send whose RELATE statement fails must return Error::Send; it returned Ok(()) \
+             and {} edges exist",
+            sf_edges(db, MARKED).await
+        ),
+        Err(e) => e,
+    };
+    let Error::Send { to, .. } = &err else {
+        panic!("expected Error::Send, got {err:?}");
+    };
+    assert_eq!(to, "sf_dst");
+    let chain: Vec<String> = std::iter::successors(std::error::Error::source(&err), |e| e.source())
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        chain.iter().any(|m| m.contains(THROWN)),
+        "the source chain must hold the statement's error `{THROWN}`; it is {chain:?}"
+    );
+
+    assert_eq!(sf_edges(db, MARKED).await, 0, "edges for the rejected send");
+    unmarked.expect("a send the event does not reject");
+    assert_eq!(
+        sf_edges(db, UNMARKED).await,
+        1,
+        "edges for the accepted send"
+    );
 }
 
 /// **Delivery races the handshake.** Send *immediately* after `Coalition::new`
@@ -894,8 +973,8 @@ async fn scenario_dropped_new_cancels_loops(db: &Surreal<any::Any>) {
     );
 }
 
-/// **A stalled `Agent::new` is bounded by the ready timeout.** Reads of
-/// `agent:as_stall` wait [`STALL_SECS`] on the server.
+/// **A stalled database call of `Agent::new` is bounded by the ready
+/// timeout.** Reads of `agent:as_stall` wait [`STALL_SECS`] on the server.
 /// `Coalition::new_with_ready_timeout` for `as_ok` and `as_stall` with a 1 s
 /// ready timeout returns `AgentCreateTimeout` for `as_stall` within 3 s.
 async fn scenario_stalled_agent_record_returns_create_timeout(db: &Surreal<any::Any>) {
@@ -1199,6 +1278,143 @@ async fn scenario_cancel_during_first_page(db: &Surreal<any::Any>) {
             panic!("Coalition::new returned Ok after its parent was cancelled");
         }
     }
+}
+
+/// Highest versionstamp in the `message` changefeed and the length of its
+/// first page, read in pages from `SINCE 0` until a page holds no changeset.
+async fn feed_end(db: &Surreal<any::Any>) -> (i64, usize) {
+    let (mut highest, mut first_page, mut since) = (0, None, 0);
+    loop {
+        let page: surrealdb_types::Value = db
+            .query(format!(
+                "SHOW CHANGES FOR TABLE {MESSAGE_TABLE} SINCE {since} LIMIT 1000"
+            ))
+            .await
+            .expect("read a feed page")
+            .take(0)
+            .expect("feed page result");
+        let surrealdb_types::Value::Array(changesets) = page else {
+            panic!("SHOW CHANGES reply is not an array: {page:?}");
+        };
+        first_page.get_or_insert(changesets.len());
+        if changesets.is_empty() {
+            return (highest, first_page.unwrap_or(0));
+        }
+        for changeset in changesets.iter() {
+            let versionstamp = match changeset {
+                surrealdb_types::Value::Object(o) => match o.get("versionstamp") {
+                    Some(surrealdb_types::Value::Number(n)) => n.to_int(),
+                    _ => None,
+                },
+                _ => None,
+            };
+            highest = highest.max(versionstamp.expect("integer versionstamp"));
+        }
+        since = highest + 1;
+    }
+}
+
+/// **A new agent starts after a feed longer than one page.** The changefeed
+/// holds more than 1 000 changesets, the last 1 100 of them messages addressed
+/// to `ls_new`, which has no `agent` or `cursor` row. After `Coalition::new`
+/// for `ls_new` and `ls_src`, `cursor:ls_new` is 1 above the feed's last
+/// versionstamp, no delivery arrives within 2 s, and a message sent afterwards
+/// is the one delivery.
+async fn scenario_new_agent_skips_a_long_feed(db: &Surreal<any::Any>) {
+    const BACKLOG: usize = 1_100;
+    db.query("DELETE agent:ls_new; DELETE cursor:ls_new;")
+        .await
+        .and_then(|r| r.check())
+        .expect("reset ls_new");
+    let relate = "RELATE agent:ls_src->message->agent:ls_new \
+                  CONTENT { created: time::now(), payload: { content: 'ls_backlog' } };";
+    db.query(relate.repeat(BACKLOG))
+        .await
+        .and_then(|r| r.check())
+        .expect("backlog for ls_new");
+    let (last, first_page) = feed_end(db).await;
+    assert_eq!(
+        first_page, 1_000,
+        "precondition: the feed must be longer than one page; its first page holds {first_page}"
+    );
+
+    let c = Coalition::<ChatMessage>::new(vec!["ls_new".to_string(), "ls_src".to_string()])
+        .await
+        .expect("coalition with a new agent");
+    let inbox = c.inbox();
+    let cursor = cursor_position(db, "ls_new").await;
+    let backlog_delivery = timeout(Duration::from_secs(2), inbox.recv()).await;
+    let src = c.agent("ls_src").await.expect("ls_src in coalition");
+    src.send(
+        "ls_new",
+        ChatMessage {
+            content: "ls_after".to_string(),
+        },
+    )
+    .await
+    .expect("ls_src → ls_new send");
+    let after = timeout(Duration::from_secs(5), inbox.recv()).await;
+    c.shutdown().await;
+
+    assert_eq!(
+        cursor,
+        Some((last + 1, 0)),
+        "cursor:ls_new must be 1 above the feed's last versionstamp {last}"
+    );
+    assert!(
+        backlog_delivery.is_err(),
+        "a new agent must get nothing from the backlog; got {backlog_delivery:?}"
+    );
+    let after = after
+        .expect("the message sent after startup was not delivered within 5 s")
+        .expect("inbox bus closed unexpectedly");
+    assert_eq!(after.message.payload.content, "ls_after");
+}
+
+/// **One `Coalition::new` walks the changefeed once.** `wo_a` and `wo_b` have
+/// no `agent` or `cursor` row. Writing `agent:wo_a` waits 2 s on the server,
+/// after the walk that `wo_a` runs, and a message to `wo_b` is created during
+/// that wait. `wo_b` starts from `wo_a`'s walk, so the message is delivered
+/// within 5 s.
+async fn scenario_new_agents_share_one_walk(db: &Surreal<any::Any>) {
+    db.query("DELETE agent:wo_a; DELETE cursor:wo_a; DELETE agent:wo_b; DELETE cursor:wo_b;")
+        .await
+        .and_then(|r| r.check())
+        .expect("reset wo_a and wo_b");
+    db.query(format!(
+        "DEFINE FIELD OVERWRITE stall ON {AGENT_TABLE} VALUE IF name = 'wo_a' {{ sleep(2s) }}"
+    ))
+    .await
+    .and_then(|r| r.check())
+    .expect("define the agent write stall field");
+
+    let relate = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        db.query(format!(
+            "RELATE agent:{AGENT_ALICE}->message->agent:wo_b \
+             CONTENT {{ created: time::now(), payload: {{ content: 'wo_during' }} }}"
+        ))
+        .await
+        .and_then(|r| r.check())
+    };
+    let names = vec!["wo_a".to_string(), "wo_b".to_string()];
+    let (built, related) = tokio::join!(Coalition::<ChatMessage>::new(names), relate);
+    remove_stall(db, AGENT_TABLE).await;
+    related.expect("message to wo_b during the walk's coalition");
+    let c = built.expect("coalition with two new agents");
+
+    let delivered = timeout(Duration::from_secs(5), c.inbox().recv()).await;
+    c.shutdown().await;
+    let delivered = delivered
+        .expect("wo_b must start from wo_a's walk; no delivery within 5 s")
+        .expect("inbox bus closed unexpectedly");
+    assert_eq!(
+        (
+            delivered.recipient.as_str(),
+            delivered.message.payload.content.as_str()
+        ),
+        ("wo_b", "wo_during")
+    );
 }
 
 /// **A failed `Coalition::new` moves no cursor past an undelivered message.**

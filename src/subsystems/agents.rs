@@ -20,8 +20,8 @@ use crate::subsystems::sdb;
 
 pub const AGENT_TABLE: &str = "agent";
 
-/// Maximum time `Coalition::new` waits for each `listen_loop` to send its
-/// ready signal.
+/// Maximum time `Coalition::new` waits for each database call of `Agent::new`,
+/// and for each `listen_loop` to send its ready signal.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Capacity of the shared MPMC delivery bus connecting agent listen loops to
@@ -33,7 +33,7 @@ const INBOX_CAPACITY: usize = 256;
 /// change not yet on the bus.
 pub const CURSOR_TABLE: &str = "cursor";
 
-/// Max changesets pulled per `SHOW CHANGES` page during catch-up.
+/// `LIMIT` of each `SHOW CHANGES` page.
 const CATCHUP_BATCH: usize = 1000;
 
 /// Reconnect backoff bounds for the LIVE wake-up subscription.
@@ -44,8 +44,12 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// one it is given.
 const WAKE_DRAIN_MAX: usize = 64;
 
-/// Maximum time [`end_live`] waits for a `KILL` of a live query.
+/// Maximum time [`kill_live`] waits for a `KILL` of a live query, and the time
+/// [`finish_subscribe`] waits for a reply before it logs a warn.
 const LIVE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Outcome of [`subscribe_wake`]: the wake stream and its live-query id.
+type Subscribed = Result<(QueryStream<Notification<Value>>, Uuid)>;
 
 /// An inbound message delivered to an agent's listen loop, forwarded onto the
 /// coalition's shared bounded `async_channel`. `recipient` is the agent that received it;
@@ -75,78 +79,130 @@ impl Agent {
     /// else [`Error::InvalidAgentName`]. An existing `agent` record and an
     /// existing `cursor` row are kept unchanged. When `cursor:<name>` is
     /// absent, it is created in the same transaction that checks for
-    /// `agent:<name>`: for a new agent, after the highest versionstamp in the
-    /// first `SHOW CHANGES` page of the `message` changefeed (at most 1000
-    /// changesets); for an agent whose record
-    /// already existed, at versionstamp 0, so the next catch-up reads the
-    /// whole retained changefeed, and that start is logged at warn with the
-    /// agent and the position as fields. Both records are written in one
-    /// transaction, so this does not write `agent:<name>` without
-    /// `cursor:<name>`.
+    /// `agent:<name>`: for a new agent, 1 above the highest versionstamp in
+    /// the whole `message` changefeed at the time of the read (1 for an empty
+    /// feed), read in pages until a page holds fewer than 1000 changesets, in
+    /// a database where `message` is the one table with a changefeed; for an
+    /// agent whose record already existed, at versionstamp 0, with no changefeed
+    /// read if the existence check finds it, so the next catch-up reads the whole retained changefeed, and
+    /// that start is logged at warn with the agent and the position as fields.
+    /// Both records are written in one transaction, so this does not write
+    /// `agent:<name>` without `cursor:<name>`.
     ///
     /// Errors: [`Error::InvalidAgentName`] for a rejected `name`;
-    /// [`Error::AgentCreate`] when a database call fails (the cursor
-    /// existence check, the changefeed read, the transaction, or the read of
-    /// the agent record), with that call's error as its source;
+    /// [`Error::AgentCreate`] when a database call fails (the cursor or agent
+    /// existence check, a changefeed page, the transaction, or the read of
+    /// the agent record), with that call's error as its source, or when a
+    /// changefeed page is not an array, is a full page with no numeric
+    /// versionstamp, or ends below its `SINCE` or at `i64::MAX`, in which case
+    /// neither record is written;
     /// [`Error::AgentCreateEmpty`] when the agent record reads back as absent.
     pub async fn new(name: &str) -> Result<Self> {
+        Self::create(name, None, &mut None).await
+    }
+
+    /// [`Agent::new`] with `bound` on each database call: under `Some`, a
+    /// call also ends in [`Error::AgentCreateTimeout`] or
+    /// [`Error::Cancelled`] (see [`bounded`]). `walked` holds the result of
+    /// [`latest_versionstamp`]: a `Some` is used with no changefeed read, and
+    /// a read stores its result there.
+    async fn create(
+        name: &str,
+        bound: Option<&CallBound<'_>>,
+        walked: &mut Option<i64>,
+    ) -> Result<Self> {
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(Error::InvalidAgentName {
                 name: name.to_string(),
             });
         }
 
-        let db = sdb::SurrealDBWrapper::connection().await;
+        let db = bounded(name, bound, sdb::SurrealDBWrapper::connection()).await?;
+        Self::create_on(db, name, bound, walked, |since| {
+            query_changes(db, since, CATCHUP_BATCH)
+        })
+        .await
+    }
+
+    /// The records of [`Agent::new`] on `db`, reading each changefeed page
+    /// through `fetch_page`. `walked` is as in [`Agent::create`].
+    async fn create_on<F, Fut>(
+        db: &Surreal<any::Any>,
+        name: &str,
+        bound: Option<&CallBound<'_>>,
+        walked: &mut Option<i64>,
+        fetch_page: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(i64) -> Fut,
+        Fut: Future<Output = std::result::Result<Value, surrealdb::Error>>,
+    {
         let create_err = |source| Error::AgentCreate {
             agent: name.to_string(),
             source: Box::new(source),
         };
         let agent_id = RecordId::new(AGENT_TABLE, name);
         let cursor_id = RecordId::new(CURSOR_TABLE, name);
-
-        let cursor_present: Option<RecordId> = db
-            .query("SELECT VALUE id FROM ONLY $cursor")
-            .bind(("cursor", cursor_id.clone()))
-            .await
-            .map_err(create_err)?
-            .take(0)
-            .map_err(create_err)?;
-        let start = match cursor_present {
-            Some(_) => None,
-            None => Some(Cursor::at(latest_versionstamp(db, name).await? + 1)),
+        let stored_id = |id: RecordId| async move {
+            db.query("SELECT VALUE id FROM ONLY $id")
+                .bind(("id", id))
+                .await?
+                .take::<Option<RecordId>>(0)
         };
-        let replay = Cursor::at(0);
 
-        let cursor_stmts = if start.is_some() {
+        let cursor_present = bounded(name, bound, stored_id(cursor_id.clone()))
+            .await?
+            .map_err(create_err)?;
+        let cursor_absent = cursor_present.is_none();
+        let replay = Cursor::at(0);
+        let start = if cursor_absent {
+            let agent_present = bounded(name, bound, stored_id(agent_id.clone()))
+                .await?
+                .map_err(create_err)?;
+            match (agent_present, *walked) {
+                (Some(_), _) => replay,
+                (None, Some(latest)) => Cursor::at(latest + 1),
+                (None, None) => {
+                    let latest = latest_versionstamp(name, bound, fetch_page).await?;
+                    *walked = Some(latest);
+                    Cursor::at(latest + 1)
+                }
+            }
+        } else {
+            replay
+        };
+
+        let cursor_stmts = if cursor_absent {
             "LET $replayed = $existed AND ((SELECT VALUE id FROM ONLY $cursor) = NONE); \
              LET $initial = IF $existed { $replay } ELSE { $start }; \
              IF (SELECT VALUE id FROM ONLY $cursor) = NONE { CREATE $cursor CONTENT $initial };"
         } else {
             "LET $replayed = false;"
         };
-        let mut response = db
-            .query(format!(
-                "BEGIN TRANSACTION; \
-                 LET $existed = (SELECT VALUE id FROM ONLY $agent) != NONE; \
-                 IF !$existed {{ \
-                     CREATE $agent CONTENT {{ name: $name, created: time::now() }} \
-                 }}; \
-                 {cursor_stmts} \
-                 RETURN $replayed; \
-                 COMMIT TRANSACTION;"
-            ))
-            .bind(("agent", agent_id.clone()))
-            .bind(("cursor", cursor_id))
-            .bind(("name", name.to_string()))
-            .bind(("start", start.unwrap_or(replay)))
-            .bind(("replay", replay))
-            .await
-            .map_err(create_err)?
-            .check()
-            .map_err(create_err)?;
-        // The `RETURN` result is the one before `COMMIT`'s.
-        let returned = response.num_statements().saturating_sub(2);
-        let replayed: Option<bool> = response.take(returned).map_err(create_err)?;
+        let write = async {
+            let mut response = db
+                .query(format!(
+                    "BEGIN TRANSACTION; \
+                     LET $existed = (SELECT VALUE id FROM ONLY $agent) != NONE; \
+                     IF !$existed {{ \
+                         CREATE $agent CONTENT {{ name: $name, created: time::now() }} \
+                     }}; \
+                     {cursor_stmts} \
+                     RETURN $replayed; \
+                     COMMIT TRANSACTION;"
+                ))
+                .bind(("agent", agent_id.clone()))
+                .bind(("cursor", cursor_id))
+                .bind(("name", name.to_string()))
+                .bind(("start", start))
+                .bind(("replay", replay))
+                .await?
+                .check()?;
+            // The `RETURN` result is the one before `COMMIT`'s.
+            let returned = response.num_statements().saturating_sub(2);
+            response.take::<Option<bool>>(returned)
+        };
+        let replayed = bounded(name, bound, write).await?.map_err(create_err)?;
         if replayed == Some(true) {
             tracing::warn!(
                 agent = name,
@@ -157,10 +213,13 @@ impl Agent {
             );
         }
 
-        let agent: Option<Agent> = db.select(agent_id).await.map_err(create_err)?;
-        agent.ok_or_else(|| Error::AgentCreateEmpty {
-            agent: name.to_string(),
-        })
+        let read_back = async { db.select::<Option<Agent>>(agent_id).await };
+        bounded(name, bound, read_back)
+            .await?
+            .map_err(create_err)?
+            .ok_or_else(|| Error::AgentCreateEmpty {
+                agent: name.to_string(),
+            })
     }
 
     /// Send a typed payload to another agent by creating a RELATE edge in the
@@ -168,7 +227,8 @@ impl Agent {
     ///
     /// Rejects unknown recipients: if no `agent` record exists for `to`, returns
     /// [`Error::UnknownRecipient`] instead of creating an edge with a dangling
-    /// `out` pointer.
+    /// `out` pointer. Returns [`Error::Send`] when the recipient lookup or the
+    /// `RELATE` fails, as a call or as a statement.
     pub async fn send<T>(&self, to: &str, payload: T) -> Result<()>
     where
         T: SurrealValue + Send + Sync + Unpin + 'static,
@@ -199,6 +259,7 @@ impl Agent {
             .bind(("to", to_id))
             .bind(("payload", payload))
             .await
+            .and_then(|r| r.check())
             .map_err(|source| Error::Send {
                 to: to.to_string(),
                 source: Box::new(source),
@@ -238,9 +299,8 @@ impl Agent {
     /// loop ends. Each of those awaits is raced against `token`; a cancel
     /// before the ready signal sends [`Error::Cancelled`] naming this agent on
     /// `ready_tx`, before any cleanup await, and the loop ends. A subscribe in
-    /// flight at a cancel is then given up to [`LIVE_KILL_TIMEOUT`] to finish,
-    /// and its live query is ended; a subscribe still in flight after that
-    /// bound, or one that fails after the cancel, is logged at warn. The loop
+    /// flight at a cancel does not hold up the loop: a spawned task finishes
+    /// it (see [`race_subscribe`]). The loop
     /// ends when its ready send fails, or when `token` is cancelled while it
     /// waits for `start`. Later failures reconnect with capped exponential
     /// backoff. While a delivery waits on a
@@ -441,24 +501,28 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// more than once returns [`Error::DuplicateAgentName`] before anything is
     /// created or spawned.
     ///
-    /// Each [`Agent::new`] call is bounded by [`READY_TIMEOUT`], which returns
+    /// Each database call of [`Agent::new`] (each changefeed page among them)
+    /// is bounded by `READY_TIMEOUT`, which returns
     /// [`Error::AgentCreateTimeout`] for that agent, and raced against the
-    /// coalition's token. Waits for every `listen_loop` to signal that its
+    /// coalition's token. The changefeed is read at most once, for the first
+    /// new agent, and that result starts each later new agent. After the last
+    /// `Agent::new` call, waits for every `listen_loop` to signal that its
     /// LIVE query is registered and its first catch-up page query succeeded.
-    /// Each wait is bounded by [`READY_TIMEOUT`]. Each loop holds at its ready
+    /// Each wait is bounded by the ready timeout. Each loop holds at its ready
     /// point, and puts nothing on the bus, until every loop has signalled
     /// ready; this then sends the start signal and returns `Ok`. On any
     /// failure it cancels every spawned loop and waits for each to end before
-    /// it returns the error. The first error a loop sends (including
-    /// [`Error::Cancelled`]) is returned as soon as it arrives, in preference
-    /// to [`Error::ReadyTimeout`] and [`Error::ListenLoopDropped`]; among
-    /// those two, the one for the earliest name in `names` is returned.
+    /// it returns the error. The first error a loop sent that these waits see
+    /// (including [`Error::Cancelled`]) ends the waits and is returned after
+    /// that teardown, in preference to [`Error::ReadyTimeout`] and
+    /// [`Error::ListenLoopDropped`]; among those two, the one for the earliest
+    /// name in `names` is returned.
     ///
-    /// If the coalition's token is cancelled before every loop is ready, this
-    /// returns [`Error::Cancelled`]: with `agent: None` when the token is
-    /// cancelled before any database call (it is checked first) or when it is
-    /// found cancelled after the readiness waits end in `Ok` or
-    /// `ReadyTimeout`; with `agent: Some(name)` when the cancel
+    /// For names that pass validation, a token cancelled before every loop is
+    /// ready returns, unless the waits see another sent error or
+    /// `ListenLoopDropped`, [`Error::Cancelled`]: with `agent: None` when the
+    /// token is cancelled before any database call or when it is found
+    /// cancelled after the readiness waits end in `Ok` or `ReadyTimeout`; with `agent: Some(name)` when the cancel
     /// interrupts that agent's `Agent::new` call or its loop's startup.
     /// Dropping the returned future before it completes cancels the token,
     /// which ends every spawned loop and the retention sweep; the drop does
@@ -468,7 +532,8 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     }
 
     /// Like [`Coalition::new`], with `ready_timeout` in place of
-    /// [`READY_TIMEOUT`] for each `Agent::new` call and each readiness wait.
+    /// `READY_TIMEOUT` for each database call of `Agent::new` and each
+    /// readiness wait.
     pub async fn new_with_ready_timeout(
         names: Vec<String>,
         ready_timeout: Duration,
@@ -477,9 +542,9 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     }
 
     /// Like [`Coalition::new`], with a root token that is a child of
-    /// `parent`: cancelling `parent` cancels the coalition. A `parent` that is
-    /// already cancelled returns [`Error::Cancelled`] with `agent: None`
-    /// before any database call.
+    /// `parent`: cancelling `parent` cancels the coalition. With no repeated
+    /// name, a `parent` that is already cancelled returns [`Error::Cancelled`]
+    /// with `agent: None` before any database call.
     pub async fn new_with_parent(names: Vec<String>, parent: &CancellationToken) -> Result<Self> {
         Self::build(names, READY_TIMEOUT, parent.child_token()).await
     }
@@ -505,29 +570,18 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
         // so the bus closes once all agents shut down.
         let (inbox_tx, inbox_rx) = async_channel::bounded::<Delivery<T>>(INBOX_CAPACITY);
 
+        let bound = CallBound {
+            per_call: ready_timeout,
+            token: &cancellation_token,
+        };
         let mut ready_rxs = Vec::with_capacity(names.len());
+        let mut walked = None;
         for name in names {
-            let created = timeout(
-                ready_timeout,
-                cancellation_token.run_until_cancelled(Agent::new(&name)),
-            )
-            .await;
-            let agent = match created {
-                Ok(Some(Ok(agent))) => agent,
-                Ok(Some(Err(err))) => {
+            let agent = match Agent::create(&name, Some(&bound), &mut walked).await {
+                Ok(agent) => agent,
+                Err(err) => {
                     abort_build(&cancellation_token, &task_tracker).await;
                     return Err(err);
-                }
-                Ok(None) => {
-                    abort_build(&cancellation_token, &task_tracker).await;
-                    return Err(Error::Cancelled { agent: Some(name) });
-                }
-                Err(_elapsed) => {
-                    abort_build(&cancellation_token, &task_tracker).await;
-                    return Err(Error::AgentCreateTimeout {
-                        agent: name,
-                        timeout: ready_timeout,
-                    });
                 }
             };
             agents.write().await.insert(name.clone(), agent.clone());
@@ -606,7 +660,9 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     }
 
     /// Cancel the root token, then wait until every listen loop and the
-    /// retention sweep have ended.
+    /// retention sweep have ended. A subscribe in flight at the cancel is
+    /// finished by a task that this does not wait for, so its `KILL` can run
+    /// after this returns.
     pub async fn shutdown(&self) {
         self.cancellation_token.cancel();
         self.task_tracker.close();
@@ -618,6 +674,36 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Drop for Coalition<T> {
     /// Cancel the root token without waiting for the tasks to end.
     fn drop(&mut self) {
         self.cancellation_token.cancel();
+    }
+}
+
+/// The bound `Coalition::new` puts on each database call of [`Agent::create`].
+struct CallBound<'a> {
+    per_call: Duration,
+    token: &'a CancellationToken,
+}
+
+/// Await `call`, a step of creating `agent`. With no `bound` this is the
+/// call's output. With `bound`, the call is raced against `bound.token`, which
+/// returns [`Error::Cancelled`] for `agent`, and limited to `bound.per_call`,
+/// which returns [`Error::AgentCreateTimeout`] for `agent`.
+async fn bounded<F: Future>(
+    agent: &str,
+    bound: Option<&CallBound<'_>>,
+    call: F,
+) -> Result<F::Output> {
+    let Some(bound) = bound else {
+        return Ok(call.await);
+    };
+    match timeout(bound.per_call, bound.token.run_until_cancelled(call)).await {
+        Ok(Some(output)) => Ok(output),
+        Ok(None) => Err(Error::Cancelled {
+            agent: Some(agent.to_string()),
+        }),
+        Err(_elapsed) => Err(Error::AgentCreateTimeout {
+            agent: agent.to_string(),
+            timeout: bound.per_call,
+        }),
     }
 }
 
@@ -792,7 +878,7 @@ fn versionstamp_of(v: &Value) -> Option<i64> {
     }
 }
 
-/// The integer `versionstamp` field of `o`, if present.
+/// The numeric `versionstamp` field of `o`, if present.
 fn object_versionstamp(o: &Object) -> Option<i64> {
     match o.get("versionstamp") {
         Some(Value::Number(n)) => n.to_int(),
@@ -821,9 +907,9 @@ fn position_within(index: i64, max: u64) -> Option<i64> {
         .map(|_| index)
 }
 
-/// Parse a `cursor` row: an object with a non-negative integer `versionstamp`
-/// and an optional non-negative integer `change_index` (absent → 0) that fits
-/// `usize`. Any other shape returns [`Error::CursorLoad`] for `agent`.
+/// Parse a `cursor` row: an object with a `versionstamp` number and an optional
+/// `change_index` number (absent → 0), each non-negative after
+/// `Number::to_int`, with `change_index` fitting `usize`. Any other shape returns [`Error::CursorLoad`] for `agent`.
 fn parse_cursor(agent: &str, row: &Value) -> Result<Cursor> {
     let malformed = || Error::CursorLoad {
         agent: agent.to_string(),
@@ -865,25 +951,89 @@ async fn save_cursor(db: &Surreal<any::Any>, agent: &str, cursor: Cursor) -> Res
     Ok(())
 }
 
-/// Largest `versionstamp` in a `SHOW CHANGES` result array (0 if empty/none).
-fn max_versionstamp(v: &Value) -> i64 {
-    let Value::Array(arr) = v else { return 0 };
-    arr.iter().filter_map(versionstamp_of).max().unwrap_or(0)
+/// What [`page_highest`] reads from one snapshot page: its highest numeric
+/// versionstamp, and whether it holds [`CATCHUP_BATCH`] changesets or more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotPage {
+    highest: Option<i64>,
+    full: bool,
 }
 
-/// Highest versionstamp in the first `SHOW CHANGES` page of the message
-/// changefeed (at most 1000 changesets), for a new agent's starting cursor;
-/// 0 when the feed is empty. [`Agent::new`] runs it only when
-/// `cursor:<agent>` is absent. Errors map to [`Error::AgentCreate`] for
-/// `agent`.
-async fn latest_versionstamp(db: &Surreal<any::Any>, agent: &str) -> Result<i64> {
-    let v = query_changes(db, 0, 1_000_000)
-        .await
-        .map_err(|source| Error::AgentCreate {
-            agent: agent.to_string(),
-            source: Box::new(source),
-        })?;
-    Ok(max_versionstamp(&v))
+/// The [`SnapshotPage`] of `reply`, the `SHOW CHANGES` page read `SINCE since`
+/// for a new `agent`'s snapshot.
+///
+/// A changeset that is not an object or has no numeric versionstamp is logged
+/// at error level and skipped. [`Error::AgentCreate`] for `agent` when `reply`
+/// is not an array, when a full page has no numeric versionstamp, or when its
+/// highest versionstamp is below `since` or is `i64::MAX`, either of which
+/// leaves no later page to read.
+fn page_highest(agent: &str, since: i64, reply: &Value) -> Result<SnapshotPage> {
+    let malformed = |message: String| Error::AgentCreate {
+        agent: agent.to_string(),
+        source: reply_error(message),
+    };
+    let Value::Array(changesets) = reply else {
+        return Err(malformed(format!(
+            "SHOW CHANGES reply is not an array: {reply:?}"
+        )));
+    };
+    let full = changesets.len() >= CATCHUP_BATCH;
+    let mut highest = None;
+    for changeset in changesets.iter() {
+        match versionstamp_of(changeset) {
+            Some(vs) => highest = highest.max(Some(vs)),
+            None => tracing::error!(
+                "snapshot for {agent}: changeset is not an object with an integer versionstamp, \
+                 skipped: {changeset:?}"
+            ),
+        }
+    }
+    match highest {
+        Some(vs) if vs >= since && vs < i64::MAX => Ok(SnapshotPage { highest, full }),
+        Some(vs) => Err(malformed(format!(
+            "SHOW CHANGES SINCE {since} reply ends at versionstamp {vs}"
+        ))),
+        None if full => Err(malformed(format!(
+            "SHOW CHANGES SINCE {since} reply has no integer versionstamp in {} changesets",
+            changesets.len()
+        ))),
+        None => Ok(SnapshotPage { highest, full }),
+    }
+}
+
+/// Highest versionstamp in the message changefeed, for a new agent's starting
+/// cursor; 0 when the feed is empty. Reads pages through `fetch_page` from
+/// `SINCE 0`, each next page `SINCE` 1 above the last page's highest, until a
+/// page is not full, each read awaited through [`bounded`]. A failed
+/// read maps to [`Error::AgentCreate`] for `agent`; see [`page_highest`] for a
+/// malformed page.
+async fn latest_versionstamp<F, Fut>(
+    agent: &str,
+    bound: Option<&CallBound<'_>>,
+    mut fetch_page: F,
+) -> Result<i64>
+where
+    F: FnMut(i64) -> Fut,
+    Fut: Future<Output = std::result::Result<Value, surrealdb::Error>>,
+{
+    let mut latest = 0;
+    let mut since = 0;
+    loop {
+        let reply = bounded(agent, bound, fetch_page(since))
+            .await?
+            .map_err(|source| Error::AgentCreate {
+                agent: agent.to_string(),
+                source: Box::new(source),
+            })?;
+        let page = page_highest(agent, since, &reply)?;
+        if let Some(highest) = page.highest {
+            latest = highest;
+            since = highest + 1;
+        }
+        if !page.full {
+            return Ok(latest);
+        }
+    }
 }
 
 /// Run `SHOW CHANGES FOR TABLE message SINCE <since> LIMIT <limit>` and return
@@ -1088,11 +1238,11 @@ const NON_MESSAGE_OPS: [&str; 2] = ["delete", "define_table"];
 /// are not read again. A change is handled when it is a `delete` or
 /// `define_table` op, when its `update` record's `out` is another agent (`out`
 /// is compared before any decode), or when its delivery is on the bus. A
-/// changeset with no integer versionstamp has no position of its own: it is
+/// changeset with no numeric versionstamp has no position of its own: it is
 /// skipped, and the cursor passes it only by moving to a later changeset's
 /// position.
 ///
-/// Malformed-data rule: a changeset that is not an object or has no integer
+/// Malformed-data rule: a changeset that is not an object or has no numeric
 /// versionstamp, a `changes` field that is missing or not an array, a change
 /// that is not an object or has no `update`, `delete` or `define_table` key, a
 /// record that is not an object, a record whose `out` is missing or not a
@@ -1291,11 +1441,12 @@ fn next_backoff(current: Duration) -> Duration {
 ///
 /// The payload is typed as `Value` and only signals that a message for `owner`
 /// changed; delivery happens via catch_up. `owner` is bound as a parameter.
-async fn subscribe_wake(
-    db: &Surreal<any::Any>,
-    owner: &RecordId,
-    agent: &str,
-) -> Result<(QueryStream<Notification<Value>>, Uuid)> {
+///
+/// Errors: [`Error::LiveQuery`] when the statement fails;
+/// [`Error::LiveQueryIdMissing`] when the id cannot be read; [`Error::Stream`]
+/// when the stream cannot be opened, after a `KILL` of the live query (see
+/// [`stream_or_kill`]).
+async fn subscribe_wake(db: &Surreal<any::Any>, owner: &RecordId, agent: &str) -> Subscribed {
     let mut response = db
         .query("LIVE SELECT id FROM message WHERE out = $owner")
         .bind(("owner", owner.clone()))
@@ -1304,33 +1455,76 @@ async fn subscribe_wake(
             agent: agent.to_string(),
             source: Box::new(source),
         })?;
-    let stream = response
-        .stream::<Notification<Value>>(0)
-        .map_err(|source| Error::Stream {
-            agent: agent.to_string(),
-            source: Box::new(source),
-        })?;
-    match response.take::<Value>(0) {
-        Ok(Value::Uuid(live_id)) => Ok((stream, live_id)),
-        _ => Err(Error::LiveQueryIdMissing {
-            agent: agent.to_string(),
-        }),
+    let live_id = live_id_of(agent, response.take::<Value>(0))?;
+    let opened = response.stream::<Notification<Value>>(0);
+    let stream = stream_or_kill(db, agent, live_id, opened).await?;
+    Ok((stream, live_id))
+}
+
+/// The live-query id in `taken`, the read of a `LIVE SELECT` result. A failed
+/// read, or a value that is not a uuid, is [`Error::LiveQueryIdMissing`] with
+/// that error or that value in its source.
+fn live_id_of(agent: &str, taken: std::result::Result<Value, surrealdb::Error>) -> Result<Uuid> {
+    let missing = |source| Error::LiveQueryIdMissing {
+        agent: agent.to_string(),
+        source,
+    };
+    match taken {
+        Ok(Value::Uuid(live_id)) => Ok(live_id),
+        Ok(other) => Err(missing(reply_error(format!(
+            "live-query id is not a uuid: {other:?}"
+        )))),
+        Err(source) => Err(missing(Box::new(source))),
     }
 }
 
-/// [`subscribe_wake`] for `ctx.owner`, raced against `ctx.token`. Returns
-/// `None` when the token is cancelled first; if `ready_tx` still holds the
-/// ready sender, [`Error::Cancelled`] is sent on it before any further await,
-/// else the stop is logged.
-/// A subscribe in flight at the cancel is then given up to
-/// [`LIVE_KILL_TIMEOUT`] to finish, and its live query is ended with
-/// [`end_live`]. A subscribe still in flight after that bound, and a
-/// subscribe that fails after the cancel, are logged at warn with the agent
-/// and the error chain.
+/// The stream in `opened`. When `opened` is an error, sends a `KILL` of live
+/// query `live_id` through [`kill_live`], then returns [`Error::Stream`] with
+/// that error as its source.
+async fn stream_or_kill(
+    db: &Surreal<any::Any>,
+    agent: &str,
+    live_id: Uuid,
+    opened: std::result::Result<QueryStream<Notification<Value>>, surrealdb::Error>,
+) -> Result<QueryStream<Notification<Value>>> {
+    match opened {
+        Ok(stream) => Ok(stream),
+        Err(source) => {
+            kill_live(db, agent, live_id).await;
+            Err(Error::Stream {
+                agent: agent.to_string(),
+                source: Box::new(source),
+            })
+        }
+    }
+}
+
+/// [`subscribe_wake`] for `ctx.owner`, raced against `ctx.token` by
+/// [`race_subscribe`].
 async fn subscribe_unless_cancelled<T: SurrealValue>(
     ctx: &LoopCtx<'_, T>,
     ready_tx: &mut Option<oneshot::Sender<Result<()>>>,
-) -> Option<Result<(QueryStream<Notification<Value>>, Uuid)>> {
+) -> Option<Subscribed> {
+    let (db, owner, agent) = (ctx.db, ctx.owner.clone(), ctx.agent.to_string());
+    let subscribe = async move { subscribe_wake(db, &owner, &agent).await };
+    race_subscribe(ctx, ready_tx, subscribe).await
+}
+
+/// Race `subscribe` against `ctx.token`. Returns `None` when the token is
+/// cancelled first; if `ready_tx` still holds the ready sender,
+/// [`Error::Cancelled`] is sent on it before any further await, else the stop
+/// is logged. A `subscribe` in flight at the cancel moves to a spawned
+/// [`finish_subscribe`] task, which this does not wait for and which no
+/// `TaskTracker` tracks, so `Coalition::shutdown` does not wait for it either.
+async fn race_subscribe<T, F>(
+    ctx: &LoopCtx<'_, T>,
+    ready_tx: &mut Option<oneshot::Sender<Result<()>>>,
+    subscribe: F,
+) -> Option<Subscribed>
+where
+    T: SurrealValue,
+    F: Future<Output = Subscribed> + Send + 'static,
+{
     let cancelled = |ready_tx: &mut Option<oneshot::Sender<Result<()>>>| match ready_tx.take() {
         Some(tx) => cancel_startup(ctx.agent, tx),
         None => Stop::Cancelled.log(ctx.agent),
@@ -1339,37 +1533,95 @@ async fn subscribe_unless_cancelled<T: SurrealValue>(
         cancelled(ready_tx);
         return None;
     }
-    let mut subscribe = std::pin::pin!(subscribe_wake(ctx.db, &ctx.owner, ctx.agent));
+    let mut subscribe = Box::pin(subscribe);
     tokio::select! {
         biased;
         subscribed = &mut subscribe => return Some(subscribed),
         () = ctx.token.cancelled() => {}
     }
     cancelled(ready_tx);
-    match timeout(LIVE_KILL_TIMEOUT, subscribe).await {
-        Ok(Ok((stream, live_id))) => end_live(ctx.db, ctx.agent, live_id, stream).await,
-        Ok(Err(e)) => tracing::warn!(
-            "subscribe for {} failed after a cancel: {}",
-            ctx.agent,
-            chain(&e)
-        ),
-        Err(_elapsed) => tracing::warn!(
-            "subscribe for {} still in flight {LIVE_KILL_TIMEOUT:?} after a cancel; \
-             its live query, if registered, is not ended",
-            ctx.agent
-        ),
-    }
+    tokio::spawn(finish_subscribe(ctx.db, ctx.agent.to_string(), subscribe).in_current_span());
     None
 }
 
-/// `KILL` live query `live_id` through `db` within [`LIVE_KILL_TIMEOUT`],
-/// logging a failure or timeout at warn, then drop `stream`.
+/// A future that awaits `subscribe`, in flight when `agent`'s loop was
+/// cancelled, then sends a `KILL` of the returned live query with [`end_live`].
+/// A failed `subscribe` is logged at warn with the agent and the error chain;
+/// a failed `KILL` call is logged by [`kill_live`]. With no reply after
+/// [`LIVE_KILL_TIMEOUT`], the future logs a warn with the agent and keeps
+/// waiting, with no bound. If the future is dropped before it finishes, polled
+/// or not, [`UnfinishedSubscribe`] logs a warn with the agent.
+fn finish_subscribe<F>(
+    db: &Surreal<any::Any>,
+    agent: String,
+    subscribe: F,
+) -> impl Future<Output = ()>
+where
+    F: Future<Output = Subscribed>,
+{
+    let unfinished = UnfinishedSubscribe { agent, armed: true };
+    async move {
+        let agent = unfinished.agent.as_str();
+        let mut subscribe = std::pin::pin!(subscribe);
+        let subscribed = match timeout(LIVE_KILL_TIMEOUT, &mut subscribe).await {
+            Ok(subscribed) => subscribed,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "subscribe for {agent} has no reply {LIVE_KILL_TIMEOUT:?} after a cancel; the \
+                     live query, if registered, is not yet ended"
+                );
+                subscribe.await
+            }
+        };
+        match subscribed {
+            Ok((stream, live_id)) => end_live(db, agent, live_id, stream).await,
+            Err(e) => tracing::warn!("subscribe for {agent} failed after a cancel: {}", chain(&e)),
+        }
+        unfinished.disarm();
+    }
+}
+
+/// Logs a warn for `agent` on drop, unless [`UnfinishedSubscribe::disarm`]
+/// consumed it.
+struct UnfinishedSubscribe {
+    agent: String,
+    armed: bool,
+}
+
+impl UnfinishedSubscribe {
+    /// Drop this with no log.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnfinishedSubscribe {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::warn!(
+                "subscribe finisher for {} dropped before it finished; the live query, if \
+                 registered, may not be ended",
+                self.agent
+            );
+        }
+    }
+}
+
+/// Send a `KILL` of live query `live_id` through [`kill_live`], then drop
+/// `stream`.
 async fn end_live(
     db: &Surreal<any::Any>,
     agent: &str,
     live_id: Uuid,
     stream: QueryStream<Notification<Value>>,
 ) {
+    kill_live(db, agent, live_id).await;
+    drop(stream);
+}
+
+/// `KILL` live query `live_id` through `db` within [`LIVE_KILL_TIMEOUT`],
+/// logging a failure or timeout at warn.
+async fn kill_live(db: &Surreal<any::Any>, agent: &str, live_id: Uuid) {
     let kill = db.query("KILL $id").bind(("id", Value::Uuid(live_id)));
     let outcome = match timeout(LIVE_KILL_TIMEOUT, kill).await {
         Ok(result) => result
@@ -1387,13 +1639,12 @@ async fn end_live(
         }),
     };
     if let Err(e) = outcome {
-        warn_end_live(&e);
+        warn_kill_live(&e);
     }
-    drop(stream);
 }
 
-/// Log an [`end_live`] failure at warn with its full source chain.
-fn warn_end_live(e: &Error) {
+/// Log a [`kill_live`] failure at warn with its full source chain.
+fn warn_kill_live(e: &Error) {
     tracing::warn!("{}", chain(e));
 }
 
@@ -1548,6 +1799,982 @@ mod tests {
         }
     }
 
+    /// `sink`'s logged text, for a test that installed it as the subscriber's
+    /// writer.
+    fn logged(sink: &LogSink) -> String {
+        String::from_utf8(sink.0.lock().expect("log sink lock").clone()).expect("utf-8 logs")
+    }
+
+    /// A subscriber writing plain text to a new [`LogSink`].
+    fn capturing_subscriber() -> (impl tracing::Subscriber + Send + Sync, LogSink) {
+        let sink = LogSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        (subscriber, sink)
+    }
+
+    /// An [`Error::LiveQueryIdMissing`] for `agent`.
+    fn id_missing(agent: &str) -> Error {
+        Error::LiveQueryIdMissing {
+            agent: agent.to_string(),
+            source: reply_error("no id".to_string()),
+        }
+    }
+
+    /// `pairs` as a `Value::Object`.
+    fn object(pairs: Vec<(&str, Value)>) -> Value {
+        Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+
+    /// A changeset with `versionstamp` and no changes.
+    fn changeset(versionstamp: i64) -> Value {
+        object(vec![
+            ("versionstamp", versionstamp.into_value()),
+            ("changes", Value::Array(Vec::<Value>::new().into())),
+        ])
+    }
+
+    /// `changesets` as a `SHOW CHANGES` reply.
+    fn reply_of(changesets: Vec<Value>) -> Value {
+        Value::Array(changesets.into_iter().collect())
+    }
+
+    /// A full `SHOW CHANGES` reply: [`CATCHUP_BATCH`] changesets from versionstamp
+    /// `first` on.
+    fn full_page(first: i64) -> Value {
+        let last = first + i64::try_from(CATCHUP_BATCH).expect("batch fits i64");
+        reply_of((first..last).map(changeset).collect())
+    }
+
+    /// [`page_highest`] on a well-formed page returns its highest
+    /// versionstamp in any order, `None` for an empty page, and reports a
+    /// page as full only at [`CATCHUP_BATCH`] changesets.
+    #[test]
+    fn page_highest_reads_a_well_formed_page() {
+        let short = |highest| SnapshotPage {
+            highest,
+            full: false,
+        };
+        let page = reply_of(vec![changeset(7), changeset(9), changeset(8)]);
+        assert_eq!(
+            page_highest("frank", 0, &page).expect("page"),
+            short(Some(9))
+        );
+        assert_eq!(
+            page_highest("frank", 9, &page).expect("page"),
+            short(Some(9))
+        );
+        assert_eq!(
+            page_highest("frank", 0, &reply_of(vec![])).expect("empty page"),
+            short(None)
+        );
+
+        let top = i64::try_from(CATCHUP_BATCH).expect("batch fits i64");
+        assert_eq!(
+            page_highest("frank", 0, &full_page(1)).expect("full page"),
+            SnapshotPage {
+                highest: Some(top),
+                full: true
+            }
+        );
+        let one_short = reply_of((1..top).map(changeset).collect());
+        assert_eq!(
+            page_highest("frank", 0, &one_short).expect("page one below full"),
+            short(Some(top - 1))
+        );
+    }
+
+    /// [`page_highest`] on a reply that is not an array returns
+    /// [`Error::AgentCreate`] for the agent, naming the reply.
+    #[test]
+    fn page_highest_rejects_a_non_array_reply() {
+        for reply in [Value::None, 5i64.into_value(), changeset(5)] {
+            let result = page_highest("frank", 0, &reply);
+            let Err(err @ Error::AgentCreate { .. }) = &result else {
+                panic!("expected AgentCreate for {reply:?}, got {result:?}");
+            };
+            let rendered = chain(err);
+            assert!(
+                rendered.contains("frank") && rendered.contains("not an array"),
+                "the error must name the agent and the reply; got {rendered:?}"
+            );
+        }
+    }
+
+    /// [`page_highest`] logs each changeset with no numeric versionstamp at
+    /// error level and skips it. With no numeric versionstamp in a full page
+    /// it returns [`Error::AgentCreate`]; in a short page it returns no
+    /// position.
+    #[test]
+    fn page_highest_skips_malformed_changesets_and_rejects_a_full_malformed_page() {
+        let no_stamp = object(vec![("changes", Value::Array(Vec::<Value>::new().into()))]);
+        let text_stamp = object(vec![("versionstamp", "7".to_string().into_value())]);
+        let mixed = reply_of(vec![
+            no_stamp.clone(),
+            changeset(4),
+            5i64.into_value(),
+            text_stamp.clone(),
+        ]);
+        let short_malformed = reply_of(vec![no_stamp.clone(), text_stamp]);
+        let full_malformed = reply_of(vec![no_stamp; CATCHUP_BATCH]);
+
+        let (subscriber, sink) = capturing_subscriber();
+        let (highest, short, rejected) = tracing::subscriber::with_default(subscriber, || {
+            (
+                page_highest("frank", 0, &mixed),
+                page_highest("frank", 0, &short_malformed),
+                page_highest("frank", 0, &full_malformed),
+            )
+        });
+
+        assert_eq!(highest.expect("mixed page").highest, Some(4));
+        assert_eq!(
+            short.expect("a short malformed page has no error"),
+            SnapshotPage {
+                highest: None,
+                full: false
+            }
+        );
+        assert!(
+            matches!(rejected, Err(Error::AgentCreate { ref agent, .. }) if agent == "frank"),
+            "a full malformed page must return AgentCreate, got {rejected:?}"
+        );
+        let logs = logged(&sink);
+        let errors = logs.lines().filter(|l| l.contains("ERROR")).count();
+        assert_eq!(
+            errors,
+            5 + CATCHUP_BATCH,
+            "expected 3 lines for the mixed page, 2 for the short malformed one and one per \
+             changeset of the full one; got {errors}"
+        );
+    }
+
+    /// [`page_highest`] returns [`Error::AgentCreate`] for a page that ends
+    /// below `since` or at `i64::MAX`, either of which has no later page.
+    #[test]
+    fn page_highest_rejects_a_page_with_no_later_page() {
+        for (since, vs) in [(10, 9), (0, -1), (0, i64::MAX)] {
+            let result = page_highest("frank", since, &reply_of(vec![changeset(vs)]));
+            assert!(
+                matches!(result, Err(Error::AgentCreate { .. })),
+                "SINCE {since} with versionstamp {vs} must return AgentCreate, got {result:?}"
+            );
+        }
+    }
+
+    /// A boxed read of one changefeed page.
+    type PageRead =
+        std::pin::Pin<Box<dyn Future<Output = std::result::Result<Value, surrealdb::Error>>>>;
+
+    /// `pages` in order as a `fetch_page` for [`latest_versionstamp`], with
+    /// each `since` it is called with pushed on `seen`, each read taking
+    /// `delay`, and empty replies after the last page.
+    fn scripted_pages(
+        pages: Vec<Value>,
+        seen: &std::cell::RefCell<Vec<i64>>,
+        delay: Duration,
+    ) -> impl FnMut(i64) -> PageRead {
+        let mut pages = pages.into_iter();
+        move |since| {
+            seen.borrow_mut().push(since);
+            let page = pages.next().unwrap_or_else(|| reply_of(vec![]));
+            Box::pin(async move {
+                sleep(delay).await;
+                Ok(page)
+            })
+        }
+    }
+
+    /// [`latest_versionstamp`] reads past full pages, each next `SINCE` 1
+    /// above the last highest, and ends on a short or an empty page: pages of
+    /// 1000, 1000 and 3 changesets take 3 reads, a feed of exactly one full
+    /// page takes 2, an empty feed takes 1, and a feed that gains a changeset
+    /// before each read still ends. A short page with no numeric versionstamp
+    /// logs at error and ends the read at the last position.
+    #[tokio::test(flavor = "current_thread")]
+    async fn latest_versionstamp_pages_until_a_short_reply() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let pages = vec![
+            full_page(1),
+            full_page(1001),
+            reply_of(vec![changeset(2001), changeset(2002), changeset(2003)]),
+        ];
+        let latest =
+            latest_versionstamp("frank", None, scripted_pages(pages, &seen, Duration::ZERO))
+                .await
+                .expect("snapshot");
+        assert_eq!(latest, 2003, "the highest versionstamp of the last page");
+        assert_eq!(*seen.borrow(), vec![0, 1001, 2001], "SINCE of each page");
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let latest = latest_versionstamp(
+            "frank",
+            None,
+            scripted_pages(vec![full_page(1)], &seen, Duration::ZERO),
+        )
+        .await
+        .expect("one full page");
+        assert_eq!(latest, 1000, "a feed of exactly one full page");
+        assert_eq!(
+            *seen.borrow(),
+            vec![0, 1001],
+            "an empty reply ends the read"
+        );
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let latest =
+            latest_versionstamp("frank", None, scripted_pages(vec![], &seen, Duration::ZERO))
+                .await
+                .expect("empty feed");
+        assert_eq!(latest, 0, "an empty feed");
+        assert_eq!(*seen.borrow(), vec![0], "one read of an empty feed");
+
+        let reads = std::cell::Cell::new(0);
+        let tail = std::cell::Cell::new(1000);
+        let latest = latest_versionstamp("frank", None, |since| {
+            reads.set(reads.get() + 1);
+            assert!(
+                reads.get() <= 2,
+                "a feed that gains a changeset before each read took {} reads",
+                reads.get()
+            );
+            let page = reply_of((since.max(1)..=tail.get()).map(changeset).collect());
+            tail.set(tail.get() + 1);
+            async move { Ok(page) }
+        })
+        .await
+        .expect("growing feed");
+        assert_eq!(latest, 1001, "the growing feed's tail at the last read");
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let pages = vec![full_page(1), reply_of(vec![object(vec![])])];
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let latest =
+            latest_versionstamp("frank", None, scripted_pages(pages, &seen, Duration::ZERO)).await;
+        drop(guard);
+        assert_eq!(
+            latest.expect("a short page with no versionstamp is not an error"),
+            1000,
+            "the position before that page"
+        );
+        assert_eq!(
+            *seen.borrow(),
+            vec![0, 1001],
+            "the short page ends the read"
+        );
+        let logs = logged(&sink);
+        assert_eq!(
+            logs.lines().filter(|l| l.contains("ERROR")).count(),
+            1,
+            "one error line for the changeset with no versionstamp; got {logs:?}"
+        );
+    }
+
+    /// [`latest_versionstamp`] under a bound that one page meets and the whole
+    /// read does not: 5 reads of 60 ms under a 200 ms bound take at least
+    /// 300 ms and return the position.
+    #[tokio::test]
+    async fn latest_versionstamp_bounds_each_page_not_the_whole_read() {
+        let per_call = Duration::from_millis(200);
+        let token = CancellationToken::new();
+        let bound = CallBound {
+            per_call,
+            token: &token,
+        };
+        let seen = std::cell::RefCell::new(Vec::new());
+        let pages = [1, 1001, 2001, 3001].map(full_page).to_vec();
+        let began = tokio::time::Instant::now();
+        let latest = latest_versionstamp(
+            "frank",
+            Some(&bound),
+            scripted_pages(pages, &seen, Duration::from_millis(60)),
+        )
+        .await;
+        let elapsed = began.elapsed();
+        assert_eq!(
+            latest.expect("a read longer than one bound must succeed"),
+            4000
+        );
+        assert_eq!(
+            *seen.borrow(),
+            vec![0, 1001, 2001, 3001, 4001],
+            "SINCE of each page"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "5 reads of 60 ms must take at least 300 ms; they took {elapsed:?}"
+        );
+    }
+
+    /// [`latest_versionstamp`] under a bound returns
+    /// [`Error::AgentCreateTimeout`] for a page that outlasts the bound, and
+    /// [`Error::Cancelled`] for a token cancelled during a page, both after
+    /// an earlier page succeeded, each within 5 s.
+    #[tokio::test]
+    async fn latest_versionstamp_ends_on_a_stalled_or_cancelled_page() {
+        let limit = Duration::from_secs(5);
+        let per_call = Duration::from_millis(50);
+        let stalled_second_page = |calls: &std::cell::Cell<u32>| {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        };
+
+        let token = CancellationToken::new();
+        let bound = CallBound {
+            per_call,
+            token: &token,
+        };
+        let calls = std::cell::Cell::new(0);
+        let read = latest_versionstamp("frank", Some(&bound), |_| {
+            let stall = stalled_second_page(&calls);
+            async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                Ok(full_page(1))
+            }
+        });
+        let result = timeout(limit, read).await;
+        assert!(
+            matches!(
+                &result,
+                Ok(Err(Error::AgentCreateTimeout { agent, timeout }))
+                    if agent == "frank" && *timeout == per_call
+            ),
+            "expected AgentCreateTimeout for frank, got {result:?}"
+        );
+
+        let token = CancellationToken::new();
+        let bound = CallBound {
+            per_call: Duration::from_secs(30),
+            token: &token,
+        };
+        let calls = std::cell::Cell::new(0);
+        let cancel = token.clone();
+        let read = latest_versionstamp("frank", Some(&bound), |_| {
+            let stall = stalled_second_page(&calls);
+            let cancel = cancel.clone();
+            async move {
+                if stall {
+                    cancel.cancel();
+                    std::future::pending::<()>().await;
+                }
+                Ok(full_page(1))
+            }
+        });
+        let result = timeout(limit, read).await;
+        assert!(
+            matches!(&result, Ok(Err(Error::Cancelled { agent: Some(a) })) if a == "frank"),
+            "expected Cancelled for frank, got {result:?}"
+        );
+    }
+
+    /// `db` with the `agent` and `cursor` tables defined.
+    async fn define_agent_tables(db: &Surreal<any::Any>) {
+        db.query(format!(
+            "DEFINE TABLE {AGENT_TABLE}; DEFINE TABLE {CURSOR_TABLE};"
+        ))
+        .await
+        .and_then(|r| r.check())
+        .expect("define agent and cursor tables");
+    }
+
+    /// Whether `table:name` exists on `db`.
+    async fn row_exists(db: &Surreal<any::Any>, table: &str, name: &str) -> bool {
+        db.select::<Option<Value>>((table, name))
+            .await
+            .expect("read row")
+            .is_some()
+    }
+
+    /// [`Agent::create_on`] with a snapshot reply that is not an array, or a
+    /// full one that holds no numeric versionstamp, returns
+    /// [`Error::AgentCreate`] and writes neither record; with a well-formed
+    /// feed it writes both, the cursor 1 above the feed's highest
+    /// versionstamp.
+    #[tokio::test]
+    async fn create_on_writes_nothing_after_a_malformed_snapshot() {
+        let db = mem_db().await;
+        define_agent_tables(&db).await;
+
+        for (name, reply) in [
+            ("nonarray", 5i64.into_value()),
+            ("unstamped", reply_of(vec![object(vec![]); CATCHUP_BATCH])),
+        ] {
+            let result = Agent::create_on(&db, name, None, &mut None, |_| {
+                let reply = reply.clone();
+                async move { Ok(reply) }
+            })
+            .await;
+            assert!(
+                matches!(&result, Err(Error::AgentCreate { agent, .. }) if agent == name),
+                "expected AgentCreate for {name}, got {result:?}"
+            );
+            let (agent_row, cursor_row) = (
+                row_exists(&db, AGENT_TABLE, name).await,
+                row_exists(&db, CURSOR_TABLE, name).await,
+            );
+            assert_eq!(
+                (agent_row, cursor_row),
+                (false, false),
+                "a malformed snapshot must write no record for {name}"
+            );
+        }
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let pages = vec![reply_of(vec![changeset(40)])];
+        Agent::create_on(
+            &db,
+            "wellformed",
+            None,
+            &mut None,
+            scripted_pages(pages, &seen, Duration::ZERO),
+        )
+        .await
+        .expect("create on a well-formed feed");
+        let cursor = load_cursor(&db, "wellformed").await.expect("load cursor");
+        assert_eq!(cursor, Some(Cursor::at(41)));
+        assert!(row_exists(&db, AGENT_TABLE, "wellformed").await);
+    }
+
+    /// Create `agent:<name>` on `db`.
+    async fn create_agent_row(db: &Surreal<any::Any>, name: &str) {
+        db.query(format!(
+            "CREATE {AGENT_TABLE}:{name} CONTENT {{ name: '{name}', created: time::now() }}"
+        ))
+        .await
+        .and_then(|r| r.check())
+        .expect("create agent row");
+    }
+
+    /// [`Agent::create_on`] for an existing agent with no cursor reads no
+    /// changefeed page and creates the cursor at versionstamp 0.
+    #[tokio::test]
+    async fn create_on_reads_no_page_for_an_existing_agent() {
+        let db = mem_db().await;
+        define_agent_tables(&db).await;
+        create_agent_row(&db, "old").await;
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut walked = None;
+        Agent::create_on(
+            &db,
+            "old",
+            None,
+            &mut walked,
+            scripted_pages(vec![full_page(1)], &seen, Duration::ZERO),
+        )
+        .await
+        .expect("create on an existing agent");
+
+        assert_eq!(*seen.borrow(), Vec::<i64>::new(), "reads of the changefeed");
+        assert_eq!(walked, None, "no read means no result for a later agent");
+        let cursor = load_cursor(&db, "old").await.expect("load cursor");
+        assert_eq!(cursor, Some(Cursor::at(0)));
+    }
+
+    /// [`Agent::create_on`] for an agent whose record appears after the
+    /// existence read decides by the transaction's own check: the cursor
+    /// starts at versionstamp 0, not after the feed the walk read.
+    #[tokio::test]
+    async fn create_on_replays_for_an_agent_created_during_the_walk() {
+        let db = mem_db().await;
+        define_agent_tables(&db).await;
+
+        let db_ref = &db;
+        Agent::create_on(&db, "racer", None, &mut None, |_| async move {
+            create_agent_row(db_ref, "racer").await;
+            Ok(reply_of(vec![changeset(40)]))
+        })
+        .await
+        .expect("create on an agent created during the walk");
+
+        let cursor = load_cursor(&db, "racer").await.expect("load cursor");
+        assert_eq!(cursor, Some(Cursor::at(0)));
+    }
+
+    /// Two new agents through one `walked` state make the reads of one walk,
+    /// and each cursor starts 1 above that walk's result. A failed walk names
+    /// the agent that ran it and leaves no result.
+    #[tokio::test]
+    async fn create_on_walks_once_for_new_agents_sharing_a_state() {
+        let db = mem_db().await;
+        define_agent_tables(&db).await;
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let pages = vec![full_page(1), reply_of(vec![changeset(1001)])];
+        let mut fetch = scripted_pages(pages, &seen, Duration::ZERO);
+        let mut walked = None;
+        for name in ["first", "second"] {
+            Agent::create_on(&db, name, None, &mut walked, &mut fetch)
+                .await
+                .expect("create a new agent");
+        }
+
+        assert_eq!(*seen.borrow(), vec![0, 1001], "the reads of one walk");
+        for name in ["first", "second"] {
+            let cursor = load_cursor(&db, name).await.expect("load cursor");
+            assert_eq!(cursor, Some(Cursor::at(1002)), "cursor of {name}");
+        }
+
+        let mut walked = None;
+        let result = Agent::create_on(&db, "third", None, &mut walked, |_| async {
+            Ok(5i64.into_value())
+        })
+        .await;
+        assert!(
+            matches!(&result, Err(Error::AgentCreate { agent, .. }) if agent == "third"),
+            "the walk's error must name the agent that ran it, got {result:?}"
+        );
+        assert_eq!(walked, None, "a failed walk leaves no result");
+    }
+
+    /// [`live_id_of`] returns the uuid; for a failed read it carries the
+    /// read's error in its source chain, and for another value that value.
+    #[test]
+    fn live_id_of_keeps_the_failed_read_or_the_unexpected_value() {
+        let id = Uuid::new_v4();
+        assert_eq!(
+            live_id_of("frank", Ok(Value::Uuid(id))).expect("uuid"),
+            id,
+            "a uuid is the id"
+        );
+
+        let failed = Err(surrealdb::Error::internal("take refused".to_string()));
+        let unexpected = Ok("not-a-uuid".to_string().into_value());
+        for (taken, needle) in [(failed, "take refused"), (unexpected, "not-a-uuid")] {
+            let result = live_id_of("frank", taken);
+            let Err(err @ Error::LiveQueryIdMissing { agent, .. }) = &result else {
+                panic!("expected LiveQueryIdMissing, got {result:?}");
+            };
+            assert_eq!(agent, "frank");
+            let rendered = chain(err);
+            assert!(
+                rendered.contains(needle),
+                "the source must carry {needle:?}; rendered {rendered:?}"
+            );
+        }
+    }
+
+    /// [`stream_or_kill`] with a failed stream open ends the live query, whose
+    /// count on the datastore returns to its earlier value, and returns
+    /// [`Error::Stream`] with the open's error in its source; with an open
+    /// stream it leaves the live query registered.
+    #[tokio::test]
+    async fn stream_or_kill_ends_the_live_query_of_a_failed_open() {
+        let db = mem_db().await;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let before = message_lives(&db).await.len();
+
+        let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe");
+        let kept = stream_or_kill(&db, "frank", live_id, Ok(stream))
+            .await
+            .expect("an open stream is returned");
+        let during = message_lives(&db).await.len();
+        assert_eq!(during, before + 1, "an open stream keeps its live query");
+
+        let opened = Err(surrealdb::Error::internal("no stream".to_string()));
+        let result = stream_or_kill(&db, "frank", live_id, opened).await;
+        let Err(err @ Error::Stream { agent, .. }) = &result else {
+            panic!("expected Stream, got {:?}", result.err());
+        };
+        assert_eq!(agent, "frank");
+        assert!(
+            chain(err).contains("no stream"),
+            "the source must carry the open's error; got {}",
+            chain(err)
+        );
+        let after = message_lives(&db).await;
+        assert_eq!(
+            after.len(),
+            before,
+            "a failed open must end live query {live_id}; datastore lists {after:?}"
+        );
+        drop(kept);
+    }
+
+    /// A [`LoopCtx`] for `frank` on `db` under `token`.
+    fn frank_ctx(
+        db: &'static Surreal<any::Any>,
+        token: CancellationToken,
+    ) -> LoopCtx<'static, String> {
+        let (inbox_tx, _inbox_rx) = async_channel::bounded(1);
+        LoopCtx {
+            db,
+            owner: RecordId::new(AGENT_TABLE, "frank"),
+            agent: "frank",
+            inbox_tx,
+            token,
+        }
+    }
+
+    /// Time a cancelled [`race_subscribe`] may take to return in the tests
+    /// below; below [`LIVE_KILL_TIMEOUT`], and the held reply never arrives
+    /// within it.
+    const RACE_RETURN_LIMIT: Duration = Duration::from_secs(1);
+
+    /// A subscribe interrupted by a cancel, whose reply arrives after the
+    /// cancel: the server has registered the live query and the reply is held
+    /// back. After the cancel, [`race_subscribe`] returns `None` within
+    /// [`RACE_RETURN_LIMIT`] with the reply still held, sends
+    /// [`Error::Cancelled`] on the ready channel, and the live query is still
+    /// registered; once the reply is released the live-query count returns to
+    /// its earlier value.
+    #[tokio::test]
+    async fn subscribe_cancelled_before_its_reply_is_ended_by_the_finisher() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        let token = CancellationToken::new();
+        let ctx = frank_ctx(db, token.clone());
+        let owner = ctx.owner.clone();
+        let before = message_lives(db).await.len();
+
+        let (registered_tx, registered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let subscribe = async move {
+            let subscribed = subscribe_wake(db, &owner, "frank").await;
+            registered_tx.send(()).expect("test holds the receiver");
+            let _ = release_rx.await;
+            subscribed
+        };
+        let (ready_tx, mut ready_rx) = oneshot::channel();
+        let mut ready = Some(ready_tx);
+
+        let (raced, during) = timeout(RACE_RETURN_LIMIT, async {
+            tokio::join!(race_subscribe(&ctx, &mut ready, subscribe), async {
+                registered_rx.await.expect("subscribe reports registration");
+                let during = message_lives(db).await.len();
+                token.cancel();
+                during
+            })
+        })
+        .await
+        .expect("a cancelled race_subscribe must return with the reply still held");
+
+        assert!(raced.is_none(), "a cancel must return None");
+        assert_eq!(during, before + 1, "precondition: the server registered it");
+        assert!(
+            matches!(
+                ready_rx.try_recv(),
+                Ok(Err(Error::Cancelled { agent: Some(ref a) })) if a == "frank"
+            ),
+            "the ready channel must hold Cancelled for frank"
+        );
+        let held = message_lives(db).await.len();
+        assert_eq!(
+            held,
+            before + 1,
+            "precondition: the reply has not arrived, so the live query is still registered"
+        );
+
+        let _ = release_tx.send(());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut after = message_lives(db).await.len();
+        while after != before && tokio::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+            after = message_lives(db).await.len();
+        }
+        assert_eq!(
+            after, before,
+            "the finisher must end the live query once the reply arrives"
+        );
+    }
+
+    /// Text of the warn line for a [`finish_subscribe`] with no reply within
+    /// [`LIVE_KILL_TIMEOUT`].
+    const NO_REPLY_WARNING: &str = "has no reply";
+
+    /// Text of the warn line for a [`finish_subscribe`] dropped before it
+    /// finished.
+    const DROPPED_WARNING: &str = "dropped before it finished";
+
+    /// A reply held past [`LIVE_KILL_TIMEOUT`]: [`finish_subscribe`] logs at
+    /// warn with the agent, with the reply still held and the live query
+    /// still registered, then ends the live query once the reply arrives, and
+    /// logs no drop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_subscribe_warns_on_a_late_reply_and_still_ends_the_live_query() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let before = message_lives(db).await.len();
+        let (stream, live_id) = subscribe_wake(db, &owner, "frank")
+            .await
+            .expect("subscribe");
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let held = async move {
+            let _ = release_rx.await;
+            Ok((stream, live_id))
+        };
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let finisher = tokio::spawn(finish_subscribe(db, "frank".to_string(), held));
+        sleep(LIVE_KILL_TIMEOUT + Duration::from_millis(300)).await;
+        let warned = logged(&sink);
+        let during = message_lives(db).await.len();
+        let _ = release_tx.send(());
+        finisher
+            .await
+            .expect("the finisher ends once the reply arrives");
+        drop(guard);
+
+        assert!(
+            warned
+                .lines()
+                .any(|l| l.contains("WARN") && l.contains("frank") && l.contains(NO_REPLY_WARNING)),
+            "no warn line for the held reply; got {warned:?}"
+        );
+        assert_eq!(
+            during,
+            before + 1,
+            "precondition: the live query is registered"
+        );
+        let after = message_lives(db).await;
+        assert_eq!(
+            after.len(),
+            before,
+            "the live query must be ended after a late reply; datastore lists {after:?}"
+        );
+        let logs = logged(&sink);
+        assert!(
+            !logs.contains(DROPPED_WARNING),
+            "a finisher that finished must log no drop; got {logs:?}"
+        );
+    }
+
+    /// Run one drop of an unfinished [`finish_subscribe`] for `frank` under a
+    /// capturing subscriber and return the logs. `drive` gets the future.
+    fn logs_of_finisher_drop(
+        subscribe: impl Future<Output = Subscribed> + Send + 'static,
+        drive: impl FnOnce(tokio::runtime::Runtime, futures::future::BoxFuture<'static, ()>),
+    ) -> String {
+        let (subscriber, sink) = capturing_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(Surreal::init()));
+        let finisher = finish_subscribe(db, "frank".to_string(), subscribe);
+        drive(runtime, finisher.boxed());
+        logged(&sink)
+    }
+
+    /// A [`finish_subscribe`] future dropped with no poll logs at warn with the
+    /// agent, when dropped directly and when queued on a runtime that exits.
+    #[test]
+    fn finish_subscribe_logs_when_dropped_with_no_poll() {
+        let direct = logs_of_finisher_drop(std::future::pending(), |_runtime, finisher| {
+            drop(finisher);
+        });
+        let queued = logs_of_finisher_drop(std::future::pending(), |runtime, finisher| {
+            runtime.spawn(finisher);
+            drop(runtime);
+        });
+        let silent: Vec<&str> = [("direct drop", direct), ("queued at exit", queued)]
+            .iter()
+            .filter(|(_, logs)| {
+                !logs.lines().any(|l| {
+                    l.contains("WARN") && l.contains("frank") && l.contains(DROPPED_WARNING)
+                })
+            })
+            .map(|(cause, _)| *cause)
+            .collect();
+        assert_eq!(silent, Vec::<&str>::new(), "drops with no warn line");
+    }
+
+    /// A [`finish_subscribe`] dropped after its first poll logs at warn with
+    /// the agent, on an abort, a panic in the subscribe it awaits, and the
+    /// exit of its runtime.
+    #[test]
+    fn finish_subscribe_logs_when_dropped_before_it_finishes() {
+        let abort = logs_of_finisher_drop(std::future::pending(), |runtime, finisher| {
+            runtime.block_on(async {
+                let handle = tokio::spawn(finisher);
+                tokio::task::yield_now().await;
+                handle.abort();
+                let joined = handle.await;
+                assert!(
+                    joined.as_ref().is_err_and(|e| e.is_cancelled()),
+                    "precondition: the finisher must be aborted, got {joined:?}"
+                );
+            });
+        });
+        let panic = logs_of_finisher_drop(async { panic!("subscribe panicked") }, |runtime, f| {
+            runtime.block_on(async {
+                let joined = tokio::spawn(f).await;
+                assert!(
+                    joined.as_ref().is_err_and(|e| e.is_panic()),
+                    "precondition: the finisher must panic, got {joined:?}"
+                );
+            });
+        });
+        let exit = logs_of_finisher_drop(std::future::pending(), |runtime, finisher| {
+            runtime.spawn(finisher);
+            runtime.block_on(tokio::task::yield_now());
+            drop(runtime);
+        });
+        let silent: Vec<&str> = [("abort", abort), ("panic", panic), ("runtime exit", exit)]
+            .iter()
+            .filter(|(_, logs)| {
+                !logs.lines().any(|l| {
+                    l.contains("WARN") && l.contains("frank") && l.contains(DROPPED_WARNING)
+                })
+            })
+            .map(|(cause, _)| *cause)
+            .collect();
+        assert_eq!(silent, Vec::<&str>::new(), "drops with no warn line");
+    }
+
+    /// Stall every later query on `db` for 3 s: a `SLEEP` holds the session's
+    /// read lock, a queued `use_db` waits for its write lock, and a later
+    /// query waits behind that writer. The returned task ends with the stall.
+    async fn hold_session(db: &'static Surreal<any::Any>) -> tokio::task::JoinHandle<()> {
+        let held = async move {
+            let (slept, used) = tokio::join!(db.query("SLEEP 3s"), async {
+                tokio::task::yield_now().await;
+                db.use_db("test").await
+            });
+            slept.and_then(|r| r.check()).expect("sleep query");
+            used.expect("use_db");
+        };
+        let task = tokio::spawn(held);
+        sleep(Duration::from_millis(100)).await;
+        task
+    }
+
+    /// A [`finish_subscribe`] aborted while its `KILL` waits logs at warn with
+    /// the agent, and the live query stays registered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_subscribe_logs_a_drop_during_its_kill() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (stream, live_id) = subscribe_wake(db, &owner, "frank")
+            .await
+            .expect("subscribe");
+        let held = hold_session(db).await;
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let finisher = tokio::spawn(finish_subscribe(db, "frank".to_string(), async move {
+            Ok((stream, live_id))
+        }));
+        sleep(Duration::from_millis(100)).await;
+        finisher.abort();
+        let joined = finisher.await;
+        drop(guard);
+
+        assert!(
+            joined.as_ref().is_err_and(|e| e.is_cancelled()),
+            "precondition: the finisher must be aborted during its KILL, got {joined:?}"
+        );
+        let logs = logged(&sink);
+        assert!(
+            logs.lines()
+                .any(|l| l.contains("WARN") && l.contains("frank") && l.contains(DROPPED_WARNING)),
+            "no drop warn line for an abort during the KILL; got {logs:?}"
+        );
+        held.await.expect("join");
+        let lives = message_lives(db).await;
+        assert_eq!(
+            lives,
+            vec![live_id.to_string()],
+            "an aborted KILL leaves the live query registered"
+        );
+    }
+
+    /// A `KILL` that stalls past [`LIVE_KILL_TIMEOUT`] (see [`hold_session`]):
+    /// [`finish_subscribe`] logs it at warn with the agent and the live id,
+    /// and the live query is still registered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_subscribe_logs_a_timed_out_kill() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (stream, live_id) = subscribe_wake(db, &owner, "frank")
+            .await
+            .expect("subscribe");
+        let held = hold_session(db).await;
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let began = tokio::time::Instant::now();
+        finish_subscribe(db, "frank".to_string(), async { Ok((stream, live_id)) }).await;
+        let elapsed = began.elapsed();
+        drop(guard);
+
+        assert!(
+            elapsed >= LIVE_KILL_TIMEOUT,
+            "precondition: the KILL must stall; finish_subscribe took {elapsed:?}"
+        );
+        let logs = logged(&sink);
+        assert!(
+            logs.lines().any(|l| l.contains("WARN")
+                && l.contains("frank")
+                && l.contains(&live_id.to_string())
+                && l.contains("did not finish within")),
+            "no warn line for the timed-out KILL; got {logs:?}"
+        );
+        held.await.expect("join");
+        let lives = message_lives(db).await;
+        assert_eq!(
+            lives,
+            vec![live_id.to_string()],
+            "a timed-out KILL leaves the live query registered"
+        );
+    }
+
+    /// [`finish_subscribe`] logs a failed subscribe at warn with the agent and
+    /// the error chain, and a failed `KILL` of the returned live query at warn
+    /// with the agent and the error chain, through a client with no
+    /// connection, on which the `KILL` fails. Neither logs a late reply or a
+    /// drop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_subscribe_logs_a_failed_subscribe_and_a_failed_kill() {
+        let db = mem_db().await;
+        let unconnected = Surreal::<any::Any>::init();
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe");
+        let failed: Subscribed = Err(Error::LiveQuery {
+            agent: "frank".to_string(),
+            source: Box::new(surrealdb::Error::internal("reply refused".to_string())),
+        });
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        finish_subscribe(&db, "frank".to_string(), async { failed }).await;
+        finish_subscribe(&unconnected, "frank".to_string(), async {
+            Ok((stream, live_id))
+        })
+        .await;
+        drop(guard);
+
+        let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert!(
+            warns
+                .iter()
+                .any(|l| l.contains("frank") && l.contains("reply refused")),
+            "no warn line with the agent and the subscribe's error chain; got {logs:?}"
+        );
+        assert!(
+            warns.iter().any(|l| l.contains("frank")
+                && l.contains("failed to KILL live query")
+                && l.contains(&live_id.to_string())),
+            "no warn line for the failed KILL; got {logs:?}"
+        );
+        assert!(
+            !logs.contains(NO_REPLY_WARNING) && !logs.contains(DROPPED_WARNING),
+            "a finisher with a prompt reply must log no late reply or drop; got {logs:?}"
+        );
+    }
+
     /// `outcomes` as a stream of `(index, outcome)` pairs in vector order.
     async fn first_ready_error_of(outcomes: Vec<Result<()>>) -> Result<()> {
         first_ready_error(futures::stream::iter(outcomes.into_iter().enumerate())).await
@@ -1566,9 +2793,7 @@ mod tests {
         let dropped = || Error::ListenLoopDropped {
             agent: "cy".to_string(),
         };
-        let sent = || Error::LiveQueryIdMissing {
-            agent: "bo".to_string(),
-        };
+        let sent = || id_missing("bo");
 
         let picked = first_ready_error_of(vec![
             Err(timeout_err()),
@@ -1578,7 +2803,7 @@ mod tests {
         ])
         .await;
         assert!(
-            matches!(&picked, Err(Error::LiveQueryIdMissing { agent }) if agent == "bo"),
+            matches!(&picked, Err(Error::LiveQueryIdMissing { agent, .. }) if agent == "bo"),
             "a sent error must win over an earlier timeout, got {picked:?}"
         );
         let picked = first_ready_error_of(vec![Ok(()), Err(dropped()), Err(timeout_err())]).await;
@@ -1616,11 +2841,7 @@ mod tests {
                 agent: "cy".to_string(),
             })
         };
-        let sent = || {
-            Err(Error::LiveQueryIdMissing {
-                agent: "bo".to_string(),
-            })
-        };
+        let sent = || Err(id_missing("bo"));
 
         let picked = cancel_override(Ok(()), true);
         assert!(
@@ -1639,7 +2860,7 @@ mod tests {
         );
         let picked = cancel_override(sent(), true);
         assert!(
-            matches!(&picked, Err(Error::LiveQueryIdMissing { agent }) if agent == "bo"),
+            matches!(&picked, Err(Error::LiveQueryIdMissing { agent, .. }) if agent == "bo"),
             "a sent error under a cancelled token must be kept, got {picked:?}"
         );
         let picked = cancel_override(Ok(()), false);
@@ -1662,9 +2883,7 @@ mod tests {
         let (_silent_tx, silent_rx) = oneshot::channel();
         let (sent_tx, sent_rx) = oneshot::channel();
         sent_tx
-            .send(Err(Error::LiveQueryIdMissing {
-                agent: "bo".to_string(),
-            }))
+            .send(Err(id_missing("bo")))
             .expect("send startup error");
         let outcomes: FuturesUnordered<_> = [("ann", silent_rx), ("bo", sent_rx)]
             .into_iter()
@@ -1678,7 +2897,7 @@ mod tests {
             .collect();
         let picked = timeout(Duration::from_secs(1), first_ready_error(outcomes)).await;
         assert!(
-            matches!(&picked, Ok(Err(Error::LiveQueryIdMissing { agent })) if agent == "bo"),
+            matches!(&picked, Ok(Err(Error::LiveQueryIdMissing { agent, .. })) if agent == "bo"),
             "a sent error must be returned within 1 s while 'ann' is silent, got {picked:?}"
         );
     }
@@ -1706,15 +2925,9 @@ mod tests {
             matches!(&picked, Err(Error::Cancelled { agent: Some(agent) }) if agent == "di"),
             "Cancelled must win over an earlier ReadyTimeout and ListenLoopDropped, got {picked:?}"
         );
-        let picked = first_ready_error_of(vec![
-            Err(Error::LiveQueryIdMissing {
-                agent: "bo".to_string(),
-            }),
-            Err(cancelled()),
-        ])
-        .await;
+        let picked = first_ready_error_of(vec![Err(id_missing("bo")), Err(cancelled())]).await;
         assert!(
-            matches!(&picked, Err(Error::LiveQueryIdMissing { agent }) if agent == "bo"),
+            matches!(&picked, Err(Error::LiveQueryIdMissing { agent, .. }) if agent == "bo"),
             "the first sent error must win over a later Cancelled, got {picked:?}"
         );
     }
@@ -1788,12 +3001,7 @@ mod tests {
             ("changes", Value::Array(changes.into_iter().collect())),
         ])];
 
-        let sink = LogSink::default();
-        let writer = sink.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
+        let (subscriber, sink) = capturing_subscriber();
         let guard = tracing::subscriber::set_default(subscriber);
         let mut cursor = Cursor::at(5);
         let flow = deliver_page(&ctx, &mut cursor, &mut wakes, page)
@@ -1810,8 +3018,7 @@ mod tests {
             "only the owner's message may reach the bus"
         );
 
-        let logs =
-            String::from_utf8(sink.0.lock().expect("log sink lock").clone()).expect("utf-8 logs");
+        let logs = logged(&sink);
         let errors: Vec<&str> = logs.lines().filter(|l| l.contains("ERROR")).collect();
         assert_eq!(
             errors.len(),
@@ -1832,10 +3039,10 @@ mod tests {
         );
     }
 
-    /// [`end_live`]'s warn line for [`Error::LiveKill`] carries the inner
+    /// [`kill_live`]'s warn line for [`Error::LiveKill`] carries the inner
     /// surrealdb error text, not only the variant's own message.
     #[test]
-    fn end_live_warning_includes_the_kill_error_source() {
+    fn kill_live_warning_includes_the_kill_error_source() {
         let inner = "kill refused by datastore";
         let err = Error::LiveKill {
             agent: "frank".to_string(),
@@ -1843,16 +3050,10 @@ mod tests {
             source: Box::new(surrealdb::Error::internal(inner.to_string())),
         };
 
-        let sink = LogSink::default();
-        let writer = sink.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, || warn_end_live(&err));
+        let (subscriber, sink) = capturing_subscriber();
+        tracing::subscriber::with_default(subscriber, || warn_kill_live(&err));
 
-        let logs =
-            String::from_utf8(sink.0.lock().expect("log sink lock").clone()).expect("utf-8 logs");
+        let logs = logged(&sink);
         let line = logs
             .lines()
             .find(|l| l.contains("failed to KILL live query"))
@@ -1877,22 +3078,20 @@ mod tests {
     #[tokio::test]
     async fn await_ready_returns_the_sent_error() {
         let (tx, rx) = oneshot::channel();
-        tx.send(Err(Error::LiveQueryIdMissing {
-            agent: "frank".to_string(),
-        }))
-        .expect("send startup error");
+        tx.send(Err(id_missing("frank")))
+            .expect("send startup error");
         let err = await_ready("frank".to_string(), rx, Duration::from_secs(30))
             .await
             .expect_err("a sent startup error must be returned");
         assert!(
-            matches!(err, Error::LiveQueryIdMissing { ref agent } if agent == "frank"),
+            matches!(err, Error::LiveQueryIdMissing { ref agent, .. } if agent == "frank"),
             "expected the sent LiveQueryIdMissing for 'frank', got {err:?}"
         );
     }
 
     /// [`parse_cursor`] reads `versionstamp` and `change_index`, defaults a
     /// missing `change_index` to 0, and rejects a non-object row, a missing,
-    /// non-integer or negative `versionstamp`, and a non-integer or negative
+    /// non-numeric or -1 `versionstamp`, and a non-numeric or -1
     /// `change_index`; and [`position_within`] with `max = u32::MAX` accepts
     /// 0 and `u32::MAX` and rejects `u32::MAX + 1` and -1.
     #[test]

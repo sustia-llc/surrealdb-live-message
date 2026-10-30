@@ -5,11 +5,12 @@
 //! - `sdb_task` spawned with a `child_token()` so the database lifecycle is
 //!   independently cancellable.
 //! - A three-arm startup `select!` that races DB readiness, sdb task failure,
-//!   and a hard startup timeout — no path can hang forever.
+//!   and a hard startup timeout, so the wait for the DB ends.
 //! - Correct shutdown ORDER: `coalition.shutdown()` first (agent listen-loops
-//!   persist their cursors and KILL their live queries while the DB is still
-//!   up), then cancel the sdb
-//!   token (triggers the 2 s drain + container stop).
+//!   that hold a subscribed stream persist their cursors and KILL their live
+//!   queries while the DB is still up), then cancel the sdb
+//!   token (triggers the 2 s drain + container stop). A subscribe in flight at
+//!   the cancel is finished by a task that `shutdown()` does not wait for.
 //! - A bounded graceful drain via `tokio::time::timeout` so the process never
 //!   blocks past `SHUTDOWN_TIMEOUT`.
 //! - Portable `shutdown_signal()` that handles SIGINT + SIGTERM on Unix and
@@ -197,8 +198,8 @@ async fn main() -> anyhow::Result<()> {
     //
     // ORDER MATTERS:
     //   1. coalition.shutdown() — cancels agent listen-loops, which persist
-    //      their cursors and KILL their live queries.  The DB must still be up
-    //      for this to succeed.
+    //      their cursors and KILL the live queries of their subscribed
+    //      streams.  The DB must still be up for this to succeed.
     //   2. token.cancel()       — propagates to the sdb child token, triggering
     //      its 2 s drain and container stop.
     //   3. tracker.wait()       — waits for the sdb_task JoinHandle to resolve.

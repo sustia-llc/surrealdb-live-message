@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-30
+
+### Changed
+
+- Breaking: `Error::LiveQueryIdMissing` gains a `source`: the failed read, or
+  a message that names the value that is not a uuid.
+- `Coalition::new` bounds each database call of `Agent::new`, each changefeed
+  page among them, by the ready timeout. The whole `Agent::new` has no fixed
+  bound. The `Error::AgentCreateTimeout` message now says "a database call".
+- A subscribe in flight at a cancel moves to a spawned task. The loop and
+  `Coalition::shutdown` do not wait for it. The task keeps waiting after its
+  warn for a reply still missing at `LIVE_KILL_TIMEOUT`, and that warn now says
+  "not yet ended".
+
+### Fixed
+
+- If the `RELATE` statement fails, `Agent::send` returns `Error::Send`. It
+  previously returned `Ok(())` and no edge existed.
+- For a new agent, the cursor starts after the highest versionstamp in the
+  whole `message` changefeed. The read ends on a page with fewer than 1000
+  changesets. This needs a database where `message` is the one table with a
+  changefeed. It previously used the first page, at most 1000 changesets, so a
+  longer feed replayed its remainder. A `Coalition::new` reads the feed at most
+  once. An agent that the existence check finds, with no cursor, reads no feed.
+- `Agent::new` returns `Error::AgentCreate` for a changefeed page that is not
+  an array, a full page with no numeric versionstamp, and a page whose highest
+  versionstamp is below its `SINCE` or is `i64::MAX`. It writes neither record.
+  A changeset with no numeric versionstamp is logged at error level.
+- When the reply arrives, a subscribe that a cancel interrupted sends a `KILL`
+  of its live query. A failed subscribe and a failed or timed-out `KILL` call
+  are logged at warn. A reply still missing after `LIVE_KILL_TIMEOUT` is logged
+  at warn, and so is a drop of that task before it finishes.
+- When the wake stream cannot be opened, `subscribe_wake` sends a `KILL` of the
+  live query before it returns `Error::Stream`.
+
 ## [0.5.0] - 2026-10-29
 
 ### Added
