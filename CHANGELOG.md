@@ -28,9 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer feed replayed its remainder. A `Coalition::new` reads the feed at most
   once. An existing agent with no cursor reads no feed.
 - `Agent::new` returns `Error::AgentCreate` for a changefeed page that is not
-  an array, a full page with no integer versionstamp, and a page whose highest
+  an array, a full page with no numeric versionstamp, and a page whose highest
   versionstamp is below its `SINCE` or is `i64::MAX`. It writes neither record.
-  A changeset with no integer versionstamp is logged at error level.
+  A changeset with no numeric versionstamp is logged at error level.
 - When the reply arrives, a subscribe that a cancel interrupted sends a `KILL`
   of its live query. A failed subscribe and a failed or timed-out `KILL` call
   are logged at warn. A reply still missing after `LIVE_KILL_TIMEOUT` is logged

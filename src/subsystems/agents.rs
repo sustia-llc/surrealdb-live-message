@@ -511,12 +511,12 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     /// ready; this then sends the start signal and returns `Ok`. On any
     /// failure it cancels every spawned loop and waits for each to end before
     /// it returns the error. The first error these waits see (including
-    /// [`Error::Cancelled`]) is returned at once, in
-    /// preference to [`Error::ReadyTimeout`] and [`Error::ListenLoopDropped`]; among
+    /// [`Error::Cancelled`]) ends the waits and is returned after that teardown,
+    /// in preference to [`Error::ReadyTimeout`] and [`Error::ListenLoopDropped`]; among
     /// those two, the one for the earliest name in `names` is returned.
     ///
-    /// If the coalition's token is cancelled before every loop is ready, this
-    /// returns [`Error::Cancelled`]: with `agent: None` when the token is
+    /// A token cancelled before every loop is ready returns, unless the waits
+    /// see another sent error or `ListenLoopDropped`, [`Error::Cancelled`]: with `agent: None` when the token is
     /// cancelled before any database call (it is checked first) or when it is
     /// found cancelled after the readiness waits end in `Ok` or
     /// `ReadyTimeout`; with `agent: Some(name)` when the cancel
@@ -875,7 +875,7 @@ fn versionstamp_of(v: &Value) -> Option<i64> {
     }
 }
 
-/// The integer `versionstamp` field of `o`, if present.
+/// The numeric `versionstamp` field of `o`, truncated to `i64`, if present.
 fn object_versionstamp(o: &Object) -> Option<i64> {
     match o.get("versionstamp") {
         Some(Value::Number(n)) => n.to_int(),
@@ -959,9 +959,9 @@ struct SnapshotPage {
 /// The [`SnapshotPage`] of `reply`, the `SHOW CHANGES` page read `SINCE since`
 /// for a new `agent`'s snapshot.
 ///
-/// A changeset that is not an object or has no integer versionstamp is logged
+/// A changeset that is not an object or has no numeric versionstamp is logged
 /// at error level and skipped. [`Error::AgentCreate`] for `agent` when `reply`
-/// is not an array, when a full page has no integer versionstamp, or when its
+/// is not an array, when a full page has no numeric versionstamp, or when its
 /// highest versionstamp is below `since` or is `i64::MAX`, either of which
 /// leaves no later page to read.
 fn page_highest(agent: &str, since: i64, reply: &Value) -> Result<SnapshotPage> {
@@ -1235,7 +1235,7 @@ const NON_MESSAGE_OPS: [&str; 2] = ["delete", "define_table"];
 /// are not read again. A change is handled when it is a `delete` or
 /// `define_table` op, when its `update` record's `out` is another agent (`out`
 /// is compared before any decode), or when its delivery is on the bus. A
-/// changeset with no integer versionstamp has no position of its own: it is
+/// changeset with no numeric versionstamp has no position of its own: it is
 /// skipped, and the cursor passes it only by moving to a later changeset's
 /// position.
 ///
