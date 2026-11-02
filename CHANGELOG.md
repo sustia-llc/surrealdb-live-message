@@ -7,27 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Breaking: `Error::CursorSaveTimeout { agent, timeout }`.
-
 ### Changed
 
-- Breaking: a cursor row with a number that is not an integer, or with
+- A cursor row with a number that is not an integer, or with
   `change_index: NULL`, returns `Error::CursorLoad`. A number was previously
-  truncated, and `NULL` read as 0.
+  truncated, and `NULL` read as 0. Three forms read as an integer: an `Int`, a
+  `Float` with no fraction up to 2^53 in size, and a `Decimal` with no fraction
+  that fits `i64`.
 - A changeset whose versionstamp is not an integer has no position. A
   versionstamp was previously truncated.
 - A page's changesets with no position give one error line, with their count
-  and the first of them. A later catch-up page from the same cursor position
-  in the same listen loop does not log them.
+  and the first of them. A later catch-up page in the same listen loop, from
+  the same cursor position and with the same count, does not log them.
 
 ### Fixed
 
-- A cursor save in a catch-up pass stops waiting after 2 s. On a stop, the
-  timeout is logged at error level. After a complete page, the pass fails with
-  `Error::CursorSaveTimeout` and the agent reconnects. A stalled save previously
-  held the loop and `Coalition::shutdown` with no bound.
+- A cursor save in a catch-up pass stops waiting after 2 s and logs at error
+  level with the position. After a complete page, the in-memory cursor still
+  moves and the pass continues. The next page's save writes the position. If no
+  such save comes, one save writes it at the listen loop's stop. A loop makes at
+  most one save after a cancel. A stalled save previously held the loop and `Coalition::shutdown`
+  with no bound.
 - A cancel ends the retention sweep's wait for its connection and for its
   `DELETE`.
 - A full catch-up page that leaves the cursor in place fails the pass with

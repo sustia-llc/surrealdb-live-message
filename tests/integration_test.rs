@@ -1420,8 +1420,8 @@ async fn scenario_new_agents_share_one_walk(db: &Surreal<any::Any>) {
 
 /// **A stalled cursor save does not hold `shutdown()`.** Writing `cursor:sv_sink`
 /// waits at least 5 s on the server. After a delivery to `sv_sink`, whose save is then in
-/// flight, `Coalition::shutdown` returns within 3.5 s: the 2 s save limit and a
-/// margin.
+/// flight, `Coalition::shutdown` takes at least 1 s, so the save stalled, and
+/// returns within 3.5 s: the 2 s save limit and a margin.
 async fn scenario_stalled_save_bounds_shutdown(db: &Surreal<any::Any>) {
     const STALL: u64 = 5;
     let c = Coalition::<ChatMessage>::new(vec!["sv_src".to_string(), "sv_sink".to_string()])
@@ -1456,6 +1456,10 @@ async fn scenario_stalled_save_bounds_shutdown(db: &Surreal<any::Any>) {
         .expect("precondition: no delivery within 5 s")
         .expect("inbox bus closed unexpectedly");
     assert_eq!(delivered.recipient, "sv_sink");
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "precondition: the cursor save must stall; shutdown took {elapsed:?}"
+    );
     assert!(
         elapsed < Duration::from_millis(3500),
         "shutdown with a stalled cursor save took {elapsed:?}"

@@ -51,6 +51,9 @@ const LIVE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum time [`save_cursor_bounded`] waits for a cursor save.
 const CURSOR_SAVE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Largest `Float` size, 2^53, that [`integral`] reads as an integer.
+const FLOAT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
+
 /// Outcome of [`subscribe_wake`]: the wake stream and its live-query id.
 type Subscribed = Result<(QueryStream<Notification<Value>>, Uuid)>;
 
@@ -283,17 +286,19 @@ impl Agent {
     /// (log at error, then move on). The cursor is persisted after each
     /// catch-up page and when a pass stops; if that save fails, the persisted
     /// cursor stays at its previous saved position. A save that does not
-    /// finish within [`CURSOR_SAVE_TIMEOUT`] stops waiting, and the in-memory
-    /// cursor stays in place. A full page that leaves the cursor in place
+    /// finish within [`CURSOR_SAVE_TIMEOUT`] stops waiting. On a complete page
+    /// the in-memory cursor still moves, and a later save, or one save when
+    /// the loop stops, writes it. A full page that leaves the cursor in place
     /// fails the pass with [`Error::CatchUp`], which reconnects as below. A
     /// message not yet on the
     /// bus is put on it after a disconnect/restart. Each `update` op of a
     /// message record addressed to this agent is one delivery, so a message
     /// record that is updated after it is created is put on the bus again.
     /// For message records that are only created: after a stop whose cursor
-    /// save succeeds, no message is put on the bus twice; after a process exit
-    /// mid-page, or a failed save, the messages sent since the last saved
-    /// position are put on the bus again. Deliveries already on the bus are
+    /// save succeeds, with no earlier save timed out, no message is put on the
+    /// bus twice; after a process exit mid-page, a failed save, or a timed-out
+    /// save, the messages sent since the position in the `cursor` row are put
+    /// on the bus again at the next start. Deliveries already on the bus are
     /// not replayed: they are lost if the process exits, or every receiver is
     /// dropped, before a consumer reads them.
     ///
@@ -360,7 +365,7 @@ impl Agent {
     /// with each catch-up page read through `read_page`.
     async fn listen_on<T, F, Fut>(
         ctx: &LoopCtx<'_, T>,
-        mut cursor: Cursor,
+        cursor: Cursor,
         ready_tx: oneshot::Sender<Result<()>>,
         start: StartGate,
         mut read_page: F,
@@ -372,12 +377,12 @@ impl Agent {
         let name = ctx.agent;
         let mut ready_tx = Some(ready_tx);
         let mut backoff = RECONNECT_BACKOFF_START;
-        let mut logged_at = None;
+        let mut progress = LoopProgress::at(cursor);
 
         loop {
             // (Re)subscribe the LIVE wake-up.
             let Some(subscribed) = subscribe_unless_cancelled(ctx, &mut ready_tx).await else {
-                return;
+                return stop_save(ctx, &progress).await;
             };
             let (stream, live_id) = match subscribed {
                 Ok(s) => s,
@@ -387,7 +392,7 @@ impl Agent {
                     }
                     tracing::error!("resubscribe failed for {name}: {}", chain(&e));
                     if cancel_or_sleep(&ctx.token, backoff).await {
-                        return;
+                        return stop_save(ctx, &progress).await;
                     }
                     backoff = next_backoff(backoff);
                     continue;
@@ -402,7 +407,7 @@ impl Agent {
                     wakes.pending = false;
                     let pass = async {
                         loop {
-                            let fetched = read_page(cursor).await;
+                            let fetched = read_page(progress.cursor).await;
                             // The first page decides the startup outcome, which
                             // is sent on `ready_tx` before any cleanup await.
                             let page = match (fetched, ready_tx.take()) {
@@ -437,21 +442,20 @@ impl Agent {
                                 return Ok(ControlFlow::Continue(()));
                             }
                             let full = page.len() >= CATCHUP_BATCH;
-                            let page_start = cursor;
+                            let page_start = progress.cursor;
                             if let ControlFlow::Break(stop) =
-                                deliver_page(ctx, &mut cursor, &mut wakes, &mut logged_at, page)
-                                    .await?
+                                deliver_page(ctx, &mut progress, &mut wakes, page).await?
                             {
                                 return Ok(ControlFlow::Break(stop));
                             }
                             if !full {
                                 return Ok(ControlFlow::Continue(()));
                             }
-                            if cursor == page_start {
+                            if progress.cursor == page_start {
                                 return Err(Error::CatchUp {
                                     agent: name.to_string(),
                                     source: reply_error(format!(
-                                        "a full page left the cursor at {cursor}"
+                                        "a full page left the cursor at {page_start}"
                                     )),
                                 });
                             }
@@ -481,6 +485,9 @@ impl Agent {
             };
 
             let Wakes { stream, end, .. } = wakes;
+            if matches!(exit, Exit::Stop(_)) {
+                stop_save(ctx, &progress).await;
+            }
             end_live(ctx.db, name, live_id, stream).await;
             if let Some(end) = end {
                 end.log(name);
@@ -496,7 +503,7 @@ impl Agent {
                 Exit::Wake => {}
             }
             if cancel_or_sleep(&ctx.token, backoff).await {
-                return;
+                return stop_save(ctx, &progress).await;
             }
             backoff = next_backoff(backoff);
         }
@@ -687,8 +694,9 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
     }
 
     /// Cancel the root token, then wait until every listen loop and the
-    /// retention sweep have ended. After the cancel, a loop waits up to 2 s for
-    /// a cursor save and up to 2 s for its `KILL`. A subscribe in flight at the
+    /// retention sweep have ended. After the cancel, a loop makes at most one
+    /// cursor save, which waits up to 2 s, and waits up to 2 s for its `KILL`.
+    /// A subscribe in flight at the
     /// cancel is finished by a task that this does not wait for, so its `KILL`
     /// can run after this returns.
     pub async fn shutdown(&self) {
@@ -914,13 +922,13 @@ fn object_versionstamp(o: &Object) -> Option<i64> {
     }
 }
 
-/// The value of `n` if `n` is an integer that fits `i64`: an `Int`, or a `Float`
-/// or `Decimal` with no fraction inside the `i64` range. Otherwise `None`.
+/// The value of `n` if `n` is an integer: an `Int`, a `Float` with no fraction
+/// up to [`FLOAT_INTEGER_LIMIT`] in size, or a `Decimal` with no fraction that
+/// fits `i64`. Otherwise `None`.
 fn integral(n: &Number) -> Option<i64> {
-    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
     let exact = match n {
         Number::Int(_) => true,
-        Number::Float(v) => v.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(v),
+        Number::Float(v) => v.fract() == 0.0 && v.abs() <= FLOAT_INTEGER_LIMIT,
         Number::Decimal(v) => v.is_integer(),
     };
     exact.then(|| n.to_int()).flatten()
@@ -992,31 +1000,95 @@ async fn save_cursor(db: &Surreal<any::Any>, agent: &str, cursor: Cursor) -> Res
     Ok(())
 }
 
-/// [`save_cursor`], or [`Error::CursorSaveTimeout`] for `agent` when it does not
-/// finish within [`CURSOR_SAVE_TIMEOUT`].
-async fn save_cursor_bounded(db: &Surreal<any::Any>, agent: &str, cursor: Cursor) -> Result<()> {
-    timeout(CURSOR_SAVE_TIMEOUT, save_cursor(db, agent, cursor))
-        .await
-        .unwrap_or_else(|_elapsed| {
-            Err(Error::CursorSaveTimeout {
-                agent: agent.to_string(),
-                timeout: CURSOR_SAVE_TIMEOUT,
-            })
-        })
+/// Why a cursor save did not finish: the call failed, or it passed
+/// [`CURSOR_SAVE_TIMEOUT`].
+enum SaveFailure {
+    Call(Error),
+    TimedOut,
+}
+
+impl std::fmt::Display for SaveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveFailure::Call(e) => f.write_str(&chain(e)),
+            SaveFailure::TimedOut => {
+                write!(f, "did not finish within {CURSOR_SAVE_TIMEOUT:?}")
+            }
+        }
+    }
+}
+
+/// [`save_cursor`], or [`SaveFailure::TimedOut`] when it does not finish within
+/// [`CURSOR_SAVE_TIMEOUT`].
+async fn save_cursor_bounded(
+    db: &Surreal<any::Any>,
+    agent: &str,
+    cursor: Cursor,
+) -> std::result::Result<(), SaveFailure> {
+    match timeout(CURSOR_SAVE_TIMEOUT, save_cursor(db, agent, cursor)).await {
+        Ok(saved) => saved.map_err(SaveFailure::Call),
+        Err(_elapsed) => Err(SaveFailure::TimedOut),
+    }
+}
+
+/// The catch-up state of one listen loop: the in-memory `cursor`, the last
+/// position known `saved`, whether the one save after a stop was tried, and the
+/// start cursor and count of the last page that logged changesets with no
+/// position.
+struct LoopProgress {
+    cursor: Cursor,
+    saved: Cursor,
+    stop_save_tried: bool,
+    logged_at: Option<(Cursor, usize)>,
+}
+
+impl LoopProgress {
+    /// The state of a loop that starts from the saved position `cursor`.
+    fn at(cursor: Cursor) -> Self {
+        Self {
+            cursor,
+            saved: cursor,
+            stop_save_tried: false,
+            logged_at: None,
+        }
+    }
+}
+
+/// Save `progress.cursor` once, within [`CURSOR_SAVE_TIMEOUT`], if it is past
+/// `progress.saved` and no save was tried at this stop. A failure or a timeout
+/// is logged at error level.
+async fn stop_save<T: SurrealValue>(ctx: &LoopCtx<'_, T>, progress: &LoopProgress) {
+    if progress.cursor <= progress.saved || progress.stop_save_tried {
+        return;
+    }
+    let (agent, cursor) = (ctx.agent, progress.cursor);
+    match save_cursor_bounded(ctx.db, agent, cursor).await {
+        Ok(()) => tracing::info!("listen_loop for {agent} saved cursor {cursor} at its stop"),
+        Err(failure) => tracing::error!(
+            "listen_loop for {agent} could not save cursor {cursor} at its stop: {failure}"
+        ),
+    }
 }
 
 /// The count of one page's changesets with no position, and the first of them.
-#[derive(Default)]
-struct NoPosition {
+struct NoPosition<V> {
     count: usize,
-    first: Option<Value>,
+    first: Option<V>,
 }
 
-impl NoPosition {
+impl<V: std::fmt::Debug> NoPosition<V> {
+    /// A count of zero.
+    fn new() -> Self {
+        Self {
+            count: 0,
+            first: None,
+        }
+    }
+
     /// Count `changeset`, and keep it if it is the first.
-    fn add(&mut self, changeset: &Value) {
+    fn add(&mut self, changeset: V) {
         self.count += 1;
-        self.first.get_or_insert_with(|| changeset.clone());
+        self.first.get_or_insert(changeset);
     }
 
     /// Log the count and the first changeset as one error line, if the count
@@ -1060,7 +1132,7 @@ fn page_highest(agent: &str, since: i64, reply: &Value) -> Result<SnapshotPage> 
     };
     let full = changesets.len() >= CATCHUP_BATCH;
     let mut highest = None;
-    let mut no_position = NoPosition::default();
+    let mut no_position = NoPosition::new();
     for changeset in changesets.iter() {
         match versionstamp_of(changeset) {
             Some(vs) => highest = highest.max(Some(vs)),
@@ -1309,7 +1381,7 @@ async fn fetch_page<T: SurrealValue>(
 /// message record.
 const NON_MESSAGE_OPS: [&str; 2] = ["delete", "define_table"];
 
-/// Deliver one catch-up page (`page`, fetched from `*cursor`) onto the bus,
+/// Deliver one catch-up page (`page`, fetched from `progress.cursor`) onto the bus,
 /// in log order, and persist the cursor.
 ///
 /// Cursor rule: the cursor moves past a changeset once every change in it
@@ -1331,40 +1403,41 @@ const NON_MESSAGE_OPS: [&str; 2] = ["delete", "define_table"];
 /// malformed) and skipped.
 ///
 /// A page's changesets with no position give one error line, with their count
-/// and the first of them. `logged_at` holds the start cursor of the last page
-/// that logged this line. A page that starts at that cursor does not log it.
+/// and the first of them. `progress.logged_at` holds the start cursor and the
+/// count of the last page that logged this line. A page with the same start
+/// cursor and count does not log it.
 ///
 /// Each send is raced against `ctx.token`, and `wakes` is read while a send
 /// waits on a full bus. Cancellation, or a closed bus, returns
 /// `ControlFlow::Break` with the cursor saved at the change not put on the
 /// bus, so the next pass starts at that change; if that save fails or takes
 /// longer than [`CURSOR_SAVE_TIMEOUT`], the error is logged and
-/// `ControlFlow::Break` is still returned. `*cursor` changes only once a save
-/// succeeds; a failed save on a complete page returns that error, and a save
-/// on a complete page that takes longer than [`CURSOR_SAVE_TIMEOUT`] returns
-/// [`Error::CursorSaveTimeout`].
+/// `ControlFlow::Break` is still returned. A failed save call on a complete
+/// page returns that error, and `progress.cursor` stays. A save on a complete
+/// page that takes longer than [`CURSOR_SAVE_TIMEOUT`] is logged at error level
+/// with the position, `progress.cursor` moves to that position, and the pass
+/// continues. The cursor is saved when it is past `progress.saved`.
 async fn deliver_page<T>(
     ctx: &LoopCtx<'_, T>,
-    cursor: &mut Cursor,
+    progress: &mut LoopProgress,
     wakes: &mut Wakes,
-    logged_at: &mut Option<Cursor>,
     page: Vec<Value>,
 ) -> Result<ControlFlow<Stop>>
 where
     T: SurrealValue + Send + Sync + Unpin + 'static,
 {
     let agent = ctx.agent;
-    let page_start = *cursor;
-    let mut committed = *cursor;
+    let page_start = progress.cursor;
+    let mut committed = progress.cursor;
     let mut stopped = None;
-    let mut no_position = NoPosition::default();
+    let mut no_position = NoPosition::new();
     'page: for mut changeset in page {
         let Value::Object(obj) = &mut changeset else {
-            no_position.add(&changeset);
+            no_position.add(changeset);
             continue;
         };
         let Some(vs) = object_versionstamp(obj).filter(|vs| *vs < i64::MAX) else {
-            no_position.add(&changeset);
+            no_position.add(changeset);
             continue;
         };
         let skip = if vs == page_start.versionstamp {
@@ -1456,30 +1529,40 @@ where
         committed = committed.max(Cursor::at(vs + 1));
     }
 
-    if no_position.count > 0 && *logged_at != Some(page_start) {
+    let log_key = (page_start, no_position.count);
+    if no_position.count > 0 && progress.logged_at != Some(log_key) {
         no_position.log("catch_up", agent);
-        *logged_at = Some(page_start);
+        progress.logged_at = Some(log_key);
     }
 
-    if committed > *cursor {
-        match save_cursor_bounded(ctx.db, agent, committed).await {
-            Ok(()) => *cursor = committed,
-            Err(e) => match stopped {
-                Some(stop) => {
-                    tracing::error!(
-                        "catch_up for {agent} could not save cursor {committed} on {stop:?}: {}",
-                        chain(&e)
-                    );
-                    return Ok(ControlFlow::Break(stop));
-                }
-                None => return Err(e),
-            },
+    if committed > progress.saved {
+        let saved = save_cursor_bounded(ctx.db, agent, committed).await;
+        progress.stop_save_tried |= stopped.is_some() || ctx.token.is_cancelled();
+        match (saved, stopped) {
+            (Ok(()), _) => {
+                progress.cursor = committed;
+                progress.saved = committed;
+            }
+            (Err(failure), Some(stop)) => {
+                tracing::error!(
+                    "catch_up for {agent} could not save cursor {committed} on {stop:?}: {failure}"
+                );
+                return Ok(ControlFlow::Break(stop));
+            }
+            (Err(SaveFailure::Call(e)), None) => return Err(e),
+            (Err(SaveFailure::TimedOut), None) => {
+                tracing::error!(
+                    "catch_up for {agent}: saving cursor {committed} did not finish within \
+                     {CURSOR_SAVE_TIMEOUT:?}; the pass continues"
+                );
+                progress.cursor = committed;
+            }
         }
     }
     if let Some(stop) = stopped {
         tracing::info!(
             "catch_up for {agent} stopped at cursor {}: {stop:?}",
-            *cursor
+            progress.cursor
         );
         return Ok(ControlFlow::Break(stop));
     }
@@ -2005,8 +2088,8 @@ mod tests {
     }
 
     /// [`page_highest`] logs one error line per page for its changesets with
-    /// no numeric versionstamp, with their count and the first of them, and
-    /// skips them. With no numeric versionstamp in a full page it returns
+    /// no integer versionstamp, with their count and the first of them, and
+    /// skips them. With no integer versionstamp in a full page it returns
     /// [`Error::AgentCreate`]; in a short page it returns no position.
     #[test]
     fn page_highest_skips_malformed_changesets_and_rejects_a_full_malformed_page() {
@@ -2109,7 +2192,7 @@ mod tests {
     /// above the last highest, and ends on a short or an empty page: pages of
     /// 1000, 1000 and 3 changesets take 3 reads, a feed of exactly one full
     /// page takes 2, an empty feed takes 1, and a feed that gains a changeset
-    /// before each read still ends. A short page with no numeric versionstamp
+    /// before each read still ends. A short page with no integer versionstamp
     /// logs at error and ends the read at the last position.
     #[tokio::test(flavor = "current_thread")]
     async fn latest_versionstamp_pages_until_a_short_reply() {
@@ -2309,7 +2392,7 @@ mod tests {
     }
 
     /// [`Agent::create_on`] with a snapshot reply that is not an array, or a
-    /// full one that holds no numeric versionstamp, returns
+    /// full one that holds no integer versionstamp, returns
     /// [`Error::AgentCreate`] and writes neither record; with a well-formed
     /// feed it writes both, the cursor 1 above the feed's highest
     /// versionstamp.
@@ -3129,14 +3212,14 @@ mod tests {
 
         let (subscriber, sink) = capturing_subscriber();
         let guard = tracing::subscriber::set_default(subscriber);
-        let mut cursor = Cursor::at(5);
-        let flow = deliver_page(&ctx, &mut cursor, &mut wakes, &mut None, page)
+        let mut progress = LoopProgress::at(Cursor::at(5));
+        let flow = deliver_page(&ctx, &mut progress, &mut wakes, page)
             .await
             .expect("deliver_page");
         drop(guard);
 
         assert_eq!(flow, ControlFlow::Continue(()), "the page must complete");
-        assert_eq!(cursor, Cursor::at(6), "cursor after the page");
+        assert_eq!(progress.cursor, Cursor::at(6), "cursor after the page");
         let delivered = inbox_rx.try_recv().expect("one delivery on the bus");
         assert_eq!(delivered.message.payload, "for frank");
         assert!(
@@ -3217,7 +3300,7 @@ mod tests {
 
     /// [`parse_cursor`] reads `versionstamp` and `change_index`, defaults a
     /// missing `change_index` to 0, and rejects a non-object row, a missing,
-    /// non-numeric or -1 `versionstamp`, and a non-numeric or -1
+    /// non-integer or -1 `versionstamp`, and a non-integer or -1
     /// `change_index`; and [`position_within`] with `max = u32::MAX` accepts
     /// 0 and `u32::MAX` and rejects `u32::MAX + 1` and -1.
     #[test]
@@ -3269,11 +3352,8 @@ mod tests {
         Number::from_decimal(text.parse().expect("decimal text"))
     }
 
-    /// 2^63, the first `f64` above the `i64` range.
-    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
-
-    /// [`integral`] reads an `Int`, a finite `Float` with no fraction inside
-    /// the `i64` range, and a `Decimal` with no fraction that fits `i64`; it
+    /// [`integral`] reads an `Int`, a finite `Float` with no fraction up to
+    /// 2^53 in size, and a `Decimal` with no fraction that fits `i64`; it
     /// reads no other tested number.
     #[test]
     fn integral_reads_only_exact_integers() {
@@ -3283,7 +3363,8 @@ mod tests {
             (Number::Float(7.0), Some(7)),
             (Number::Float(-0.0), Some(0)),
             (Number::Float(-7.0), Some(-7)),
-            (Number::Float(-TWO_POW_63), Some(i64::MIN)),
+            (Number::Float(FLOAT_INTEGER_LIMIT), Some(1 << 53)),
+            (Number::Float(-FLOAT_INTEGER_LIMIT), Some(-(1 << 53))),
             (decimal("7"), Some(7)),
             (decimal("7.00"), Some(7)),
             (Number::Float(7.5), None),
@@ -3292,7 +3373,8 @@ mod tests {
             (Number::Float(f64::INFINITY), None),
             (Number::Float(f64::NEG_INFINITY), None),
             (Number::Float(1e30), None),
-            (Number::Float(TWO_POW_63), None),
+            (Number::Float(FLOAT_INTEGER_LIMIT + 2.0), None),
+            (Number::Float(-FLOAT_INTEGER_LIMIT - 2.0), None),
             (decimal("7.5"), None),
             (decimal("-0.5"), None),
             (decimal("10000000000000000000000000000"), None),
@@ -3420,13 +3502,13 @@ mod tests {
             })
             .to_vec();
 
-        let mut cursor = Cursor::at(5);
-        let flow = deliver_page(&ctx, &mut cursor, &mut wakes, &mut None, page)
+        let mut progress = LoopProgress::at(Cursor::at(5));
+        let flow = deliver_page(&ctx, &mut progress, &mut wakes, page)
             .await
             .expect("deliver_page");
 
         assert_eq!(flow, ControlFlow::Continue(()), "the page must complete");
-        assert_eq!(cursor, Cursor::at(8), "cursor after the page");
+        assert_eq!(progress.cursor, Cursor::at(8), "cursor after the page");
         let mut payloads = Vec::new();
         while let Ok(delivery) = inbox.try_recv() {
             payloads.push(delivery.message.payload);
@@ -3450,8 +3532,8 @@ mod tests {
 
         let (subscriber, sink) = capturing_subscriber();
         let guard = tracing::subscriber::set_default(subscriber);
-        let mut cursor = Cursor::at(5);
-        let flow = deliver_page(&ctx, &mut cursor, &mut wakes, &mut None, page)
+        let mut progress = LoopProgress::at(Cursor::at(5));
+        let flow = deliver_page(&ctx, &mut progress, &mut wakes, page)
             .await
             .expect("deliver_page");
         drop(guard);
@@ -3483,12 +3565,16 @@ mod tests {
         let (ctx, inbox, mut wakes) = page_fixture(db, CancellationToken::new(), 8).await;
         let last = stamped(i64::MAX.into_value(), vec![message_change(&frank(), "max")]);
 
-        let mut cursor = Cursor::at(5);
-        let flow = deliver_page(&ctx, &mut cursor, &mut wakes, &mut None, vec![last.clone()])
+        let mut progress = LoopProgress::at(Cursor::at(5));
+        let flow = deliver_page(&ctx, &mut progress, &mut wakes, vec![last.clone()])
             .await
             .expect("deliver_page");
         assert_eq!(flow, ControlFlow::Continue(()), "the page must complete");
-        assert_eq!(cursor, Cursor::at(5), "cursor after an i64::MAX changeset");
+        assert_eq!(
+            progress.cursor,
+            Cursor::at(5),
+            "cursor after an i64::MAX changeset"
+        );
         let delivered = inbox.try_recv().map(|d| d.message.payload);
         assert!(
             delivered.is_err(),
@@ -3496,47 +3582,133 @@ mod tests {
         );
 
         let below = stamped((i64::MAX - 1).into_value(), Vec::new());
-        let flow = deliver_page(&ctx, &mut cursor, &mut wakes, &mut None, vec![below, last])
+        let flow = deliver_page(&ctx, &mut progress, &mut wakes, vec![below, last])
             .await
             .expect("deliver_page");
         assert_eq!(flow, ControlFlow::Continue(()), "the page must complete");
-        assert_eq!(cursor, Cursor::at(i64::MAX), "cursor past i64::MAX - 1");
+        assert_eq!(
+            progress.cursor,
+            Cursor::at(i64::MAX),
+            "cursor past i64::MAX - 1"
+        );
     }
 
-    /// A save stalled on a complete page: [`deliver_page`] returns
-    /// [`Error::CursorSaveTimeout`] for the agent within
-    /// [`CURSOR_SAVE_TIMEOUT`] plus 500 ms, and `*cursor` does not move.
+    /// A save stalled on a complete page: within [`CURSOR_SAVE_TIMEOUT`] plus
+    /// 500 ms, [`deliver_page`] logs one error line with the agent and the
+    /// position and continues; the cursor moves, and the known-saved position
+    /// does not.
     #[tokio::test(flavor = "current_thread")]
-    async fn stalled_save_on_a_complete_page_times_out() {
+    async fn stalled_save_on_a_complete_page_moves_the_cursor() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
         let (ctx, _inbox, mut wakes) = page_fixture(db, CancellationToken::new(), 8).await;
         let held = hold_session(db).await;
 
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
         let began = tokio::time::Instant::now();
-        let mut cursor = Cursor::at(5);
+        let mut progress = LoopProgress::at(Cursor::at(5));
         let page = vec![changeset(7)];
-        let result = deliver_page(&ctx, &mut cursor, &mut wakes, &mut None, page).await;
+        let result = deliver_page(&ctx, &mut progress, &mut wakes, page).await;
         let elapsed = began.elapsed();
+        drop(guard);
         held.await.expect("join");
 
         assert!(
-            matches!(
-                &result,
-                Err(Error::CursorSaveTimeout { agent, timeout })
-                    if agent == "frank" && *timeout == CURSOR_SAVE_TIMEOUT
-            ),
-            "expected CursorSaveTimeout for frank after {elapsed:?}, got {result:?}"
+            matches!(result, Ok(ControlFlow::Continue(()))),
+            "the pass must continue after {elapsed:?}, got {result:?}"
         );
-        assert_eq!(cursor, Cursor::at(5), "cursor after a timed-out save");
+        assert_eq!(progress.cursor, Cursor::at(8), "cursor after the timeout");
+        assert_eq!(progress.saved, Cursor::at(5), "known-saved position");
         assert!(
             elapsed < CURSOR_SAVE_TIMEOUT + Duration::from_millis(500),
             "the save held deliver_page for {elapsed:?}"
         );
+        let logs = logged(&sink);
+        let errors: Vec<&str> = logs.lines().filter(|l| l.contains("ERROR")).collect();
+        assert_eq!(errors.len(), 1, "expected one error line; got {errors:?}");
+        assert!(
+            errors[0].contains("frank") && errors[0].contains("8#0"),
+            "the line must hold the agent and the position; got {}",
+            errors[0]
+        );
+    }
+
+    /// A failed save call on a complete page: [`deliver_page`] returns
+    /// [`Error::CursorSave`] for the agent, and neither position moves. The
+    /// `cursor` table's `versionstamp` type refuses the write.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_save_call_returns_the_error_and_keeps_the_cursor() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        db.query(format!(
+            "DEFINE TABLE {CURSOR_TABLE} SCHEMAFULL; \
+             DEFINE FIELD versionstamp ON {CURSOR_TABLE} TYPE string;"
+        ))
+        .await
+        .and_then(|r| r.check())
+        .expect("define a cursor table that refuses a save");
+        let (ctx, _inbox, mut wakes) = page_fixture(db, CancellationToken::new(), 8).await;
+
+        let mut progress = LoopProgress::at(Cursor::at(5));
+        let page = vec![changeset(7)];
+        let result = deliver_page(&ctx, &mut progress, &mut wakes, page).await;
+
+        assert!(
+            matches!(&result, Err(Error::CursorSave { agent, .. }) if agent == "frank"),
+            "expected CursorSave for frank, got {result:?}"
+        );
+        assert_eq!(progress.cursor, Cursor::at(5), "cursor after a failed save");
+        assert_eq!(progress.saved, Cursor::at(5), "known-saved position");
+    }
+
+    /// A page that does not move the cursor, read with the cursor past the
+    /// known-saved position: [`deliver_page`] saves the cursor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_page_saves_a_position_past_the_known_saved_one() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        define_agent_tables(db).await;
+        let (ctx, _inbox, mut wakes) = page_fixture(db, CancellationToken::new(), 8).await;
+
+        let mut progress = LoopProgress::at(Cursor::at(5));
+        progress.cursor = Cursor::at(8);
+        let page = vec![object(vec![])];
+        let flow = deliver_page(&ctx, &mut progress, &mut wakes, page)
+            .await
+            .expect("deliver_page");
+
+        assert_eq!(flow, ControlFlow::Continue(()), "the page must complete");
+        let saved = load_cursor(db, "frank").await.expect("read cursor");
+        assert_eq!(saved, Some(Cursor::at(8)), "persisted cursor");
+        assert_eq!(progress.saved, Cursor::at(8), "known-saved position");
+    }
+
+    /// [`deliver_page`] from one position logs a page's no-position line once
+    /// per count: counts 1, 1, 2, 2, 1 give 3 lines.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_count_change_at_the_same_position_logs_again() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        let (ctx, _inbox, mut wakes) = page_fixture(db, CancellationToken::new(), 8).await;
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let mut progress = LoopProgress::at(Cursor::at(5));
+        for count in [1, 1, 2, 2, 1] {
+            let page = vec![object(vec![]); count];
+            let flow = deliver_page(&ctx, &mut progress, &mut wakes, page)
+                .await
+                .expect("deliver_page");
+            assert_eq!(flow, ControlFlow::Continue(()), "the page must complete");
+        }
+        drop(guard);
+
+        let logs = logged(&sink);
+        let lines = no_position_lines(&logs);
+        assert_eq!(lines.len(), 3, "expected 3 lines; got {lines:?}");
     }
 
     /// A save stalled on a stop, a cancel and a closed bus: [`deliver_page`]
     /// logs the timeout at error level and returns `ControlFlow::Break` within
-    /// [`CURSOR_SAVE_TIMEOUT`] plus 500 ms, and `*cursor` does not move.
+    /// [`CURSOR_SAVE_TIMEOUT`] plus 500 ms, the cursor does not move, and the
+    /// save counts as the stop's one save.
     #[tokio::test(flavor = "current_thread")]
     async fn stalled_save_on_a_stop_logs_and_breaks() {
         for want in [Stop::Cancelled, Stop::NoReceivers] {
@@ -3556,8 +3728,8 @@ mod tests {
             let (subscriber, sink) = capturing_subscriber();
             let guard = tracing::subscriber::set_default(subscriber);
             let began = tokio::time::Instant::now();
-            let mut cursor = Cursor::at(5);
-            let result = deliver_page(&ctx, &mut cursor, &mut wakes, &mut None, page).await;
+            let mut progress = LoopProgress::at(Cursor::at(5));
+            let result = deliver_page(&ctx, &mut progress, &mut wakes, page).await;
             let elapsed = began.elapsed();
             drop(guard);
             held.await.expect("join");
@@ -3566,7 +3738,11 @@ mod tests {
                 matches!(result, Ok(ControlFlow::Break(stop)) if stop == want),
                 "expected Break({want:?}) after {elapsed:?}, got {result:?}"
             );
-            assert_eq!(cursor, Cursor::at(5), "cursor after {want:?}");
+            assert_eq!(progress.cursor, Cursor::at(5), "cursor after {want:?}");
+            assert!(
+                progress.stop_save_tried,
+                "the save on {want:?} must count as the stop's one save"
+            );
             assert!(
                 elapsed < CURSOR_SAVE_TIMEOUT + Duration::from_millis(500),
                 "the save held deliver_page for {elapsed:?} on {want:?}"
@@ -3788,45 +3964,151 @@ mod tests {
         assert_eq!(failed, 3, "catch-up failure lines; got {logs:?}");
     }
 
-    /// A save stalled on a complete page, in one listen loop: the pass fails
-    /// with [`Error::CursorSaveTimeout`], and the next read comes from the
-    /// same position.
+    /// Text of the line for a save at a loop's stop.
+    const STOP_SAVED_LOG: &str = "at its stop";
+
+    /// The lines of `logs` for a save at a loop's stop, finished or not.
+    fn stop_save_lines(logs: &str) -> Vec<&str> {
+        logs.lines()
+            .filter(|l| l.contains(STOP_SAVED_LOG))
+            .collect()
+    }
+
+    /// One read at a time from `pages`, as [`scripted_reads`], with the first
+    /// read stalling every call on `db` for `stall_secs` before it returns.
+    fn reads_with_a_first_stall(
+        db: &'static Surreal<any::Any>,
+        stall_secs: u64,
+        pages: Vec<Vec<Value>>,
+        seen: tokio::sync::mpsc::UnboundedSender<Cursor>,
+    ) -> impl FnMut(Cursor) -> CatchUpRead + Send + 'static {
+        let mut pages = pages.into_iter();
+        let mut first = true;
+        move |at| {
+            seen.send(at).expect("the test holds the receiver");
+            let hold = std::mem::take(&mut first);
+            let page = pages.next().unwrap_or_default();
+            Box::pin(async move {
+                if hold {
+                    drop(hold_session_for(db, stall_secs).await);
+                }
+                Ok(ControlFlow::Continue(page))
+            })
+        }
+    }
+
+    /// A save stalled on a complete page, in one listen loop: the delivery
+    /// arrives once, the next read comes from the position past that page, and
+    /// that page's save persists its position.
     #[tokio::test(flavor = "current_thread")]
-    async fn listen_loop_reads_the_same_page_after_a_save_timeout() {
+    async fn listen_loop_moves_past_a_page_whose_save_timed_out() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        define_agent_tables(db).await;
         let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
         let mut first = true;
+        // The feed by position: a read from 5 returns the message each time.
         let reads = move |at: Cursor| -> CatchUpRead {
             seen_tx.send(at).expect("the test holds the receiver");
             let hold = std::mem::take(&mut first);
+            let page = match at.versionstamp {
+                5 => vec![stamped(
+                    7i64.into_value(),
+                    vec![message_change(&frank(), "once")],
+                )],
+                8 => vec![changeset(9)],
+                _ => Vec::new(),
+            };
             Box::pin(async move {
                 if hold {
                     drop(hold_session(db).await);
-                    return Ok(ControlFlow::Continue(vec![changeset(7)]));
                 }
-                Ok(ControlFlow::Continue(Vec::new()))
+                Ok(ControlFlow::Continue(page))
             })
         };
+        let coalition = scripted_coalition(db, Cursor::at(5), 8, reads).await;
+        let first_read = next_read(&mut seen).await;
+        let inbox = coalition.inbox();
+        let delivered = timeout(Duration::from_secs(5), inbox.recv()).await;
+        sleep(CURSOR_SAVE_TIMEOUT).await;
+        wake_frank(db).await;
+        let second_read = next_read(&mut seen).await;
+        wake_frank(db).await;
+        let third_read = next_read(&mut seen).await;
+        coalition.shutdown().await;
+
+        let delivered = delivered
+            .expect("precondition: a delivery within 5 s")
+            .expect("the bus is open");
+        assert_eq!(delivered.message.payload, "once");
+        let repeated = inbox.try_recv().map(|d| d.message.payload);
+        assert!(repeated.is_err(), "a repeated delivery: {repeated:?}");
+        assert_eq!(
+            [first_read, second_read, third_read],
+            [Cursor::at(5), Cursor::at(8), Cursor::at(10)],
+            "the cursor of each read"
+        );
+        let saved = load_cursor(db, "frank").await.expect("read cursor");
+        assert_eq!(saved, Some(Cursor::at(10)), "persisted cursor");
+    }
+
+    /// An idle stop after a timed-out save on a complete page: the loop makes
+    /// exactly one save at the stop, and it persists the cursor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_stop_after_a_timed_out_save_saves_once() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        define_agent_tables(db).await;
+        let (seen_tx, _seen) = tokio::sync::mpsc::unbounded_channel();
 
         let (subscriber, sink) = capturing_subscriber();
         let guard = tracing::subscriber::set_default(subscriber);
+        let reads = reads_with_a_first_stall(db, 3, vec![vec![changeset(7)]], seen_tx);
         let coalition = scripted_coalition(db, Cursor::at(5), 8, reads).await;
-        let first_read = next_read(&mut seen).await;
-        let second_read = next_read(&mut seen).await;
+        sleep(Duration::from_secs(3)).await;
+        let before = load_cursor(db, "frank").await.expect("read cursor");
         coalition.shutdown().await;
         drop(guard);
 
         assert_eq!(
-            (first_read, second_read),
-            (Cursor::at(5), Cursor::at(5)),
-            "the cursor of each read"
+            before, None,
+            "precondition: the timed-out save did not land"
         );
+        let saved = load_cursor(db, "frank").await.expect("read cursor");
+        assert_eq!(saved, Some(Cursor::at(8)), "persisted cursor");
         let logs = logged(&sink);
+        let lines = stop_save_lines(&logs);
+        assert_eq!(lines.len(), 1, "expected one stop save; got {lines:?}");
+    }
+
+    /// An idle stop with every call stalled, after a timed-out save on a
+    /// complete page: the loop's one save at the stop times out, it is logged
+    /// at error level before the `KILL`, and [`Coalition::shutdown`] stays in
+    /// its bound.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_stop_save_is_logged_once_before_the_kill() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        let (seen_tx, _seen) = tokio::sync::mpsc::unbounded_channel();
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let reads =
+            reads_with_a_first_stall(db, ALL_CALLS_STALL_SECS, vec![vec![changeset(7)]], seen_tx);
+        let coalition = scripted_coalition(db, Cursor::at(5), 8, reads).await;
+        sleep(CURSOR_SAVE_TIMEOUT + Duration::from_millis(300)).await;
+        assert_bounded_shutdown(&coalition, &sink).await;
+        drop(guard);
+
+        let logs = logged(&sink);
+        let lines = stop_save_lines(&logs);
+        assert_eq!(lines.len(), 1, "expected one stop save; got {lines:?}");
         assert!(
-            logs.lines().any(|l| l.contains("ERROR")
-                && l.contains("catch_up failed for frank")
-                && l.contains("did not finish within")),
-            "no error line for the save timeout; got {logs:?}"
+            lines[0].contains("ERROR") && lines[0].contains("8#0"),
+            "the line must be an error with the position; got {}",
+            lines[0]
+        );
+        let order = |needle: &str| logs.find(needle).expect("logged line");
+        assert!(
+            order(STOP_SAVED_LOG) < order("KILL of live query"),
+            "the stop save must come before the KILL; got {logs:?}"
         );
     }
 
@@ -3878,7 +4160,7 @@ mod tests {
     /// With every call stalled and a save in flight at the cancel on a
     /// complete page, [`Coalition::shutdown`] returns within
     /// [`CURSOR_SAVE_TIMEOUT`] plus [`LIVE_KILL_TIMEOUT`] plus
-    /// [`SHUTDOWN_MARGIN`].
+    /// [`SHUTDOWN_MARGIN`], with no further save at the stop.
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_is_bounded_with_a_save_in_flight() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
@@ -3902,11 +4184,13 @@ mod tests {
         assert_eq!(delivered.message.payload, "delivered");
         let logs = logged(&sink);
         assert!(
-            logs.lines().any(|l| l.contains("ERROR")
-                && l.contains("catch_up failed for frank")
-                && l.contains("did not finish within")),
+            logs.lines()
+                .any(|l| l.contains("ERROR")
+                    && l.contains("saving cursor 8#0 did not finish within")),
             "precondition: the save must stall; got {logs:?}"
         );
+        let lines = stop_save_lines(&logs);
+        assert_eq!(lines, Vec::<&str>::new(), "saves at the stop");
     }
 
     /// With every call stalled and a cancel during a send on a full bus, the
@@ -3945,6 +4229,56 @@ mod tests {
                 && l.contains("did not finish within")),
             "precondition: the save of the stop must stall; got {logs:?}"
         );
+    }
+
+    /// With every call stalled, a full page whose save timed out, and then a
+    /// cancel during a send on a full bus: the page's save on the stop times
+    /// out, the cursor is still past the known-saved position, and the loop
+    /// makes no second save, so [`Coalition::shutdown`] stays in its bound.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_second_save_after_a_stop_save_timed_out() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        let batch = i64::try_from(CATCHUP_BATCH).expect("batch fits i64");
+        let full: Vec<Value> = (6..6 + batch).map(changeset).collect();
+        let changes = vec![
+            message_change(&frank(), "on the bus"),
+            message_change(&frank(), "not on the bus"),
+        ];
+        let pages = vec![full, vec![stamped(2000i64.into_value(), changes)]];
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let reads = reads_with_a_first_stall(db, ALL_CALLS_STALL_SECS, pages, seen_tx);
+        let coalition = scripted_coalition(db, Cursor::at(5), 1, reads).await;
+        let first_read = next_read(&mut seen).await;
+        let second_read = next_read(&mut seen).await;
+        let inbox = coalition.inbox();
+        timeout(Duration::from_secs(5), async {
+            while !inbox.is_full() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("precondition: the bus must fill");
+        sleep(Duration::from_millis(100)).await;
+        assert_bounded_shutdown(&coalition, &sink).await;
+        drop(guard);
+
+        assert_eq!(
+            (first_read, second_read),
+            (Cursor::at(5), Cursor::at(6 + batch)),
+            "the cursor of each read"
+        );
+        let logs = logged(&sink);
+        assert!(
+            logs.lines().any(|l| l.contains("ERROR")
+                && l.contains("could not save cursor 2000#1")
+                && l.contains("did not finish within")),
+            "precondition: the save of the stop must stall; got {logs:?}"
+        );
+        let lines = stop_save_lines(&logs);
+        assert_eq!(lines, Vec::<&str>::new(), "second saves at the stop");
     }
 
     /// Time a cancelled sweep may take to end in the tests below; below the

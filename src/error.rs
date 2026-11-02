@@ -109,13 +109,6 @@ pub enum Error {
         source: Box<surrealdb::Error>,
     },
 
-    /// A cursor save for `agent` in a catch-up pass did not finish within
-    /// `timeout`.
-    #[error(
-        "persisting the durable-log cursor for agent '{agent}' did not finish within {timeout:?}"
-    )]
-    CursorSaveTimeout { agent: String, timeout: Duration },
-
     #[error("durable-log catch-up (SHOW CHANGES) failed for agent '{agent}'")]
     CatchUp {
         agent: String,

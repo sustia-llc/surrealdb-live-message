@@ -19,7 +19,7 @@ messaging over SurrealDB graph edges + LIVE queries. `src/main.rs` is a binary e
 These are diagnosed fixes, and tests lock them in. See the docstrings in `src/message.rs` and `src/subsystems/agents.rs`.
 
 1. **Edge fields need `#[surreal(rename = "in")]`.** `SurrealValue` derive uses raw Rust identifiers as wire keys, so `r#in` serializes as `"r#in"` without the attribute. SurrealDB emits `"in"` for edge source. **serde `rename` is ignored**, so you must use the `#[surreal(...)]` attribute. (`src/message.rs:34`)
-2. **A bare `SELECT *` / `LIVE SELECT *` on edge records omits `in`/`out`.** Read edge pointers with an explicit projection: `SELECT *, in, out FROM message WHERE ...` (`tests/integration_test.rs:153`, `:177`, `:299`). The pointer assertions at `:167` to `:174` lock it in. The **durable bus sidesteps this**: `SHOW CHANGES` changeset records carry `id`/`in`/`out` natively. So the wake-up subscription is only `LIVE SELECT id FROM message WHERE out = $owner` (`src/subsystems/agents.rs:1551`). The gotcha still applies to any plain `SELECT` you add.
+2. **A bare `SELECT *` / `LIVE SELECT *` on edge records omits `in`/`out`.** Read edge pointers with an explicit projection: `SELECT *, in, out FROM message WHERE ...` (`tests/integration_test.rs:153`, `:177`, `:300`). The pointer assertions at `:167` to `:174` lock it in. The **durable bus sidesteps this**: `SHOW CHANGES` changeset records carry `id`/`in`/`out` natively. So the wake-up subscription is only `LIVE SELECT id FROM message WHERE out = $owner` (`src/subsystems/agents.rs:1634`). The gotcha still applies to any plain `SELECT` you add.
 3. Payload types must derive `SurrealValue`. The bound is `Message<T: SurrealValue>`, not only `Serialize`.
 
 ## Lifecycle / shutdown contract
@@ -29,7 +29,7 @@ These are diagnosed fixes, and tests lock them in. See the docstrings in `src/me
 - `Coalition` owns a root `CancellationToken`, which is a child of the caller's token with `Coalition::new_with_parent`.
 - It spawns listen-loops on `child_token()` and exposes `cancellation_token()` + `shutdown().await`.
 - Dropping a `Coalition` cancels its root token without waiting.
-- `shutdown().await` cancels the root token and waits for the listen loops and the retention sweep to end. After the cancel, a loop waits up to `CURSOR_SAVE_TIMEOUT` for a cursor save and up to `LIVE_KILL_TIMEOUT` for its `KILL` (`scenario_stalled_save_bounds_shutdown`). The sweep's connection and `DELETE` are raced against the token.
+- `shutdown().await` cancels the root token and waits for the listen loops and the retention sweep to end. After the cancel, a loop makes at most one cursor save. That save waits up to `CURSOR_SAVE_TIMEOUT`. The loop then waits up to `LIVE_KILL_TIMEOUT` for its `KILL`. Tests: `shutdown_is_bounded_with_a_save_in_flight`, `shutdown_is_bounded_with_a_save_on_a_stop`. The sweep's connection and `DELETE` are raced against the token.
 - The library installs no signal handling. Callers wire top-level shutdown (for example bare `tokio::signal::ctrl_c`) outside the library. Do not add signal handling or `tokio-graceful-shutdown` inside the lib.
 
 ### Delivery bus
@@ -84,22 +84,22 @@ These are diagnosed fixes, and tests lock them in. See the docstrings in `src/me
 
 ### Catch-up cursor
 
-- `cursor:<agent>` holds `versionstamp` and `change_index` (absent or `NONE` reads as 0). A row that is not an object with non-negative integers fails with `CursorLoad`. So does `change_index: NULL`. An integer is an `Int`, or a `Float` or `Decimal` with no fraction that fits `i64` (`integral`).
+- `cursor:<agent>` holds `versionstamp` and `change_index` (absent or `NONE` reads as 0). A row that is not an object with non-negative integers fails with `CursorLoad`. So does `change_index: NULL`. `integral` reads three forms as an integer: an `Int`, a `Float` with no fraction up to 2^53 in size, and a `Decimal` with no fraction that fits `i64`.
 - Each bus send and each page query is raced against the agent's cancel token. The LIVE wake stream is still read while a send waits.
 - The cursor advances past a message addressed to the agent only once its delivery is on the bus.
-- The cursor is persisted after each page and on a stop. The in-memory cursor moves only after the save succeeds.
-- A save that does not finish within `CURSOR_SAVE_TIMEOUT` stops waiting. On a stop, this is logged at error level. After a complete page, the pass fails with `CursorSaveTimeout`, and the loop reconnects and reads the page again.
+- The cursor is persisted after each page and on a stop. After a failed save call on a complete page, the in-memory cursor stays and the pass fails.
+- A save that does not finish within `CURSOR_SAVE_TIMEOUT` stops waiting and is logged at error level with the position. On a complete page, the in-memory cursor still moves and the pass continues, so the page is not read again. The next page's save writes the position. If no such save comes, one save writes it at the loop's stop.
 - A `SHOW CHANGES` reply that is not an array fails the catch-up with `CatchUp`.
 - A full page that leaves the cursor in place fails the pass with `CatchUp`. The loop reconnects with backoff and reads the page again.
 - Each `update` op of a message record for the agent is one delivery, so a message record updated after creation is delivered again.
-- For message records that are only created, a stop whose save succeeds puts no message on the bus twice.
-- After a failed save or a process exit mid-page, the messages sent since the last saved position are put on the bus again.
+- For message records that are only created, a stop whose save succeeds, with no earlier save timed out, puts no message on the bus twice.
+- Three events can repeat messages at the next start: a failed save, a timed-out save, and a process exit mid-page. The messages sent since the position in the `cursor` row go on the bus again.
 - Deliveries already on the bus are not replayed. If the process exits, or every receiver is dropped, before a consumer reads them, they are lost.
 - `close()` on any receiver stops further sends, and the queued deliveries stay readable.
 
 Malformed data is one rule: log at error level and skip. The rule covers these cases:
 
-- A changeset that is not an object, has no integer versionstamp, or has versionstamp `i64::MAX`. It has no position, so the cursor passes it only by moving to a later changeset. These changesets give one error line per page, with their count and the first of them. A later page from the same cursor position in the same listen loop does not log them.
+- A changeset that is not an object, has no integer versionstamp, or has versionstamp `i64::MAX`. It has no position, so the cursor passes it only by moving to a later changeset. These changesets give one error line per page, with their count and the first of them. A later page in the same listen loop, from the same cursor position and with the same count, does not log them.
 - A missing or non-array `changes`.
 - A change that is not an object, or whose op key is not `update`, `delete` or `define_table`.
 - A record that is not an object.
