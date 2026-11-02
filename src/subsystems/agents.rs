@@ -2111,6 +2111,19 @@ mod tests {
         }
     }
 
+    /// [`page_highest`] skips a changeset stamped 7.5: the page has no highest
+    /// versionstamp.
+    #[test]
+    fn page_highest_skips_a_fractional_stamp() {
+        let fractional = object(vec![("versionstamp", Value::Number(Number::Float(7.5)))]);
+        let page = page_highest("frank", 0, &reply_of(vec![fractional])).expect("short page");
+        assert_eq!(
+            page.highest, None,
+            "a stamp of 7.5 read as {:?}",
+            page.highest
+        );
+    }
+
     /// [`page_highest`] logs one error line per page for its changesets with
     /// no integer versionstamp, with their count and the first of them, and
     /// skips them. With no integer versionstamp in a full page it returns
@@ -3439,6 +3452,13 @@ mod tests {
                     change_index: 2,
                 },
             ),
+            (
+                row(seven(), Some(Value::Number(decimal("2.0")))),
+                Cursor {
+                    versionstamp: 7,
+                    change_index: 2,
+                },
+            ),
         ] {
             let parsed = parse_cursor("frank", &read);
             assert!(
@@ -3874,7 +3894,9 @@ mod tests {
 
     /// A short page with no position, read six times by one listen loop: the
     /// first read from position 5 logs it; later reads from 5, across a wake
-    /// and a resubscribe, do not; a read from the new position 8 logs it.
+    /// and a resubscribe, do not, the last of them with a page that moves the
+    /// cursor to 8; a read from the new position 8 logs it. The line count is
+    /// taken after each read.
     #[tokio::test(flavor = "current_thread")]
     async fn no_position_is_logged_once_per_cursor_position() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
@@ -3893,7 +3915,11 @@ mod tests {
         let guard = tracing::subscriber::set_default(subscriber);
         let reads = scripted_reads(pages, seen_tx);
         let coalition = scripted_coalition(db, Cursor::at(5), 8, reads).await;
+        let settle = Duration::from_millis(50);
+        let lines_now = || no_position_lines(&logged(&sink)).len();
         let mut ats = vec![next_read(&mut seen).await];
+        sleep(settle).await;
+        let mut counts = vec![lines_now()];
         // Reads 2 and 3 follow one wake each; read 3 fails, so read 4 follows
         // the resubscribe; reads 5 and 6 follow one wake each.
         for wakes in [true, true, false, true, true] {
@@ -3901,6 +3927,8 @@ mod tests {
                 wake_frank(db).await;
             }
             ats.push(next_read(&mut seen).await);
+            sleep(settle).await;
+            counts.push(lines_now());
         }
         coalition.shutdown().await;
         drop(guard);
@@ -3911,13 +3939,99 @@ mod tests {
             vec![five, five, five, five, five, Cursor::at(8)],
             "the cursor of each read"
         );
-        let logs = logged(&sink);
-        let lines = no_position_lines(&logs);
         assert_eq!(
-            lines.len(),
-            2,
-            "expected one line from position 5 and one from 8; got {lines:?}"
+            counts,
+            vec![1, 1, 1, 1, 1, 2],
+            "no-position lines after each read; got {counts:?}"
         );
+    }
+
+    /// A failed save call on a stop in one listen loop: one error line holds
+    /// the position and the call's error. The `cursor` table's `versionstamp`
+    /// type refuses the write.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_save_call_on_a_stop_is_logged_with_the_position() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        refuse_cursor_writes(db).await;
+        let changes = vec![
+            message_change(&frank(), "on the bus"),
+            message_change(&frank(), "not on the bus"),
+        ];
+        let pages = vec![Ok(vec![stamped(7i64.into_value(), changes)])];
+        let (seen_tx, _seen) = tokio::sync::mpsc::unbounded_channel();
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let reads = scripted_reads(pages, seen_tx);
+        let coalition = scripted_coalition(db, Cursor::at(5), 1, reads).await;
+        let inbox = coalition.inbox();
+        timeout(Duration::from_secs(5), async {
+            while !inbox.is_full() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("precondition: the bus must fill");
+        coalition.shutdown().await;
+        drop(guard);
+
+        let logs = logged(&sink);
+        let lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("ERROR") && l.contains("could not save cursor 7#1"))
+            .collect();
+        assert_eq!(lines.len(), 1, "expected one line; got {logs:?}");
+        assert!(
+            lines[0].contains(CURSOR_SAVE_FAILED),
+            "the line must hold the call's error; got {}",
+            lines[0]
+        );
+    }
+
+    /// Text of [`Error::CursorSave`].
+    const CURSOR_SAVE_FAILED: &str = "failed to persist the durable-log cursor";
+
+    /// Make every later write to `cursor` on `db` fail: `versionstamp` takes
+    /// only a string.
+    async fn refuse_cursor_writes(db: &Surreal<any::Any>) {
+        db.query(format!(
+            "DEFINE TABLE IF NOT EXISTS {CURSOR_TABLE}; \
+             DEFINE FIELD OVERWRITE versionstamp ON {CURSOR_TABLE} TYPE string;"
+        ))
+        .await
+        .and_then(|r| r.check())
+        .expect("define a cursor table that refuses a save");
+    }
+
+    /// A timed-out save on a complete page, then a refused write, then a stop
+    /// in one listen loop: one error line for the save at the stop holds the
+    /// position and the call's error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_save_call_at_the_stop_is_logged_once() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        define_agent_tables(db).await;
+        let (seen_tx, _seen) = tokio::sync::mpsc::unbounded_channel();
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let pages = in_order(vec![vec![changeset(7)]]);
+        let reads = reads_with_a_first_stall(db, 3, pages, seen_tx);
+        let coalition = scripted_coalition(db, Cursor::at(5), 8, reads).await;
+        sleep(Duration::from_secs(3)).await;
+        refuse_cursor_writes(db).await;
+        coalition.shutdown().await;
+        drop(guard);
+
+        let logs = logged(&sink);
+        let lines = stop_save_lines(&logs);
+        assert_eq!(lines.len(), 1, "expected one stop line; got {logs:?}");
+        for needle in ["ERROR", "8#0", CURSOR_SAVE_FAILED] {
+            assert!(
+                lines[0].contains(needle),
+                "the stop line must hold {needle:?}; got {}",
+                lines[0]
+            );
+        }
     }
 
     /// A full page that leaves the cursor in place, read by one listen loop:
@@ -3983,11 +4097,13 @@ mod tests {
         let logs = logged(&sink);
         let lines = no_position_lines(&logs);
         assert_eq!(lines.len(), 1, "no-position lines in 3 reads: {lines:?}");
+        let catch_up = failed_read().to_string();
         let failed = logs
             .lines()
             .filter(|l| {
                 l.contains("ERROR")
                     && l.contains("catch_up failed for frank")
+                    && l.contains(&catch_up)
                     && l.contains("left the cursor at 5#0")
             })
             .count();
@@ -4142,8 +4258,9 @@ mod tests {
 
     /// [`save_cursor`] on the schema of `cursor` in `sdb.rs`, with the row
     /// absent, at a lower position, at an equal position and at a higher one,
-    /// through versionstamp and through `change_index`: each save returns `Ok`,
-    /// and the row moves only forward.
+    /// through versionstamp and through `change_index`, and with a lower stamp
+    /// and a higher index: each save returns `Ok`, and the row moves only
+    /// forward.
     #[tokio::test(flavor = "current_thread")]
     async fn save_cursor_moves_the_row_only_forward() {
         let db = mem_db().await;
@@ -4167,6 +4284,8 @@ mod tests {
             (at(8, 0), at(8, 0)),
             (at(8, 2), at(8, 2)),
             (at(8, 1), at(8, 2)),
+            (at(9, 0), at(9, 0)),
+            (at(8, 3), at(9, 0)),
         ] {
             let saved = save_cursor(&db, "frank", save).await;
             assert!(saved.is_ok(), "save of {save} returned {saved:?}");
