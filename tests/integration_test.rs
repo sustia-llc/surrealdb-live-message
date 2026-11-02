@@ -231,6 +231,7 @@ async fn test_agent_messaging() {
     scenario_new_agent_skips_a_long_feed(db).await;
     scenario_new_agents_share_one_walk(db).await;
     scenario_stalled_save_bounds_shutdown(db).await;
+    scenario_cursor_save_moves_only_forward(db).await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
     let lives_before = message_lives(db).await;
@@ -1464,6 +1465,40 @@ async fn scenario_stalled_save_bounds_shutdown(db: &Surreal<any::Any>) {
         elapsed < Duration::from_millis(3500),
         "shutdown with a stalled cursor save took {elapsed:?}"
     );
+}
+
+/// **A cursor save moves the row only forward.** With `cursor:fw_sink` set above
+/// the feed, a delivery to `fw_sink` and its shutdown leave the row unchanged.
+async fn scenario_cursor_save_moves_only_forward(db: &Surreal<any::Any>) {
+    const AHEAD: i64 = i64::MAX - 1;
+    let c = Coalition::<ChatMessage>::new(vec!["fw_src".to_string(), "fw_sink".to_string()])
+        .await
+        .expect("coalition creation");
+    db.query(format!(
+        "UPDATE cursor:fw_sink SET versionstamp = {AHEAD}, change_index = 3"
+    ))
+    .await
+    .and_then(|r| r.check())
+    .expect("move cursor:fw_sink ahead of the feed");
+
+    let src = c.agent("fw_src").await.expect("fw_src in coalition");
+    src.send(
+        "fw_sink",
+        ChatMessage {
+            content: "fw".to_string(),
+        },
+    )
+    .await
+    .expect("fw_src → fw_sink send");
+    let delivered = timeout(Duration::from_secs(5), c.inbox().recv()).await;
+    c.shutdown().await;
+
+    let delivered = delivered
+        .expect("precondition: no delivery within 5 s")
+        .expect("inbox bus closed unexpectedly");
+    assert_eq!(delivered.recipient, "fw_sink");
+    let row = cursor_position(db, "fw_sink").await;
+    assert_eq!(row, Some((AHEAD, 3)), "cursor:fw_sink after a lower save");
 }
 
 /// **A failed `Coalition::new` moves no cursor past an undelivered message.**
