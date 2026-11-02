@@ -12,16 +12,20 @@ The cursor passes a message addressed to the agent only after its delivery is on
 
 Malformed data follows one rule: log at error level and skip. The rule covers these cases:
 
-- A changeset that is not an object or has no numeric versionstamp. Such a changeset has no position, so the cursor passes it only by moving to a later changeset.
+- A changeset that is not an object, has no integer versionstamp, or has versionstamp `i64::MAX`. Such a changeset has no position, so the cursor passes it only by moving to a later changeset. These changesets give one error line per page, with their count and the first of them. A later page from the same cursor position in the same listen loop does not log them.
 - A missing or non-array `changes`.
 - A change that is not an object, or whose op key is not `update`, `delete` or `define_table`.
 - A record that is not an object.
 - A record whose `out` is missing or not a record id.
 - A message whose payload does not decode as `T`.
 
+A full page that leaves the cursor in place is not skipped. It fails the pass with `Error::CatchUp`, and the agent reconnects with backoff and reads the page again.
+
 `delete` and `define_table` ops and messages for other agents are skipped without a log. Each `update` op of a message record for the agent is one delivery, so a message record updated after creation is delivered again.
 
 A stop by cancellation or by a closed bus persists the cursor at the first change not on the bus. For message records that are only created, the next run then neither skips nor repeats a message. If that save fails, the persisted cursor stays at its previous saved position, and the messages sent since then are put on the bus again.
+
+A cursor save that does not finish within 2 s stops waiting, and the in-memory cursor stays in place. On a stop, the timeout is logged at error level. After a complete page, the pass fails with `Error::CursorSaveTimeout`, and the agent reconnects and reads the page again.
 
 The cursor is persisted once per catch-up page. If the process exits mid-page, that page's already-sent messages are put on the bus again after restart.
 

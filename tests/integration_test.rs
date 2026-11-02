@@ -230,6 +230,7 @@ async fn test_agent_messaging() {
     scenario_cancel_during_first_page(db).await;
     scenario_new_agent_skips_a_long_feed(db).await;
     scenario_new_agents_share_one_walk(db).await;
+    scenario_stalled_save_bounds_shutdown(db).await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
     let lives_before = message_lives(db).await;
@@ -1414,6 +1415,50 @@ async fn scenario_new_agents_share_one_walk(db: &Surreal<any::Any>) {
             delivered.message.payload.content.as_str()
         ),
         ("wo_b", "wo_during")
+    );
+}
+
+/// **A stalled cursor save does not hold `shutdown()`.** Writing `cursor:sv_sink`
+/// waits at least 5 s on the server. After a delivery to `sv_sink`, whose save is then in
+/// flight, `Coalition::shutdown` returns within 3.5 s: the 2 s save limit and a
+/// margin.
+async fn scenario_stalled_save_bounds_shutdown(db: &Surreal<any::Any>) {
+    const STALL: u64 = 5;
+    let c = Coalition::<ChatMessage>::new(vec!["sv_src".to_string(), "sv_sink".to_string()])
+        .await
+        .expect("coalition creation");
+    db.query(format!(
+        "DEFINE FIELD OVERWRITE stall ON cursor VALUE IF id = cursor:sv_sink {{ sleep({STALL}s) }}"
+    ))
+    .await
+    .and_then(|r| r.check())
+    .expect("define the cursor write stall field");
+
+    let src = c.agent("sv_src").await.expect("sv_src in coalition");
+    src.send(
+        "sv_sink",
+        ChatMessage {
+            content: "sv".to_string(),
+        },
+    )
+    .await
+    .expect("sv_src → sv_sink send");
+    let delivered = timeout(Duration::from_secs(5), c.inbox().recv()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let began = tokio::time::Instant::now();
+    c.shutdown().await;
+    let elapsed = began.elapsed();
+    remove_stall(db, "cursor").await;
+    wait_out_stall(began, STALL).await;
+
+    let delivered = delivered
+        .expect("precondition: no delivery within 5 s")
+        .expect("inbox bus closed unexpectedly");
+    assert_eq!(delivered.recipient, "sv_sink");
+    assert!(
+        elapsed < Duration::from_millis(3500),
+        "shutdown with a stalled cursor save took {elapsed:?}"
     );
 }
 
