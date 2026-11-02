@@ -12,18 +12,22 @@ The cursor passes a message addressed to the agent only after its delivery is on
 
 Malformed data follows one rule: log at error level and skip. The rule covers these cases:
 
-- A changeset that is not an object or has no numeric versionstamp. Such a changeset has no position, so the cursor passes it only by moving to a later changeset.
+- A changeset that is not an object, has no integer versionstamp, or has versionstamp `i64::MAX`. Such a changeset has no position, so the cursor passes it only by moving to a later changeset. These changesets give one error line per page, with their count and the first of them. A page that repeats the cursor position and count of the last logged page does not log them.
 - A missing or non-array `changes`.
 - A change that is not an object, or whose op key is not `update`, `delete` or `define_table`.
 - A record that is not an object.
 - A record whose `out` is missing or not a record id.
 - A message whose payload does not decode as `T`.
 
+A full page that leaves the cursor in place is not skipped. It fails the pass with `Error::CatchUp`, and the agent reconnects with backoff and reads the page again.
+
 `delete` and `define_table` ops and messages for other agents are skipped without a log. Each `update` op of a message record for the agent is one delivery, so a message record updated after creation is delivered again.
 
-A stop by cancellation or by a closed bus persists the cursor at the first change not on the bus. For message records that are only created, the next run then neither skips nor repeats a message. If that save fails, the persisted cursor stays at its previous saved position, and the messages sent since then are put on the bus again.
+A stop by cancellation or by a closed bus persists the cursor at the first change not on the bus. For message records that are only created, and with no earlier save failed or timed out, the next run then neither skips nor repeats a message. If that save fails, the persisted cursor stays at its previous saved position, and the messages sent since then are put on the bus again.
 
-The cursor is persisted once per catch-up page. If the process exits mid-page, that page's already-sent messages are put on the bus again after restart.
+A cursor save that does not finish within 2 s stops waiting and is logged at error level with the position. After a complete page, the in-memory cursor still moves and the pass continues, so the page is not read again. Three saves can then write the position: the next page's save, a retry on an empty page, and one save at the listen loop's stop. A cursor save does not move the row to a lower position. After a timed-out save, the messages sent since the position in the `cursor` row are put on the bus again at the next start.
+
+The cursor is persisted once per catch-up page. If the process exits mid-page, the messages sent since the position in the `cursor` row are put on the bus again after restart. A stalled database can leave more than one page unsaved, so that replay can hold more than one page.
 
 Deliveries already on the bus are **not** replayed. If the process exits, or every receiver is dropped, before a consumer reads them, they are lost. `close()` on any receiver stops further sends, and the queued deliveries stay readable. (See the SurrealDB `live-queries` skill, "Delivery guarantees".)
 
