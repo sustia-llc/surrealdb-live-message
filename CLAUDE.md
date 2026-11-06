@@ -29,7 +29,8 @@ These are diagnosed fixes, and tests lock them in. See the docstrings in `src/me
 - `Coalition` owns a root `CancellationToken`, which is a child of the caller's token with `Coalition::new_with_parent`.
 - It spawns listen-loops on `child_token()` and exposes `cancellation_token()` + `shutdown().await`.
 - Dropping a `Coalition` cancels its root token without waiting.
-- `shutdown().await` cancels the root token and waits for the listen loops and the retention sweep to end. After the cancel, a loop makes at most one cursor save. That save waits up to `CURSOR_SAVE_TIMEOUT`. The end of its live query waits up to `LIVE_KILL_TIMEOUT`. If that end is not confirmed, one fallback `KILL` waits up to `LIVE_KILL_TIMEOUT` more. So a loop stops within `CURSOR_SAVE_TIMEOUT + 2 × LIVE_KILL_TIMEOUT` after the cancel. Tests: `shutdown_is_bounded_with_a_save_in_flight`, `shutdown_is_bounded_with_a_save_on_a_stop`. The sweep's connection and `DELETE` are raced against the token.
+- `shutdown().await` cancels the root token and waits for the listen loops and the retention sweep to end. After the cancel, a loop makes at most one cursor save. That save waits up to `CURSOR_SAVE_TIMEOUT`. The end of its live query waits up to `LIVE_KILL_TIMEOUT`. If that end is not confirmed, one fallback `KILL` and one more `INFO` read share up to `LIVE_KILL_TIMEOUT` more. So a loop stops within `CURSOR_SAVE_TIMEOUT + 2 × LIVE_KILL_TIMEOUT` after the cancel. Tests: `shutdown_is_bounded_with_a_save_in_flight`, `shutdown_is_bounded_with_a_save_on_a_stop`. The sweep's connection and `DELETE` are raced against the token.
+- Only a stop runs that full end. On a reconnect (`Exit::CatchUp` or `Exit::Wake`), the end wait stops at the first failed read and sends no fallback `KILL` (`exit_end_scope_is_full_only_at_a_stop`, `short_end_live_sends_no_fallback_kill`).
 - The library installs no signal handling. Callers wire top-level shutdown (for example bare `tokio::signal::ctrl_c`) outside the library. Do not add signal handling or `tokio-graceful-shutdown` inside the lib.
 
 ### Delivery bus
@@ -79,8 +80,8 @@ These are diagnosed fixes, and tests lock them in. See the docstrings in `src/me
 
 - A subscribe in flight at a cancel moves to a spawned task that no `TaskTracker` tracks. Neither the loop nor `shutdown()` waits for it, and the live count can settle after they return.
 - When the reply arrives, that task ends the live query as a loop does at its stop. It drops the stream, and the SDK's `Drop` sends a `KILL` on the stream's session (`surrealdb-4.0.0/src/method/live.rs:369`). It then reads `INFO FOR TABLE message` until the live query is not listed, up to `LIVE_KILL_TIMEOUT`. If the end is not confirmed by then, it sends one `KILL` of its own.
-- It logs these cases at warn: a failed subscribe, a reply still missing after `LIVE_KILL_TIMEOUT`, the live query still listed at the deadline (`LiveStillListed`), no read returned by the deadline (`LiveEndUnread`), a failed or timed-out fallback `KILL` (`LiveKill`, `LiveKillTimeout`), and its own drop before it finishes. After the missing-reply warn, it keeps waiting.
-- The SDK keeps the result of a `KILL` statement (`surrealdb-4.0.0/src/method/query.rs:445`), so a refused fallback `KILL` logs `LiveKill` with the server's error.
+- It logs these cases at warn: a failed subscribe, a reply still missing after `LIVE_KILL_TIMEOUT`, an end not confirmed by the deadline (`LiveEndUnconfirmed`, whose `listed` field says whether a read still listed the live query), a failed or timed-out fallback `KILL` (`LiveKill`, `LiveKillTimeout`), and its own drop before it finishes. After the missing-reply warn, it keeps waiting.
+- The SDK keeps the result of a `KILL` statement (`surrealdb-4.0.0/src/method/query.rs:445`). After a failed or refused fallback `KILL`, the crate reads `INFO FOR TABLE message` once more. If that read does not list the live query, nothing is logged. Otherwise the crate logs `LiveKill` with the server's error.
 
 ### Catch-up cursor
 
