@@ -44,9 +44,13 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// one it is given.
 const WAKE_DRAIN_MAX: usize = 64;
 
-/// Maximum time [`kill_live`] waits for a `KILL` of a live query, and the time
+/// Maximum time [`kill_live`] waits for a `KILL` of a live query, the time
+/// [`end_live`] waits for a live query to leave the datastore, and the time
 /// [`finish_subscribe`] waits for a reply before it logs a warn.
 const LIVE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Interval between the reads of [`end_live`]'s wait.
+const LIVE_END_POLL: Duration = Duration::from_millis(10);
 
 /// Maximum time [`save_cursor_bounded`] waits for a cursor save.
 const CURSOR_SAVE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -149,20 +153,23 @@ impl Agent {
         };
         let agent_id = RecordId::new(AGENT_TABLE, name);
         let cursor_id = RecordId::new(CURSOR_TABLE, name);
-        let stored_id = |id: RecordId| async move {
-            db.query("SELECT VALUE id FROM ONLY $id")
+        // A table scan with `WHERE id = …` evaluates no computed field that
+        // `VALUE id` does not read; a point lookup (`FROM ONLY $id`) evaluates
+        // every computed field of the record.
+        let stored_id = |table: &'static str, id: RecordId| async move {
+            db.query(format!("SELECT VALUE id FROM {table} WHERE id = $id"))
                 .bind(("id", id))
                 .await?
                 .take::<Option<RecordId>>(0)
         };
 
-        let cursor_present = bounded(name, bound, stored_id(cursor_id.clone()))
+        let cursor_present = bounded(name, bound, stored_id(CURSOR_TABLE, cursor_id.clone()))
             .await?
             .map_err(create_err)?;
         let cursor_absent = cursor_present.is_none();
         let replay = Cursor::at(0);
         let start = if cursor_absent {
-            let agent_present = bounded(name, bound, stored_id(agent_id.clone()))
+            let agent_present = bounded(name, bound, stored_id(AGENT_TABLE, agent_id.clone()))
                 .await?
                 .map_err(create_err)?;
             match (agent_present, *walked) {
@@ -697,10 +704,10 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
 
     /// Cancel the root token, then wait until every listen loop and the
     /// retention sweep have ended. After the cancel, a loop makes at most one
-    /// cursor save, which waits up to 2 s, and waits up to 2 s for its `KILL`.
-    /// A subscribe in flight at the
-    /// cancel is finished by a task that this does not wait for, so its `KILL`
-    /// can run after this returns.
+    /// cursor save, which waits up to 2 s, and waits up to 2 s for its live
+    /// query to leave the datastore. A subscribe in flight at the
+    /// cancel is finished by a task that this does not wait for, so its live
+    /// query can end after this returns.
     pub async fn shutdown(&self) {
         self.cancellation_token.cancel();
         self.task_tracker.close();
@@ -924,13 +931,30 @@ fn object_versionstamp(o: &Object) -> Option<i64> {
     }
 }
 
-/// The value of `n` if `n` is an integer: an `Int`, a `Float` with no fraction
-/// below [`FLOAT_INTEGER_BOUND`] in size, or a `Decimal` with no fraction that
-/// fits `i64`. Otherwise `None`.
+/// The value of `n` if `n` is a whole number in `i64` range, else `None`.
+///
+/// Integer variants (`Int`, `I8`, `U8`, `I16`, `U16`, `I32`, `U32`, `U64`)
+/// qualify when they fit `i64`, so a `U64` above `i64::MAX` does not. A
+/// `Float`, `F32` or `F16` qualifies when it has no fraction and its size is
+/// below [`FLOAT_INTEGER_BOUND`], so a NaN and an infinity do not. A `Decimal`
+/// or `BigDecimal` qualifies when it has no fraction and fits `i64`.
 fn integral(n: &Number) -> Option<i64> {
+    let whole_float = |v: f64| v.fract() == 0.0 && v.abs() < FLOAT_INTEGER_BOUND;
     let exact = match n {
-        Number::Int(_) => true,
-        Number::Float(v) => v.fract() == 0.0 && v.abs() < FLOAT_INTEGER_BOUND,
+        Number::Int(_)
+        | Number::I8(_)
+        | Number::U8(_)
+        | Number::I16(_)
+        | Number::U16(_)
+        | Number::I32(_)
+        | Number::U32(_)
+        | Number::U64(_)
+        // `to_int` of a `BigDecimal` is `None` for a fraction or a value
+        // outside `i64`.
+        | Number::BigDecimal(_) => true,
+        Number::Float(v) => whole_float(*v),
+        Number::F32(v) => whole_float(f64::from(*v)),
+        Number::F16(v) => whole_float(f64::from(*v)),
         Number::Decimal(v) => v.is_integer(),
     };
     exact.then(|| n.to_int()).flatten()
@@ -1752,9 +1776,10 @@ where
 }
 
 /// A future that awaits `subscribe`, in flight when `agent`'s loop was
-/// cancelled, then sends a `KILL` of the returned live query with [`end_live`].
+/// cancelled, then ends the returned live query with [`end_live`].
 /// A failed `subscribe` is logged at warn with the agent and the error chain;
-/// a failed `KILL` call is logged by [`kill_live`]. With no reply after
+/// a failed end check or a live query still listed after
+/// [`LIVE_KILL_TIMEOUT`] is logged by [`end_live`]. With no reply after
 /// [`LIVE_KILL_TIMEOUT`], the future logs a warn with the agent and keeps
 /// waiting, with no bound. If the future is dropped before it finishes, polled
 /// or not, [`UnfinishedSubscribe`] logs a warn with the agent.
@@ -1814,20 +1839,79 @@ impl Drop for UnfinishedSubscribe {
     }
 }
 
-/// Send a `KILL` of live query `live_id` through [`kill_live`], then drop
-/// `stream`.
+/// End live query `live_id` of `stream`: drop `stream`, whose `Drop` has the
+/// SDK send a `KILL` of `live_id` on the stream's own session, then read
+/// `INFO FOR TABLE message` every [`LIVE_END_POLL`] until its `lives` no
+/// longer lists `live_id`, for up to [`LIVE_KILL_TIMEOUT`]. A failed read is
+/// logged at warn as [`Error::LiveEndCheck`], and `live_id` still listed after
+/// the timeout as [`Error::LiveKillTimeout`], each with the agent and the live
+/// id.
 async fn end_live(
     db: &Surreal<any::Any>,
     agent: &str,
     live_id: Uuid,
     stream: QueryStream<Notification<Value>>,
 ) {
-    kill_live(db, agent, live_id).await;
     drop(stream);
+    let outcome = match timeout(LIVE_KILL_TIMEOUT, await_live_end(db, agent, live_id)).await {
+        Ok(ended) => ended,
+        Err(_elapsed) => Err(Error::LiveKillTimeout {
+            agent: agent.to_string(),
+            live_id,
+            timeout: LIVE_KILL_TIMEOUT,
+        }),
+    };
+    if let Err(e) = outcome {
+        warn_kill_live(&e);
+    }
+}
+
+/// Read `INFO FOR TABLE message` every [`LIVE_END_POLL`] until `lives` does
+/// not list `live_id`. A failed read, or a reply with no `lives` object, is
+/// [`Error::LiveEndCheck`] for `agent`.
+async fn await_live_end(db: &Surreal<any::Any>, agent: &str, live_id: Uuid) -> Result<()> {
+    let id = live_id.to_string();
+    loop {
+        let listed = message_live_ids(db)
+            .await
+            .map_err(|source| Error::LiveEndCheck {
+                agent: agent.to_string(),
+                live_id,
+                source: Box::new(source),
+            })?;
+        if !listed.contains(&id) {
+            return Ok(());
+        }
+        sleep(LIVE_END_POLL).await;
+    }
+}
+
+/// The keys of `lives` in `INFO FOR TABLE message`: the ids of the live
+/// queries the datastore holds on `message`. A failed read, or a reply with no
+/// `lives` object, is an error naming the reply.
+async fn message_live_ids(
+    db: &Surreal<any::Any>,
+) -> std::result::Result<Vec<String>, surrealdb::Error> {
+    let info: Value = db
+        .query(format!("INFO FOR TABLE {MESSAGE_TABLE}"))
+        .await?
+        .take(0)?;
+    match &info {
+        Value::Object(o) => match o.get("lives") {
+            Some(Value::Object(lives)) => Ok(lives.keys().cloned().collect()),
+            _ => Err(*reply_error(format!(
+                "INFO FOR TABLE {MESSAGE_TABLE} has no `lives` object: {info:?}"
+            ))),
+        },
+        _ => Err(*reply_error(format!(
+            "INFO FOR TABLE {MESSAGE_TABLE} is not an object: {info:?}"
+        ))),
+    }
 }
 
 /// `KILL` live query `live_id` through `db` within [`LIVE_KILL_TIMEOUT`],
-/// logging a failure or timeout at warn.
+/// logging at warn a failed call, a `KILL` the datastore refuses (with its
+/// error in the source chain), or a timeout.
 async fn kill_live(db: &Surreal<any::Any>, agent: &str, live_id: Uuid) {
     let kill = db.query("KILL $id").bind(("id", Value::Uuid(live_id)));
     let outcome = match timeout(LIVE_KILL_TIMEOUT, kill).await {
@@ -1941,11 +2025,14 @@ mod tests {
         );
     }
 
-    /// Time for a `Drop`-spawned SDK KILL to run before the datastore is read.
+    /// Time for a `Drop`-spawned SDK KILL to run, and to log, before the logs
+    /// or the datastore are read.
     const DROP_KILL_SETTLE: Duration = Duration::from_millis(300);
 
-    /// [`end_live`] removes the wake-up subscription from the datastore.
-    #[tokio::test]
+    /// On Mem, once [`end_live`] returns, the datastore lists no live query,
+    /// and neither the crate nor the SDK logs a warn line, also after
+    /// [`DROP_KILL_SETTLE`].
+    #[tokio::test(flavor = "current_thread")]
     async fn end_live_removes_the_live_query() {
         let db = mem_db().await;
         let owner = RecordId::new(AGENT_TABLE, "frank");
@@ -1960,35 +2047,59 @@ mod tests {
             "subscribe registers one live query"
         );
 
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
         end_live(&db, "frank", live_id, stream).await;
+        let at_return = message_lives(&db).await;
         sleep(DROP_KILL_SETTLE).await;
+        drop(guard);
 
-        let after = message_lives(&db).await;
-        assert!(
-            after.is_empty(),
-            "live query {id} must be gone after end_live; datastore still lists {after:?}"
+        assert_eq!(
+            at_return,
+            Vec::<String>::new(),
+            "live query {id} must be gone when end_live returns"
+        );
+        let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(
+            warns,
+            Vec::<&str>::new(),
+            "end_live must log no warn from the crate or the SDK"
         );
     }
 
-    /// Countermodel: dropping the SDK stream alone leaves the live query
-    /// registered. Its `Drop` KILL runs on a fresh session with no namespace,
-    /// database or sign-in, which the datastore refuses.
-    #[tokio::test]
-    async fn dropping_the_stream_leaves_the_live_query() {
+    /// At surrealdb 4.0.0 on Mem, dropping the SDK stream alone ends its live
+    /// query: the datastore lists it no more within 2 s, and the drop logs no
+    /// warn line.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_the_stream_ends_the_live_query() {
         let db = mem_db().await;
         let owner = RecordId::new(AGENT_TABLE, "frank");
         let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
             .await
             .expect("subscribe");
 
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
         drop(stream);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut after = message_lives(&db).await;
+        while !after.is_empty() && tokio::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+            after = message_lives(&db).await;
+        }
         sleep(DROP_KILL_SETTLE).await;
+        drop(guard);
 
-        let after = message_lives(&db).await;
         assert_eq!(
             after,
-            vec![live_id.to_string()],
-            "the SDK's Drop KILL is expected to fail and leave {live_id} registered"
+            Vec::<String>::new(),
+            "the SDK's Drop KILL must end live query {live_id}"
+        );
+        let logs = logged(&sink);
+        assert!(
+            !logs.contains("WARN"),
+            "the drop must log no warn; got {logs:?}"
         );
     }
 
@@ -2894,10 +3005,24 @@ mod tests {
         task
     }
 
-    /// A [`finish_subscribe`] aborted while its `KILL` waits logs at warn with
-    /// the agent, and the live query stays registered.
+    /// Poll the live-query count on `message` every 10 ms until it is 0 or 2 s
+    /// pass; return the last ids read.
+    async fn lives_after_drain(db: &Surreal<any::Any>) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut lives = message_lives(db).await;
+        while !lives.is_empty() && tokio::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+            lives = message_lives(db).await;
+        }
+        lives
+    }
+
+    /// A [`finish_subscribe`] aborted while [`end_live`] waits for the live
+    /// query to leave a stalled datastore (see [`hold_session`]) logs at warn
+    /// with the agent. The stream's `Drop` `KILL` does not depend on the
+    /// finisher, so once the stall ends the live query is gone within 2 s.
     #[tokio::test(flavor = "current_thread")]
-    async fn finish_subscribe_logs_a_drop_during_its_kill() {
+    async fn finish_subscribe_logs_a_drop_during_its_end_wait() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
         let owner = RecordId::new(AGENT_TABLE, "frank");
         let (stream, live_id) = subscribe_wake(db, &owner, "frank")
@@ -2917,28 +3042,29 @@ mod tests {
 
         assert!(
             joined.as_ref().is_err_and(|e| e.is_cancelled()),
-            "precondition: the finisher must be aborted during its KILL, got {joined:?}"
+            "precondition: the finisher must be aborted during its end wait, got {joined:?}"
         );
         let logs = logged(&sink);
         assert!(
             logs.lines()
                 .any(|l| l.contains("WARN") && l.contains("frank") && l.contains(DROPPED_WARNING)),
-            "no drop warn line for an abort during the KILL; got {logs:?}"
+            "no drop warn line for an abort during the end wait; got {logs:?}"
         );
         held.await.expect("join");
-        let lives = message_lives(db).await;
+        let lives = lives_after_drain(db).await;
         assert_eq!(
             lives,
-            vec![live_id.to_string()],
-            "an aborted KILL leaves the live query registered"
+            Vec::<String>::new(),
+            "the stream's Drop KILL must end live query {live_id} after the stall"
         );
     }
 
-    /// A `KILL` that stalls past [`LIVE_KILL_TIMEOUT`] (see [`hold_session`]):
-    /// [`finish_subscribe`] logs it at warn with the agent and the live id,
-    /// and the live query is still registered.
+    /// A live query still listed [`LIVE_KILL_TIMEOUT`] after its stream was
+    /// dropped, because the datastore stalls (see [`hold_session`]):
+    /// [`finish_subscribe`] logs it at warn with the agent and the live id.
+    /// Once the stall ends, the live query is gone within 2 s.
     #[tokio::test(flavor = "current_thread")]
-    async fn finish_subscribe_logs_a_timed_out_kill() {
+    async fn finish_subscribe_logs_a_live_query_still_listed_after_the_timeout() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
         let owner = RecordId::new(AGENT_TABLE, "frank");
         let (stream, live_id) = subscribe_wake(db, &owner, "frank")
@@ -2955,7 +3081,7 @@ mod tests {
 
         assert!(
             elapsed >= LIVE_KILL_TIMEOUT,
-            "precondition: the KILL must stall; finish_subscribe took {elapsed:?}"
+            "precondition: the end wait must stall; finish_subscribe took {elapsed:?}"
         );
         let logs = logged(&sink);
         assert!(
@@ -2963,24 +3089,24 @@ mod tests {
                 && l.contains("frank")
                 && l.contains(&live_id.to_string())
                 && l.contains("did not finish within")),
-            "no warn line for the timed-out KILL; got {logs:?}"
+            "no warn line for the live query still listed; got {logs:?}"
         );
         held.await.expect("join");
-        let lives = message_lives(db).await;
+        let lives = lives_after_drain(db).await;
         assert_eq!(
             lives,
-            vec![live_id.to_string()],
-            "a timed-out KILL leaves the live query registered"
+            Vec::<String>::new(),
+            "the stream's Drop KILL must end live query {live_id} after the stall"
         );
     }
 
     /// [`finish_subscribe`] logs a failed subscribe at warn with the agent and
-    /// the error chain, and a failed `KILL` of the returned live query at warn
-    /// with the agent and the error chain, through a client with no
-    /// connection, on which the `KILL` fails. Neither logs a late reply or a
-    /// drop.
+    /// the error chain, and a failed end check of the returned live query at
+    /// warn with the agent, the live id and the error chain, through a client
+    /// with no connection, on which the `INFO FOR TABLE` read fails. Neither
+    /// logs a late reply or a drop.
     #[tokio::test(flavor = "current_thread")]
-    async fn finish_subscribe_logs_a_failed_subscribe_and_a_failed_kill() {
+    async fn finish_subscribe_logs_a_failed_subscribe_and_a_failed_end_check() {
         let db = mem_db().await;
         let unconnected = Surreal::<any::Any>::init();
         let owner = RecordId::new(AGENT_TABLE, "frank");
@@ -3011,9 +3137,9 @@ mod tests {
         );
         assert!(
             warns.iter().any(|l| l.contains("frank")
-                && l.contains("failed to KILL live query")
+                && l.contains("could not confirm the end of live query")
                 && l.contains(&live_id.to_string())),
-            "no warn line for the failed KILL; got {logs:?}"
+            "no warn line for the failed end check; got {logs:?}"
         );
         assert!(
             !logs.contains(NO_REPLY_WARNING) && !logs.contains(DROPPED_WARNING),
@@ -3310,6 +3436,60 @@ mod tests {
         );
     }
 
+    /// Text of the datastore's refusal of a `KILL` of an id it does not hold.
+    const KILL_REFUSAL: &str = "Cannot execute KILL statement using id";
+
+    /// On Mem, [`kill_live`] of an id the datastore does not hold logs one
+    /// warn line with the agent, the id and the datastore's refusal in its
+    /// source chain; a [`kill_live`] of a registered live query logs no warn
+    /// line and the datastore lists the live query no more.
+    #[tokio::test(flavor = "current_thread")]
+    async fn kill_live_warns_on_a_refused_kill_and_not_on_a_kill_that_succeeds() {
+        let db = mem_db().await;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe");
+        let unknown = Uuid::new_v4();
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        kill_live(&db, "frank", unknown).await;
+        let refused_logs = logged(&sink);
+        kill_live(&db, "frank", live_id).await;
+        let all_logs = logged(&sink);
+        drop(guard);
+        let after = message_lives(&db).await;
+        drop(stream);
+
+        let refused: Vec<&str> = refused_logs
+            .lines()
+            .filter(|l| l.contains("WARN"))
+            .collect();
+        assert_eq!(
+            refused.len(),
+            1,
+            "one warn line for the refused KILL; got {refused_logs:?}"
+        );
+        assert!(
+            refused[0].contains("frank")
+                && refused[0].contains(&unknown.to_string())
+                && refused[0].contains(KILL_REFUSAL),
+            "the warn line must carry the agent, the id and {KILL_REFUSAL:?}; got {:?}",
+            refused[0]
+        );
+        let later = &all_logs[refused_logs.len()..];
+        assert!(
+            !later.contains("WARN"),
+            "a KILL that succeeds logs no warn line; got {later:?}"
+        );
+        assert_eq!(
+            after,
+            Vec::<String>::new(),
+            "the KILL that succeeded ends live query {live_id}"
+        );
+    }
+
     /// A pre-sent signal resolves to `Ok(())` — the happy path of the seam.
     #[tokio::test]
     async fn await_ready_succeeds_when_signalled() {
@@ -3421,6 +3601,62 @@ mod tests {
             (decimal("7.5"), None),
             (decimal("-0.5"), None),
             (decimal("10000000000000000000000000000"), None),
+        ];
+        for (number, want) in cases {
+            let read = integral(&number);
+            assert_eq!(read, want, "integral({number:?}) read {read:?}");
+        }
+    }
+
+    /// `text` as a `BigDecimal` number.
+    fn big(text: &str) -> Number {
+        Number::BigDecimal(Box::new(
+            text.parse::<surrealdb_types::BigDecimal>()
+                .expect("bigdecimal text"),
+        ))
+    }
+
+    /// [`integral`] over the `Number` variants new at surrealdb-types 4.0.0:
+    /// each integer variant at its extremes, a `U64` above `i64::MAX`, `F32`
+    /// and `F16` with and without a fraction, NaN and infinities, an `F32` at
+    /// and above [`FLOAT_INTEGER_BOUND`], and `BigDecimal` whole, fractional
+    /// and outside `i64`.
+    #[test]
+    fn integral_reads_every_number_variant() {
+        use surrealdb_types::f16;
+        let cases = [
+            (Number::I8(i8::MIN), Some(-128)),
+            (Number::U8(u8::MAX), Some(255)),
+            (Number::I16(i16::MIN), Some(-32_768)),
+            (Number::U16(u16::MAX), Some(65_535)),
+            (Number::I32(i32::MIN), Some(-2_147_483_648)),
+            (Number::U32(u32::MAX), Some(4_294_967_295)),
+            (Number::U64(7), Some(7)),
+            (Number::U64(9_223_372_036_854_775_807), Some(i64::MAX)),
+            (Number::U64(9_223_372_036_854_775_808), None),
+            (Number::U64(u64::MAX), None),
+            (Number::F32(7.0), Some(7)),
+            (Number::F32(-7.0), Some(-7)),
+            (Number::F32(7.5), None),
+            (Number::F32(f32::NAN), None),
+            (Number::F32(f32::INFINITY), None),
+            (Number::F32(f32::NEG_INFINITY), None),
+            (Number::F32(9_007_199_254_740_992.0), None),
+            (Number::F32(1e30), None),
+            (Number::F32(16_777_216.0), Some(16_777_216)),
+            (Number::F16(f16::from_f32(7.0)), Some(7)),
+            (Number::F16(f16::from_f32(-2048.0)), Some(-2048)),
+            (Number::F16(f16::from_f32(65504.0)), Some(65_504)),
+            (Number::F16(f16::from_f32(7.5)), None),
+            (Number::F16(f16::NAN), None),
+            (Number::F16(f16::INFINITY), None),
+            (Number::F16(f16::NEG_INFINITY), None),
+            (big("7"), Some(7)),
+            (big("7.00"), Some(7)),
+            (big("-9223372036854775808"), Some(i64::MIN)),
+            (big("7.5"), None),
+            (big("9223372036854775808"), None),
+            (big("1e40"), None),
         ];
         for (number, want) in cases {
             let read = integral(&number);
