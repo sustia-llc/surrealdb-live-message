@@ -10,6 +10,7 @@ use std::time::Duration;
 
 /// All fallible operations in the library funnel through this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("failed to connect to SurrealDB")]
     Connect(#[source] Box<surrealdb::Error>),
@@ -88,17 +89,39 @@ pub enum Error {
         source: Box<surrealdb::Error>,
     },
 
-    /// The read of `INFO FOR TABLE message` that checks whether live query
-    /// `live_id` has ended failed, with that error as `source`, or returned
-    /// no `lives` object, named in `source`.
-    #[error("failed to read whether live query {live_id} for agent '{agent}' has ended")]
-    LiveEndCheck {
+    /// No read of `INFO FOR TABLE message` returned a reply within `timeout`
+    /// while waiting for live query `live_id` to end. `source` is the last
+    /// failed read's error, or a reply with no `lives` object named in it;
+    /// `None` when no read finished.
+    #[error(
+        "no read of whether live query {live_id} for agent '{agent}' has ended returned a \
+         reply within {timeout:?}"
+    )]
+    LiveEndUnread {
         agent: String,
         live_id: surrealdb_types::Uuid,
+        timeout: Duration,
         #[source]
-        source: Box<surrealdb::Error>,
+        source: Option<Box<surrealdb::Error>>,
     },
 
+    /// `INFO FOR TABLE message` still listed live query `live_id` in its last
+    /// reply when the wait of `timeout` for the live query to end ran out.
+    /// `source` is the last failed read's error, if a read failed.
+    #[error(
+        "live query {live_id} for agent '{agent}' was still listed when the wait of \
+         {timeout:?} for it to end ran out"
+    )]
+    LiveStillListed {
+        agent: String,
+        live_id: surrealdb_types::Uuid,
+        timeout: Duration,
+        #[source]
+        source: Option<Box<surrealdb::Error>>,
+    },
+
+    /// A `KILL` of live query `live_id` sent by this crate did not finish
+    /// within `timeout`.
     #[error("KILL of live query {live_id} for agent '{agent}' did not finish within {timeout:?}")]
     LiveKillTimeout {
         agent: String,

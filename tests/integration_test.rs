@@ -993,9 +993,11 @@ async fn cursor_position(db: &Surreal<any::Any>, agent: &str) -> Option<(i64, i6
     Some((int("versionstamp")?, int("change_index").unwrap_or(0)))
 }
 
-/// A SurrealQL block that loops on the server until `secs` seconds have passed
-/// since it started, then yields `NONE`. Each statement of a `FOR` body reads
-/// its own `time::now()`.
+/// A SurrealQL block that loops on the server, then yields `NONE`. The loop
+/// ends when a check finds that `secs` seconds have passed since the block
+/// started, or after its last iteration: 100 000 outer iterations, each one
+/// check and then up to 1000 inner iterations of one check each, so at most
+/// 100 100 000 checks. Each check reads its own `time::now()`.
 fn busy_wait(secs: u64) -> String {
     format!(
         "{{ LET $end = time::now() + {secs}s; \
