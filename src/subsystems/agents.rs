@@ -105,8 +105,7 @@ impl Agent {
     /// absent, it is created in the same transaction that checks for
     /// `agent:<name>`: for a new agent, 1 above the highest versionstamp in
     /// the whole `message` changefeed at the time of the read (1 for an empty
-    /// feed), read in pages until a page holds fewer than 1000 changesets, in
-    /// a database where `message` is the one table with a changefeed; for an
+    /// feed), read in pages until a page holds fewer than 1000 changesets; for an
     /// agent whose record already existed, at versionstamp 0, with no changefeed
     /// read if the existence check finds it, so the next catch-up reads the whole retained changefeed, and
     /// that start is logged at warn with the agent and the position as fields.

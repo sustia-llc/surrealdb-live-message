@@ -42,7 +42,7 @@ Since the 2026-04 library-first refactor, the library exposes a `Coalition<T: Su
 - It validates `name`, which must be non-empty ASCII alphanumeric or `_`. A rejected name returns `Error::InvalidAgentName`.
 - It **reuses an existing `agent` record or creates one**. It is restart-idempotent, so a restarted coalition resumes its durable cursors.
 - If `cursor:<name>` is absent, it creates that cursor. An existing cursor is kept.
-- A new agent starts after the highest versionstamp in the whole `message` changefeed. The read goes in pages until a page holds fewer than 1000 changesets. This needs a database where `message` is the one table with a changefeed.
+- A new agent starts after the highest versionstamp in the whole `message` changefeed. The read goes in pages until a page holds fewer than 1000 changesets. Another table with a changefeed in the same database does not end the read early.
 - An existing agent starts at versionstamp 0, so its retained backlog is delivered, with a warn log. If the first lookup finds the agent, there is no changefeed read.
 - The agent record and the cursor are written in one transaction, so `Agent::new` does not write an `agent` record without its cursor.
 
@@ -146,8 +146,8 @@ RELATE agent:alice->message->agent:bob
         payload: { kind: "Text", body: "Hello, Bob!" },
     };
 
-# inspect — note the *, in, out projection is required for edge records
-SELECT *, in, out FROM message;
+# inspect: a bare SELECT * returns the edge pointers in and out
+SELECT * FROM message;
 ```
 
 ## Examples
@@ -217,8 +217,9 @@ This repo is the reference implementation for several transferable patterns, eac
 
 - **Two-tier durable message bus** (`surrealdb:live-queries`, "Delivery guarantees"). `LIVE` is at-most-once with no replay, so it is only a low-latency wake-up over a durable, `CHANGEFEED`-backed log. The sole delivery path is `SHOW CHANGES … SINCE <cursor>` catch-up. It advances a persisted per-agent (versionstamp, change index) cursor past a change only once its delivery is on the bus. The listen loop reconnects with backoff and re-drains on every (re)connect. A per-coalition retention sweep ages out the log. As a result, a message is put on the bus after disconnects and restarts. A stop whose cursor save succeeds repeats no message. A process exit mid-page repeats the sent messages of that page. Deliveries already on the bus are not replayed.
 - **Library-first async lifecycle** (`rust-v2:async-lifecycle`). Expose `CancellationToken` + `TaskTracker`, not `SubsystemHandle`, and let callers wire their top-level shutdown. `Coalition::new` has a readiness handshake for subscription-registering spawns. The integration test uses `DropGuard` for panic-safe container teardown.
-- **`#[surreal(rename)]` for raw-identifier fields** (`surrealdb:repository-patterns`). The `SurrealValue` derive ignores `#[serde(rename)]`. Fields like `r#in` must carry `#[surreal(rename = "in")]` or round-trip as `None`.
-- **Explicit edge-pointer projection on edge records** (`surrealdb:live-queries`). A bare `SELECT *` / `LIVE SELECT *` on `RELATE`-created edges omits `in`/`out`. Read them with `SELECT *, in, out FROM message ...`, as the integration test asserts. The durable-bus delivery path sidesteps this because `SHOW CHANGES` changeset records carry `id`/`in`/`out` natively. So the wake-up subscription only needs `LIVE SELECT id`.
+- **Raw-identifier fields** (`surrealdb:repository-patterns`). At SurrealDB 4.0.0 the `SurrealValue` derive strips `r#`, so `r#in` decodes from the key `in` with no attribute. The integration test decodes `Message` this way.
+- **Edge pointers** (`surrealdb:live-queries`). At SurrealDB 4.0.0 a bare `SELECT *` on a `RELATE`-created edge returns `in` and `out`, as the integration test asserts. The wake-up subscription reads only `LIVE SELECT id`, and the durable bus reads `in` and `out` from `SHOW CHANGES` changeset records.
+- **Worker stack size** (`surrealdb:embedded-databases`). A debug build that runs the `kv-mem` engine can overflow the default thread stack, and the unit tests pass with a 10 MiB stack. This repo sets `RUST_MIN_STACK = "10485760"` in `.cargo/config.toml`. That file applies only to cargo runs in this repo, so a consumer that embeds `kv-mem` sets its own stack size.
 - **Sync/async delivery bus**. Each agent forwards durable-log messages, delivered via catch-up, onto a shared bounded [async-channel](https://crates.io/crates/async-channel) MPMC channel as `Delivery<T> { recipient, message }`. Consume with `coalition.inbox()`. Clone it for multiple workers, or call `recv_blocking()` from a synchronous agent handler on a blocking thread (see `examples/worker_pool.rs`). This is the seam that a framework hangs agent logic off of.
 - **Validate at the boundary, parameterize at the query** (`surrealdb:graph-operations`). `Agent::new` validates agent names (`InvalidAgentName`). The LIVE query binds them as `$owner` in place of interpolation, so a name can never alter the SQL. `Agent::send` makes sure that the recipient exists (`UnknownRecipient`) in place of writing a dangling edge.
 
