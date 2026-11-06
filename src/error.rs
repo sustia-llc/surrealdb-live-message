@@ -88,6 +88,17 @@ pub enum Error {
         source: Box<surrealdb::Error>,
     },
 
+    /// The read of `INFO FOR TABLE message` that checks whether live query
+    /// `live_id` has ended failed, with that error as `source`, or returned
+    /// no `lives` object, named in `source`.
+    #[error("failed to read whether live query {live_id} for agent '{agent}' has ended")]
+    LiveEndCheck {
+        agent: String,
+        live_id: surrealdb_types::Uuid,
+        #[source]
+        source: Box<surrealdb::Error>,
+    },
+
     #[error("KILL of live query {live_id} for agent '{agent}' did not finish within {timeout:?}")]
     LiveKillTimeout {
         agent: String,

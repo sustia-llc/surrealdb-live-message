@@ -149,8 +149,9 @@ async fn test_agent_messaging() {
     // `in = alice` and `out = bob`. So `in = agent:alice` filters for
     // *outgoing* messages from alice (i.e., alice's sends, containing her
     // payload). Likewise for bob.
+    scenario_bare_select_edge_pointers(db).await;
     let mut response = db
-        .query("SELECT *, in, out FROM message WHERE in = agent:alice")
+        .query("SELECT * FROM message WHERE in = agent:alice")
         .await
         .unwrap();
     let alice_outgoing: Vec<Message<ChatMessage>> = response.take(0).unwrap();
@@ -161,9 +162,6 @@ async fn test_agent_messaging() {
             content: "Hello from Alice!".to_string(),
         }
     );
-    // Full edge-pointer assertion — locks in the `#[surreal(rename = "in")]`
-    // + explicit `SELECT *, in, out` projection combo that makes `r#in`
-    // deserialize correctly.
     assert_eq!(
         alice_outgoing[0].r#in,
         Some(RecordId::new(AGENT_TABLE, AGENT_ALICE))
@@ -174,7 +172,7 @@ async fn test_agent_messaging() {
     );
 
     let mut response = db
-        .query("SELECT *, in, out FROM message WHERE in = agent:bob")
+        .query("SELECT * FROM message WHERE in = agent:bob")
         .await
         .unwrap();
     let bob_outgoing: Vec<Message<ChatMessage>> = response.take(0).unwrap();
@@ -232,6 +230,7 @@ async fn test_agent_messaging() {
     scenario_new_agents_share_one_walk(db).await;
     scenario_stalled_save_bounds_shutdown(db).await;
     scenario_cursor_save_moves_only_forward(db).await;
+    scenario_other_changefeed_table(db).await;
 
     // 6) Shutdown — coalition first (agent drain), then the sdb task.
     let lives_before = message_lives(db).await;
@@ -276,6 +275,205 @@ async fn assert_no_live_queries(db: &Surreal<any::Any>) {
     );
 }
 
+/// **A bare `SELECT *` on a `message` edge carries its pointers.** Over the
+/// WebSocket connection, the one `message` row from `agent:alice` read with a
+/// bare `SELECT *` has the keys `in` and `out`, holding `agent:alice` and
+/// `agent:bob`, and decodes as a [`Message`], whose `r#in` field has no
+/// `#[surreal(rename)]` attribute, with `r#in` `agent:alice` and `out`
+/// `agent:bob`.
+async fn scenario_bare_select_edge_pointers(db: &Surreal<any::Any>) {
+    let query = "SELECT * FROM message WHERE in = agent:alice";
+    let alice = surrealdb_types::Value::RecordId(RecordId::new(AGENT_TABLE, AGENT_ALICE));
+    let bob = surrealdb_types::Value::RecordId(RecordId::new(AGENT_TABLE, AGENT_BOB));
+
+    let rows: Vec<surrealdb_types::Value> = db
+        .query(query)
+        .await
+        .and_then(|mut r| r.take(0))
+        .expect("bare select as values");
+    let [surrealdb_types::Value::Object(row)] = rows.as_slice() else {
+        panic!("expected one object row from alice, got {rows:?}");
+    };
+    assert_eq!(
+        (row.get("in"), row.get("out")),
+        (Some(&alice), Some(&bob)),
+        "a bare SELECT * row must carry in and out; row keys {:?}",
+        row.keys().collect::<Vec<_>>()
+    );
+
+    let decoded: Vec<Message<ChatMessage>> = db
+        .query(query)
+        .await
+        .and_then(|mut r| r.take(0))
+        .expect("bare select as messages");
+    let pointers: Vec<_> = decoded
+        .iter()
+        .map(|m| (m.r#in.clone(), m.out.clone()))
+        .collect();
+    assert_eq!(
+        pointers,
+        vec![(
+            Some(RecordId::new(AGENT_TABLE, AGENT_ALICE)),
+            Some(RecordId::new(AGENT_TABLE, AGENT_BOB))
+        )],
+        "Message::r#in and out decoded from a bare SELECT *"
+    );
+}
+
+/// The versionstamps of `table`'s changesets from `since` on, read in
+/// `SHOW CHANGES` pages of 1 000 until a page is empty.
+async fn table_stamps(db: &Surreal<any::Any>, table: &str, since: i64) -> Vec<i64> {
+    let mut stamps = Vec::new();
+    let mut since = since;
+    loop {
+        let page: surrealdb_types::Value = db
+            .query(format!(
+                "SHOW CHANGES FOR TABLE {table} SINCE {since} LIMIT 1000"
+            ))
+            .await
+            .and_then(|mut r| r.take(0))
+            .unwrap_or_else(|e| panic!("read a {table} feed page: {e}"));
+        let surrealdb_types::Value::Array(changesets) = page else {
+            panic!("SHOW CHANGES reply is not an array: {page:?}");
+        };
+        if changesets.is_empty() {
+            return stamps;
+        }
+        for changeset in changesets.iter() {
+            let stamp = match changeset {
+                surrealdb_types::Value::Object(o) => match o.get("versionstamp") {
+                    Some(surrealdb_types::Value::Number(n)) => n.to_int(),
+                    _ => None,
+                },
+                _ => None,
+            };
+            stamps.push(stamp.expect("integer versionstamp"));
+        }
+        since = stamps.iter().max().expect("a non-empty page") + 1;
+    }
+}
+
+/// The count of `stamps` strictly between `low` and `high`.
+fn between(stamps: &[i64], low: i64, high: i64) -> usize {
+    stamps.iter().filter(|s| **s > low && **s < high).count()
+}
+
+/// **Another changefeed table does not end a read early.** `cf_other`, a
+/// second table with a changefeed, gets 1 100 changesets between each two
+/// `message` changesets below. Round 1: `mc_new`, with no `agent` or `cursor`
+/// row, has two backlog messages; after `Coalition::new` for `mc_new`,
+/// `mc_src` and `mc_dst`, `cursor:mc_new` is 1 above the highest `message`
+/// versionstamp and no delivery arrives within 2 s. Round 2: with that
+/// coalition stopped, messages to `mc_dst`, `mc_new` and `mc_dst` are sent; a
+/// new coalition for the same names delivers each to its recipient, each once.
+async fn scenario_other_changefeed_table(db: &Surreal<any::Any>) {
+    const NOISE: usize = 1_100;
+    const OTHER: &str = "cf_other";
+    db.query(format!(
+        "DELETE agent:mc_new; DELETE cursor:mc_new; DELETE agent:mc_src; DELETE cursor:mc_src; \
+         DELETE agent:mc_dst; DELETE cursor:mc_dst; \
+         DEFINE TABLE OVERWRITE {OTHER} SCHEMALESS CHANGEFEED 1h;"
+    ))
+    .await
+    .and_then(|r| r.check())
+    .expect("reset the mc agents and define cf_other");
+    let noise = || async {
+        db.query(format!("CREATE {OTHER};").repeat(NOISE))
+            .await
+            .and_then(|r| r.check())
+            .expect("cf_other changesets");
+    };
+    let relate = |to: &'static str, content: &'static str| async move {
+        db.query(format!(
+            "RELATE agent:mc_src->message->agent:{to} \
+             CONTENT {{ created: time::now(), payload: {{ content: '{content}' }} }}"
+        ))
+        .await
+        .and_then(|r| r.check())
+        .unwrap_or_else(|e| panic!("send {content} to {to}: {e}"));
+    };
+    let names = || {
+        vec![
+            "mc_new".to_string(),
+            "mc_src".to_string(),
+            "mc_dst".to_string(),
+        ]
+    };
+
+    let (start, _) = feed_end(db).await;
+    relate("mc_new", "mc_backlog_1").await;
+    noise().await;
+    relate("mc_new", "mc_backlog_2").await;
+    let round_1 = table_stamps(db, MESSAGE_TABLE, start + 1).await;
+    let others = table_stamps(db, OTHER, start + 1).await;
+    let [m1, m2] = round_1[..] else {
+        panic!("precondition: two message changesets in round 1, got {round_1:?}");
+    };
+    assert!(
+        between(&others, m1, m2) > 1_000,
+        "precondition: more than 1 000 cf_other changesets between {m1} and {m2}; got {}",
+        between(&others, m1, m2)
+    );
+
+    let c1 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-1 coalition");
+    let cursor = cursor_position(db, "mc_new").await;
+    let backlog = timeout(Duration::from_secs(2), c1.inbox().recv()).await;
+    c1.shutdown().await;
+
+    relate("mc_dst", "mc_3").await;
+    noise().await;
+    relate("mc_new", "mc_4").await;
+    noise().await;
+    relate("mc_dst", "mc_5").await;
+    let round_2 = table_stamps(db, MESSAGE_TABLE, m2 + 1).await;
+    let others = table_stamps(db, OTHER, m2 + 1).await;
+    let [m3, m4, m5] = round_2[..] else {
+        panic!("precondition: three message changesets in round 2, got {round_2:?}");
+    };
+    let gaps = [between(&others, m3, m4), between(&others, m4, m5)];
+    assert!(
+        gaps.iter().all(|g| *g > 1_000),
+        "precondition: more than 1 000 cf_other changesets in each gap; got {gaps:?}"
+    );
+
+    let c2 = Coalition::<ChatMessage>::new(names())
+        .await
+        .expect("round-2 coalition");
+    let inbox = c2.inbox();
+    let mut got: Vec<(String, String)> = Vec::new();
+    while let Ok(Ok(d)) = timeout(Duration::from_secs(3), inbox.recv()).await {
+        got.push((d.recipient, d.message.payload.content));
+    }
+    c2.shutdown().await;
+    db.query(format!("REMOVE TABLE IF EXISTS {OTHER}"))
+        .await
+        .and_then(|r| r.check())
+        .expect("remove cf_other");
+
+    assert_eq!(
+        cursor,
+        Some((m2 + 1, 0)),
+        "cursor:mc_new must be 1 above the highest message versionstamp {m2}"
+    );
+    assert!(
+        backlog.is_err(),
+        "a new agent must get nothing from the backlog; got {backlog:?}"
+    );
+    got.sort();
+    let pair = |r: &str, c: &str| (r.to_string(), c.to_string());
+    assert_eq!(
+        got,
+        vec![
+            pair("mc_dst", "mc_3"),
+            pair("mc_dst", "mc_5"),
+            pair("mc_new", "mc_4")
+        ],
+        "round-2 deliveries"
+    );
+}
+
 /// **Send to unknown agent is rejected.** `Agent::send` to a name with no
 /// `agent` record returns [`Error::UnknownRecipient`] and creates no edge,
 /// rather than a `RELATE` with a dangling `out`.
@@ -298,7 +496,7 @@ async fn scenario_unknown_agent(db: &Surreal<any::Any>, alice: &Agent) {
 
     // No edge was created.
     let mut resp = db
-        .query("SELECT *, in, out FROM message WHERE in = agent:alice AND out = agent:ghost")
+        .query("SELECT * FROM message WHERE in = agent:alice AND out = agent:ghost")
         .await
         .unwrap();
     let edges: Vec<Message<ChatMessage>> = resp.take(0).unwrap();
@@ -342,9 +540,7 @@ async fn scenario_schema_enforcement(db: &Surreal<any::Any>) {
 /// Number of `message` edges from `agent:sf_src` whose payload is `content`.
 async fn sf_edges(db: &Surreal<any::Any>, content: &str) -> usize {
     let edges: Vec<Message<ChatMessage>> = db
-        .query(
-            "SELECT *, in, out FROM message WHERE in = agent:sf_src AND payload.content = $content",
-        )
+        .query("SELECT * FROM message WHERE in = agent:sf_src AND payload.content = $content")
         .bind(("content", content.to_string()))
         .await
         .unwrap()
@@ -797,12 +993,27 @@ async fn cursor_position(db: &Surreal<any::Any>, agent: &str) -> Option<(i64, i6
     Some((int("versionstamp")?, int("change_index").unwrap_or(0)))
 }
 
+/// A SurrealQL block that loops on the server until `secs` seconds have passed
+/// since it started, then yields `NONE`. Each statement of a `FOR` body reads
+/// its own `time::now()`.
+fn busy_wait(secs: u64) -> String {
+    format!(
+        "{{ LET $end = time::now() + {secs}s; \
+         FOR $i IN 0..100000 {{ \
+             IF time::now() > $end {{ BREAK }}; \
+             FOR $j IN 0..1000 {{ IF time::now() > $end {{ BREAK }} }}; \
+         }}; \
+         NONE }}"
+    )
+}
+
 /// Make every server-side read of `<table>:<agent>` wait `secs` seconds,
-/// through a computed field `stall` on `table`.
+/// through a computed field `stall` on `table` that runs [`busy_wait`].
 async fn stall_reads(db: &Surreal<any::Any>, table: &str, agent: &str, secs: u64) {
     db.query(format!(
         "DEFINE FIELD OVERWRITE stall ON {table} COMPUTED \
-         IF id = {table}:{agent} {{ sleep({secs}s) }}"
+         IF id = {table}:{agent} {}",
+        busy_wait(secs)
     ))
     .await
     .and_then(|r| r.check())
@@ -1192,7 +1403,8 @@ async fn scenario_lost_cursor_replays_backlog(db: &Surreal<any::Any>) {
 
 /// **A cancel during the first page query returns `Cancelled` for that
 /// agent.** `pq_sink`'s cursor predates 1 000 changesets of traffic between
-/// two other agents, so its first page query returns 1 000 changesets; a
+/// two other agents, each with a 20 000-character payload, so its first page
+/// query returns 1 000 changesets; a
 /// probe of that page must take at least 25 ms.
 /// `Coalition::new_with_parent` for `pq_sink` is polled while the server's
 /// live-query count is read back to back; once `pq_sink`'s live query is
@@ -1210,7 +1422,7 @@ async fn scenario_cancel_during_first_page(db: &Surreal<any::Any>) {
     .shutdown()
     .await;
     let relate = "RELATE agent:pq_a->message->agent:pq_b \
-                  CONTENT { created: time::now(), payload: { content: 'pq' } };";
+                  CONTENT { created: time::now(), payload: { content: string::repeat('pq', 10000) } };";
     db.query(relate.repeat(TRAFFIC))
         .await
         .and_then(|r| r.check())
@@ -1384,7 +1596,8 @@ async fn scenario_new_agents_share_one_walk(db: &Surreal<any::Any>) {
         .and_then(|r| r.check())
         .expect("reset wo_a and wo_b");
     db.query(format!(
-        "DEFINE FIELD OVERWRITE stall ON {AGENT_TABLE} VALUE IF name = 'wo_a' {{ sleep(2s) }}"
+        "DEFINE FIELD OVERWRITE stall ON {AGENT_TABLE} VALUE IF name = 'wo_a' {}",
+        busy_wait(2)
     ))
     .await
     .and_then(|r| r.check())
@@ -1429,7 +1642,8 @@ async fn scenario_stalled_save_bounds_shutdown(db: &Surreal<any::Any>) {
         .await
         .expect("coalition creation");
     db.query(format!(
-        "DEFINE FIELD OVERWRITE stall ON cursor VALUE IF id = cursor:sv_sink {{ sleep({STALL}s) }}"
+        "DEFINE FIELD OVERWRITE stall ON cursor VALUE IF id = cursor:sv_sink {}",
+        busy_wait(STALL)
     ))
     .await
     .and_then(|r| r.check())
