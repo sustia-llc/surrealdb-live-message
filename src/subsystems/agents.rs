@@ -45,6 +45,7 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const WAKE_DRAIN_MAX: usize = 64;
 
 /// Maximum time [`kill_live`] waits for a `KILL` of a live query, the time
+/// [`kill_fallback`] waits for its `KILL` and the read after it, the time
 /// [`await_end`] waits for a live query to end, and the time
 /// [`finish_subscribe`] waits for a reply before it logs a warn.
 const LIVE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -513,7 +514,7 @@ impl Agent {
             if matches!(exit, Exit::Stop(_)) {
                 stop_save(ctx, &progress).await;
             }
-            end_live(ctx.db, name, live_id, stream).await;
+            end_live(ctx.db, name, live_id, stream, exit.end_scope()).await;
             if let Some(end) = end {
                 end.log(name);
             }
@@ -963,8 +964,8 @@ fn integral(n: &Number) -> Option<i64> {
     };
     match n.wide() {
         Wide::Int(v) => Some(v),
-        Wide::Float(v) => (v.fract() == 0.0 && v.abs() < float_bound).then(|| n.to_int())?,
-        Wide::Decimal(v) => v.is_integer().then(|| n.to_int())?,
+        Wide::Float(v) => (v.fract() == 0.0 && v.abs() < float_bound).then_some(v as i64),
+        Wide::Decimal(v) => v.is_integer().then(|| i64::try_from(v).ok())?,
         Wide::BigDecimal(v) => v.to_i64(),
     }
 }
@@ -1380,6 +1381,18 @@ enum Exit {
     Wake,
 }
 
+impl Exit {
+    /// The [`EndScope`] of [`end_live`] after this exit: [`EndScope::Full`]
+    /// for [`Exit::Stop`], [`EndScope::Short`] for [`Exit::CatchUp`] and
+    /// [`Exit::Wake`].
+    fn end_scope(&self) -> EndScope {
+        match self {
+            Exit::Stop(_) => EndScope::Full,
+            Exit::CatchUp(_) | Exit::Wake => EndScope::Short,
+        }
+    }
+}
+
 /// What one listen loop works with for its whole run.
 struct LoopCtx<'a, T: SurrealValue> {
     db: &'static Surreal<any::Any>,
@@ -1791,9 +1804,9 @@ where
 /// - no reply after [`LIVE_KILL_TIMEOUT`]; the future then keeps waiting, with
 ///   no bound;
 /// - a failed `subscribe`, with the error chain;
-/// - each outcome of [`end_live`] that it logs: the live query still listed
-///   ([`Error::LiveStillListed`]), no read returned ([`Error::LiveEndUnread`]),
-///   and a failed or timed-out fallback `KILL` ([`Error::LiveKill`],
+/// - each outcome of [`end_live`] with [`EndScope::Full`] that it logs: an
+///   end not confirmed ([`Error::LiveEndUnconfirmed`]), and a failed or
+///   timed-out fallback `KILL` ([`Error::LiveKill`],
 ///   [`Error::LiveKillTimeout`]);
 /// - a drop before it finishes, polled or not, through
 ///   [`UnfinishedSubscribe`].
@@ -1820,7 +1833,7 @@ where
             }
         };
         match subscribed {
-            Ok((stream, live_id)) => end_live(db, agent, live_id, stream).await,
+            Ok((stream, live_id)) => end_live(db, agent, live_id, stream, EndScope::Full).await,
             Err(e) => tracing::warn!("subscribe for {agent} failed after a cancel: {}", chain(&e)),
         }
         unfinished.disarm();
@@ -1853,45 +1866,50 @@ impl Drop for UnfinishedSubscribe {
     }
 }
 
+/// How much of the end of a live query [`end_live`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndScope {
+    /// [`await_end`] reads past failed reads up to its deadline, and an end
+    /// not confirmed is followed by [`kill_fallback`].
+    Full,
+    /// [`await_end`] stops at the first failed read, and no fallback `KILL`
+    /// follows.
+    Short,
+}
+
 /// Drop `stream`, live query `live_id`'s stream, then wait with
-/// [`await_end`] until `INFO FOR TABLE message` no longer lists `live_id`.
-/// The SDK's `Drop` of the stream sends the `KILL`, on the stream's session,
-/// from a task it spawns (`surrealdb-4.0.0/src/method/live.rs:369`).
-/// Outcomes:
+/// [`await_end`] in `scope` until `INFO FOR TABLE message` no longer lists
+/// `live_id`. The SDK's `Drop` of the stream sends the `KILL`, on the
+/// stream's session, from a task it spawns
+/// (`surrealdb-4.0.0/src/method/live.rs:369`). Outcomes:
 ///
 /// - a read confirms `live_id` gone: no log, and no `KILL` from this crate;
-/// - the last reply at the deadline still lists `live_id`: a warn of
-///   [`Error::LiveStillListed`];
-/// - no read returned a reply by the deadline: a warn of
-///   [`Error::LiveEndUnread`].
-///
-/// Each warn carries the source chain, with the last failed read's error if
-/// a read failed. After either warn, one [`kill_live`] of `live_id` follows,
-/// which logs its own failure or timeout.
+/// - otherwise a warn of [`Error::LiveEndUnconfirmed`] with its source chain,
+///   with `listed` set when a read showed `live_id` listed. With
+///   [`EndScope::Full`], [`kill_fallback`] of `live_id` follows.
 async fn end_live(
     db: &Surreal<any::Any>,
     agent: &str,
     live_id: Uuid,
     stream: QueryStream<Notification<Value>>,
+    scope: EndScope,
 ) {
     drop(stream);
-    let unconfirmed = match await_end(|| live_listed(db, live_id)).await {
-        EndWait::Gone => return,
-        EndWait::Listed(source) => Error::LiveStillListed {
-            agent: agent.to_string(),
-            live_id,
-            timeout: LIVE_KILL_TIMEOUT,
-            source,
-        },
-        EndWait::Unread(source) => Error::LiveEndUnread {
-            agent: agent.to_string(),
-            live_id,
-            timeout: LIVE_KILL_TIMEOUT,
-            source,
-        },
+    let EndWait::Unconfirmed { listed, source } =
+        await_end(|| live_listed(db, live_id), scope).await
+    else {
+        return;
     };
-    warn_kill_live(&unconfirmed);
-    kill_live(db, agent, live_id).await;
+    warn_live_end(&Error::LiveEndUnconfirmed {
+        agent: agent.to_string(),
+        live_id,
+        timeout: LIVE_KILL_TIMEOUT,
+        listed,
+        source,
+    });
+    if scope == EndScope::Full {
+        kill_fallback(db, agent, live_id).await;
+    }
 }
 
 /// Outcome of [`await_end`].
@@ -1899,80 +1917,137 @@ async fn end_live(
 enum EndWait {
     /// A read returned `false`.
     Gone,
-    /// No read returned `false`, and the last read that returned a reply
-    /// returned `true`; the last failed read's error, if a read failed.
-    Listed(Option<Box<surrealdb::Error>>),
-    /// No read returned a reply; the last failed read's error, if a read
-    /// failed.
-    Unread(Option<Box<surrealdb::Error>>),
+    /// No read returned `false`. `listed` is `true` when a read returned
+    /// `true`. `source` is the error of the last read that failed or returned
+    /// a malformed reply, if one did.
+    Unconfirmed {
+        listed: bool,
+        source: Option<Box<surrealdb::Error>>,
+    },
+}
+
+/// A read of [`live_listed`] that showed neither `true` nor `false`.
+#[derive(Debug)]
+enum ListedReadError {
+    /// The read call failed, with its error.
+    Failed(Box<surrealdb::Error>),
+    /// The reply was not an object with a `lives` object, named in the error.
+    Malformed(Box<surrealdb::Error>),
 }
 
 /// Call `read`, whether a live query is still listed, until it returns
 /// `Ok(false)` or [`LIVE_KILL_TIMEOUT`] has passed since the call to
-/// `await_end`. A failed read does not end the wait. The interval between two
-/// reads starts at [`LIVE_END_POLL`] and doubles after each read, up to
-/// [`LIVE_END_POLL_MAX`]. A read or interval in progress at the deadline is
-/// dropped.
-async fn await_end<F, Fut>(mut read: F) -> EndWait
+/// `await_end`. With [`EndScope::Short`], a [`ListedReadError::Failed`] read
+/// also ends the wait; with [`EndScope::Full`], no failed read does. A
+/// [`ListedReadError::Malformed`] read does not end the wait. The interval
+/// between two reads starts at [`LIVE_END_POLL`] and doubles after each read,
+/// up to [`LIVE_END_POLL_MAX`]. A read or interval in progress at the
+/// deadline is dropped.
+async fn await_end<F, Fut>(mut read: F, scope: EndScope) -> EndWait
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = std::result::Result<bool, Box<surrealdb::Error>>>,
+    Fut: Future<Output = std::result::Result<bool, ListedReadError>>,
 {
     let deadline = Instant::now() + LIVE_KILL_TIMEOUT;
     let mut interval = LIVE_END_POLL;
     let mut listed = false;
-    let mut last_error = None;
+    let mut source = None;
     loop {
         match timeout_at(deadline, read()).await {
             Err(_elapsed) => break,
             Ok(Ok(false)) => return EndWait::Gone,
             Ok(Ok(true)) => listed = true,
-            Ok(Err(e)) => last_error = Some(e),
+            Ok(Err(ListedReadError::Failed(e))) => {
+                source = Some(e);
+                if scope == EndScope::Short {
+                    break;
+                }
+            }
+            Ok(Err(ListedReadError::Malformed(e))) => source = Some(e),
         }
         if timeout_at(deadline, sleep(interval)).await.is_err() {
             break;
         }
         interval = (interval * 2).min(LIVE_END_POLL_MAX);
     }
-    if listed {
-        EndWait::Listed(last_error)
-    } else {
-        EndWait::Unread(last_error)
-    }
+    EndWait::Unconfirmed { listed, source }
 }
 
 /// Whether `INFO FOR TABLE message` lists live query `live_id` under `lives`.
-/// A failed read, or a reply with no `lives` object, is an error naming it.
+/// A failed read is [`ListedReadError::Failed`]; a reply is read by
+/// [`listed_in`].
 async fn live_listed(
     db: &Surreal<any::Any>,
     live_id: Uuid,
-) -> std::result::Result<bool, Box<surrealdb::Error>> {
+) -> std::result::Result<bool, ListedReadError> {
     let info: Value = db
         .query(format!("INFO FOR TABLE {MESSAGE_TABLE}"))
         .await
         .and_then(|mut r| r.take(0))
-        .map_err(Box::new)?;
-    match &info {
+        .map_err(|e| ListedReadError::Failed(Box::new(e)))?;
+    listed_in(&info, live_id)
+}
+
+/// Whether `info`, an `INFO FOR TABLE` reply, lists live query `live_id`
+/// under `lives`. A reply that is not an object with a `lives` object is
+/// [`ListedReadError::Malformed`], naming the reply as malformed.
+fn listed_in(info: &Value, live_id: Uuid) -> std::result::Result<bool, ListedReadError> {
+    match info {
         Value::Object(o) => match o.get("lives") {
             Some(Value::Object(lives)) => Ok(lives.contains_key(&live_id.to_string())),
-            _ => Err(reply_error(format!(
-                "INFO FOR TABLE has no `lives` object: {info:?}"
-            ))),
+            _ => Err(ListedReadError::Malformed(reply_error(format!(
+                "malformed INFO FOR TABLE reply, with no `lives` object: {info:?}"
+            )))),
         },
-        _ => Err(reply_error(format!(
-            "INFO FOR TABLE reply is not an object: {info:?}"
-        ))),
+        _ => Err(ListedReadError::Malformed(reply_error(format!(
+            "malformed INFO FOR TABLE reply, not an object: {info:?}"
+        )))),
     }
 }
 
-/// `KILL` live query `live_id` through `db` within [`LIVE_KILL_TIMEOUT`]. A
-/// failed call or a `KILL` statement that the datastore refuses
-/// ([`Error::LiveKill`], with the datastore's error in its source), or a
-/// timeout ([`Error::LiveKillTimeout`]), is logged at warn with its source
-/// chain.
+/// [`send_kill`] of live query `live_id` through `db`, by
+/// [`LIVE_KILL_TIMEOUT`] from the call. Its error is logged at warn with its
+/// source chain.
 async fn kill_live(db: &Surreal<any::Any>, agent: &str, live_id: Uuid) {
+    if let Err(e) = send_kill(db, agent, live_id, Instant::now() + LIVE_KILL_TIMEOUT).await {
+        warn_live_end(&e);
+    }
+}
+
+/// The fallback `KILL` of [`end_live`]: [`send_kill`] of live query
+/// `live_id` through `db`, with one deadline, [`LIVE_KILL_TIMEOUT`] from the
+/// call, for the `KILL` and the read after it. An
+/// [`Error::LiveKillTimeout`] is logged at warn. After an
+/// [`Error::LiveKill`], one [`live_listed`] read follows: a reply that does
+/// not list `live_id` logs nothing, and any other outcome logs the
+/// [`Error::LiveKill`] at warn. Each warn carries the source chain.
+async fn kill_fallback(db: &Surreal<any::Any>, agent: &str, live_id: Uuid) {
+    let deadline = Instant::now() + LIVE_KILL_TIMEOUT;
+    let refused = match send_kill(db, agent, live_id, deadline).await {
+        Ok(()) => return,
+        Err(e @ Error::LiveKill { .. }) => e,
+        Err(e) => return warn_live_end(&e),
+    };
+    if !matches!(
+        timeout_at(deadline, live_listed(db, live_id)).await,
+        Ok(Ok(false))
+    ) {
+        warn_live_end(&refused);
+    }
+}
+
+/// `KILL` live query `live_id` through `db` by `deadline`. A failed call or
+/// a `KILL` statement that the datastore refuses is [`Error::LiveKill`], with
+/// the datastore's error in its source; no reply by `deadline` is
+/// [`Error::LiveKillTimeout`].
+async fn send_kill(
+    db: &Surreal<any::Any>,
+    agent: &str,
+    live_id: Uuid,
+    deadline: Instant,
+) -> Result<()> {
     let kill = db.query("KILL $id").bind(("id", Value::Uuid(live_id)));
-    let outcome = match timeout(LIVE_KILL_TIMEOUT, kill).await {
+    match timeout_at(deadline, kill).await {
         Ok(result) => result
             .and_then(|r| r.check())
             .map(drop)
@@ -1986,16 +2061,13 @@ async fn kill_live(db: &Surreal<any::Any>, agent: &str, live_id: Uuid) {
             live_id,
             timeout: LIVE_KILL_TIMEOUT,
         }),
-    };
-    if let Err(e) = outcome {
-        warn_kill_live(&e);
     }
 }
 
-/// Log `e` at warn with its full source chain. Callers: [`kill_live`], with
-/// [`Error::LiveKill`] or [`Error::LiveKillTimeout`]; [`end_live`], with
-/// [`Error::LiveStillListed`] or [`Error::LiveEndUnread`].
-fn warn_kill_live(e: &Error) {
+/// Log `e` at warn with its full source chain. Callers: [`kill_live`] and
+/// [`kill_fallback`], with [`Error::LiveKill`] or [`Error::LiveKillTimeout`];
+/// [`end_live`], with [`Error::LiveEndUnconfirmed`].
+fn warn_live_end(e: &Error) {
     tracing::warn!("{}", chain(e));
 }
 
@@ -2104,7 +2176,7 @@ mod tests {
 
         let (subscriber, sink) = capturing_subscriber();
         let guard = tracing::subscriber::set_default(subscriber);
-        end_live(&db, "frank", live_id, stream).await;
+        end_live(&db, "frank", live_id, stream, EndScope::Full).await;
         let after = message_lives(&db).await;
         sleep(DROP_KILL_SETTLE).await;
         drop(guard);
@@ -3163,10 +3235,12 @@ mod tests {
         );
     }
 
-    /// Text of the warn line of [`Error::LiveEndUnread`].
-    const UNREAD_WARNING: &str = "has ended returned a reply within";
+    /// Text of the warn line of [`Error::LiveEndUnconfirmed`] with `listed:
+    /// false`.
+    const UNREAD_WARNING: &str = "no read showed whether live query";
 
-    /// Text of the warn line of [`Error::LiveStillListed`].
+    /// Text of the warn line of [`Error::LiveEndUnconfirmed`] with `listed:
+    /// true`.
     const STILL_LISTED_WARNING: &str = "was still listed when the wait of";
 
     /// Text of the warn line of [`Error::LiveKill`].
@@ -3174,13 +3248,14 @@ mod tests {
 
     /// With every query stalled (see [`hold_session`]) past
     /// [`LIVE_KILL_TIMEOUT`] after its stream's drop, [`finish_subscribe`]
-    /// logs at warn, with the agent and the live id, that no read returned,
-    /// and not that a `KILL` did not finish. It then sends one fallback
-    /// `KILL`, which runs after the stall, behind the drop's `KILL`; the
-    /// datastore refuses it, and the warn line carries the refusal. The live
+    /// logs at warn, with the agent and the live id, that no read showed
+    /// whether the live query had ended, and not that a `KILL` did not
+    /// finish. It then sends one fallback `KILL`, which runs after the stall,
+    /// behind the drop's `KILL`; the datastore refuses it, the read after it
+    /// shows the live query gone, and no `KILL` warn line is logged. The live
     /// query is gone afterward.
     #[tokio::test(flavor = "current_thread")]
-    async fn finish_subscribe_logs_an_unread_end_then_a_refused_fallback_kill() {
+    async fn finish_subscribe_logs_an_unread_end_and_not_a_refused_kill_of_a_gone_query() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
         let owner = RecordId::new(AGENT_TABLE, "frank");
         let (stream, live_id) = subscribe_wake(db, &owner, "frank")
@@ -3209,11 +3284,12 @@ mod tests {
         };
         assert!(
             crate_warn(UNREAD_WARNING),
-            "no warn line that no read returned; got {warns:?}"
+            "no warn line that no read showed the end; got {warns:?}"
         );
         assert!(
-            crate_warn(KILL_FAILED_WARNING) && crate_warn("Cannot execute KILL statement"),
-            "no warn line for the refused fallback KILL; got {warns:?}"
+            !logs.contains(KILL_FAILED_WARNING) && !logs.contains("Cannot execute KILL statement"),
+            "a refused fallback KILL of a live query read as gone must log no warn; \
+             got {warns:?}"
         );
         assert!(
             !logs.contains("did not finish within") && !logs.contains(STILL_LISTED_WARNING),
@@ -3248,7 +3324,7 @@ mod tests {
         let (subscriber, sink) = capturing_subscriber();
         let guard = tracing::subscriber::set_default(subscriber);
         let began = tokio::time::Instant::now();
-        end_live(&db, "frank", live_id, dropped).await;
+        end_live(&db, "frank", live_id, dropped, EndScope::Full).await;
         let elapsed = began.elapsed();
         let after = message_lives(&db).await;
         drop(guard);
@@ -3278,14 +3354,116 @@ mod tests {
         );
     }
 
+    /// [`Exit::end_scope`] is [`EndScope::Full`] for each [`Exit::Stop`], and
+    /// [`EndScope::Short`] for [`Exit::CatchUp`] and [`Exit::Wake`].
+    #[test]
+    fn exit_end_scope_is_full_only_at_a_stop() {
+        let scopes = [
+            Exit::Stop(Stop::Cancelled),
+            Exit::Stop(Stop::NoReceivers),
+            Exit::CatchUp(Error::HealthCheck),
+            Exit::Wake,
+        ]
+        .map(|exit| exit.end_scope());
+        assert_eq!(
+            scopes,
+            [
+                EndScope::Full,
+                EndScope::Full,
+                EndScope::Short,
+                EndScope::Short
+            ],
+            "end scopes of [Stop(Cancelled), Stop(NoReceivers), CatchUp, Wake]"
+        );
+    }
+
+    /// [`end_live`] with [`EndScope::Short`] on a live query whose stream it
+    /// does not hold (see
+    /// [`end_live_kills_a_live_query_still_listed_at_its_deadline`]) logs at
+    /// warn, with the agent and the live id, that it was still listed at the
+    /// deadline, and sends no fallback `KILL`: the live query is still listed
+    /// when [`end_live`] returns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_end_live_sends_no_fallback_kill() {
+        let db = mem_db().await;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (dropped, _dropped_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe the dropped stream");
+        let (kept, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe the kept stream");
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        end_live(&db, "frank", live_id, dropped, EndScope::Short).await;
+        let after = message_lives(&db).await;
+        drop(guard);
+        drop(kept);
+
+        let id = live_id.to_string();
+        let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert!(
+            warns.iter().any(|l| l.contains("frank")
+                && l.contains(&id)
+                && l.contains(STILL_LISTED_WARNING)),
+            "no warn line that live query {id} was still listed; got {warns:?}"
+        );
+        assert_eq!(
+            after,
+            vec![id.clone()],
+            "a short end must send no fallback KILL of live query {id}"
+        );
+    }
+
+    /// [`end_live`] with [`EndScope::Short`] through a client with no
+    /// connection, on which every read fails, returns after one read, within
+    /// [`LIVE_END_POLL`]; it logs one warn line, with the agent, the live id
+    /// and the read's error, that no read showed whether the live query had
+    /// ended, and no `KILL` warn line.
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_end_live_stops_at_a_failed_read() {
+        let db = mem_db().await;
+        let unconnected = Surreal::<any::Any>::init();
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe");
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let began = tokio::time::Instant::now();
+        end_live(&unconnected, "frank", live_id, stream, EndScope::Short).await;
+        let elapsed = began.elapsed();
+        drop(guard);
+
+        let id = live_id.to_string();
+        let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert!(
+            elapsed < LIVE_END_POLL,
+            "a short end must stop at the first failed read; it took {elapsed:?}"
+        );
+        assert_eq!(warns.len(), 1, "warn lines of a short end: {warns:?}");
+        assert!(
+            warns[0].contains("frank")
+                && warns[0].contains(&id)
+                && warns[0].contains(UNREAD_WARNING)
+                && warns[0].contains("Connection uninitialised"),
+            "the warn line must name the agent, the id, the unread end and the read error; \
+             got {warns:?}"
+        );
+    }
+
     /// A scripted read for [`await_end`]: the `n`th call (from 0) returns
     /// `script(n)`, and each call's time is pushed to `calls`.
     fn scripted_read(
         calls: &std::sync::Mutex<Vec<tokio::time::Instant>>,
-        script: impl Fn(usize) -> Option<std::result::Result<bool, Box<surrealdb::Error>>> + 'static,
+        script: impl Fn(usize) -> Option<std::result::Result<bool, ListedReadError>> + 'static,
     ) -> impl FnMut() -> futures::future::BoxFuture<
         'static,
-        std::result::Result<bool, Box<surrealdb::Error>>,
+        std::result::Result<bool, ListedReadError>,
     > + '_ {
         move || {
             let mut calls = calls.lock().expect("calls lock");
@@ -3298,87 +3476,221 @@ mod tests {
         }
     }
 
-    /// A read error with text `read <n>`.
-    fn read_error(n: usize) -> Box<surrealdb::Error> {
-        Box::new(surrealdb::Error::internal(format!("read {n}")))
+    /// A failed read with text `read <n>`.
+    fn read_error(n: usize) -> ListedReadError {
+        ListedReadError::Failed(Box::new(surrealdb::Error::internal(format!("read {n}"))))
     }
 
-    /// [`await_end`] reads again after a failed read, and a later read that
-    /// returns `false` ends the wait with [`EndWait::Gone`], on the third
-    /// read.
-    #[tokio::test]
+    /// A malformed reply with text `malformed <n>`.
+    fn malformed(n: usize) -> ListedReadError {
+        ListedReadError::Malformed(Box::new(surrealdb::Error::internal(format!(
+            "malformed {n}"
+        ))))
+    }
+
+    /// Whether `outcome` is [`EndWait::Unconfirmed`] with `listed` and a
+    /// source whose text contains `text`, or no source for `None`.
+    fn unconfirmed(outcome: &EndWait, listed: bool, text: Option<&str>) -> bool {
+        match (outcome, text) {
+            (
+                EndWait::Unconfirmed {
+                    listed: l,
+                    source: None,
+                },
+                None,
+            ) => *l == listed,
+            (
+                EndWait::Unconfirmed {
+                    listed: l,
+                    source: Some(e),
+                },
+                Some(t),
+            ) => *l == listed && e.to_string().contains(t),
+            _ => false,
+        }
+    }
+
+    /// With [`EndScope::Full`], [`await_end`] reads again after a failed
+    /// read and after a malformed reply, and a later read that returns
+    /// `false` ends the wait with [`EndWait::Gone`], on the fourth read; with
+    /// [`EndScope::Short`], a malformed reply does not end the wait either,
+    /// and the read after it ends it with [`EndWait::Gone`].
+    #[tokio::test(start_paused = true)]
     async fn await_end_reads_past_a_failed_read() {
-        let calls = std::sync::Mutex::new(Vec::new());
-        let outcome = await_end(scripted_read(&calls, |n| {
-            Some(if n < 2 { Err(read_error(n)) } else { Ok(false) })
-        }))
-        .await;
-        let reads = calls.lock().expect("calls lock").len();
-        assert!(
-            matches!(outcome, EndWait::Gone),
-            "a read of false after two failed reads must end in Gone; got {outcome:?}"
+        let full = std::sync::Mutex::new(Vec::new());
+        let short = std::sync::Mutex::new(Vec::new());
+        let (full_outcome, short_outcome) = tokio::join!(
+            await_end(
+                scripted_read(&full, |n| Some(match n {
+                    0 => Err(read_error(n)),
+                    1 => Err(malformed(n)),
+                    2 => Err(read_error(n)),
+                    _ => Ok(false),
+                })),
+                EndScope::Full,
+            ),
+            await_end(
+                scripted_read(&short, |n| Some(if n == 0 {
+                    Err(malformed(n))
+                } else {
+                    Ok(false)
+                })),
+                EndScope::Short,
+            ),
         );
-        assert_eq!(reads, 3, "reads until the one that returned false");
+        let reads = |calls: &std::sync::Mutex<Vec<tokio::time::Instant>>| {
+            calls.lock().expect("calls lock").len()
+        };
+        assert!(
+            matches!(full_outcome, EndWait::Gone),
+            "full: a read of false after failed and malformed reads must end in Gone; \
+             got {full_outcome:?}"
+        );
+        assert_eq!(
+            reads(&full),
+            4,
+            "full: reads until the one that returned false"
+        );
+        assert!(
+            matches!(short_outcome, EndWait::Gone),
+            "short: a read of false after a malformed reply must end in Gone; \
+             got {short_outcome:?}"
+        );
+        assert_eq!(
+            reads(&short),
+            2,
+            "short: reads until the one that returned false"
+        );
     }
 
-    /// At [`LIVE_KILL_TIMEOUT`], [`await_end`] returns [`EndWait::Unread`]
-    /// with the last failed read's error when every read failed;
-    /// [`EndWait::Listed`] with the last failed read's error when one read
-    /// returned `true` and the later ones failed; and [`EndWait::Unread`]
-    /// with no error when the first read never returns.
-    #[tokio::test]
+    /// With [`EndScope::Short`], [`await_end`] ends at the first failed read,
+    /// at once, with [`EndWait::Unconfirmed`] carrying that read's error:
+    /// `listed` after a read that returned `true`, else not.
+    #[tokio::test(start_paused = true)]
+    async fn short_await_end_stops_at_the_first_failed_read() {
+        let listed_then_failing = std::sync::Mutex::new(Vec::new());
+        let failing = std::sync::Mutex::new(Vec::new());
+        let began = tokio::time::Instant::now();
+        let (listed, failed) = tokio::join!(
+            await_end(
+                scripted_read(&listed_then_failing, |n| Some(if n == 0 {
+                    Ok(true)
+                } else {
+                    Err(read_error(n))
+                })),
+                EndScope::Short,
+            ),
+            await_end(
+                scripted_read(&failing, |n| Some(Err(read_error(n)))),
+                EndScope::Short,
+            ),
+        );
+        let elapsed = began.elapsed();
+        let calls = |calls: &std::sync::Mutex<Vec<tokio::time::Instant>>| {
+            calls
+                .lock()
+                .expect("calls lock")
+                .iter()
+                .map(|t| *t - began)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            unconfirmed(&listed, true, Some("read 1")),
+            "listed, then a failed read: want Unconfirmed {{ listed: true, \"read 1\" }}; \
+             got {listed:?}"
+        );
+        assert!(
+            unconfirmed(&failed, false, Some("read 0")),
+            "a failed first read: want Unconfirmed {{ listed: false, \"read 0\" }}; \
+             got {failed:?}"
+        );
+        assert_eq!(
+            (calls(&listed_then_failing), calls(&failing), elapsed),
+            (
+                vec![Duration::ZERO, LIVE_END_POLL],
+                vec![Duration::ZERO],
+                LIVE_END_POLL
+            ),
+            "(read times listed then failing, read times failing, elapsed)"
+        );
+    }
+
+    /// At [`LIVE_KILL_TIMEOUT`], with [`EndScope::Full`], [`await_end`]
+    /// returns [`EndWait::Unconfirmed`]: not listed, with the last failed
+    /// read's error, when every read failed; listed, with the last failed
+    /// read's error, when one read returned `true` and the later ones failed;
+    /// not listed, with the last malformed reply's error, when every reply
+    /// was malformed; and not listed with no error when the first read never
+    /// returns.
+    #[tokio::test(start_paused = true)]
     async fn await_end_reports_the_last_error_and_what_was_read() {
         let failing = std::sync::Mutex::new(Vec::new());
         let listed_then_failing = std::sync::Mutex::new(Vec::new());
+        let malformed_replies = std::sync::Mutex::new(Vec::new());
         let stalled = std::sync::Mutex::new(Vec::new());
-        let (failed, listed, unread) = tokio::join!(
-            await_end(scripted_read(&failing, |n| Some(Err(read_error(n))))),
-            await_end(scripted_read(&listed_then_failing, |n| {
-                Some(if n == 0 { Ok(true) } else { Err(read_error(n)) })
-            })),
-            await_end(scripted_read(&stalled, |_| None)),
+        let began = tokio::time::Instant::now();
+        let (failed, listed, bad, unread) = tokio::join!(
+            await_end(
+                scripted_read(&failing, |n| Some(Err(read_error(n)))),
+                EndScope::Full
+            ),
+            await_end(
+                scripted_read(&listed_then_failing, |n| {
+                    Some(if n == 0 { Ok(true) } else { Err(read_error(n)) })
+                }),
+                EndScope::Full,
+            ),
+            await_end(
+                scripted_read(&malformed_replies, |n| Some(Err(malformed(n)))),
+                EndScope::Full,
+            ),
+            await_end(scripted_read(&stalled, |_| None), EndScope::Full),
         );
-        let last = |calls: &std::sync::Mutex<Vec<tokio::time::Instant>>| {
-            format!("read {}", calls.lock().expect("calls lock").len() - 1)
+        let elapsed = began.elapsed();
+        let reads = |calls: &std::sync::Mutex<Vec<tokio::time::Instant>>| {
+            calls.lock().expect("calls lock").len()
         };
 
-        let failed_reads = failing.lock().expect("calls lock").len();
         assert!(
-            failed_reads > 1,
-            "a failed read must not end the wait; reads: {failed_reads}"
-        );
-        let want = last(&failing);
-        assert!(
-            matches!(&failed, EndWait::Unread(Some(e)) if e.to_string().contains(&want)),
-            "every read failed: want Unread with {want:?}; got {failed:?}"
-        );
-        let want = last(&listed_then_failing);
-        assert!(
-            matches!(&listed, EndWait::Listed(Some(e)) if e.to_string().contains(&want)),
-            "listed, then failed reads: want Listed with {want:?}; got {listed:?}"
+            unconfirmed(&failed, false, Some("read 8")),
+            "every read failed: want Unconfirmed {{ listed: false, \"read 8\" }}; got {failed:?}"
         );
         assert!(
-            matches!(unread, EndWait::Unread(None)),
-            "a read that never returns: want Unread(None); got {unread:?}"
+            unconfirmed(&listed, true, Some("read 8")),
+            "listed, then failed reads: want Unconfirmed {{ listed: true, \"read 8\" }}; \
+             got {listed:?}"
+        );
+        assert!(
+            unconfirmed(&bad, false, Some("malformed 8")),
+            "every reply malformed: want Unconfirmed {{ listed: false, \"malformed 8\" }}; \
+             got {bad:?}"
+        );
+        assert!(
+            unconfirmed(&unread, false, None),
+            "a read that never returns: want Unconfirmed {{ listed: false, None }}; \
+             got {unread:?}"
         );
         assert_eq!(
-            stalled.lock().expect("calls lock").len(),
-            1,
-            "a read that never returns is the only read"
+            [
+                reads(&failing),
+                reads(&listed_then_failing),
+                reads(&malformed_replies),
+                reads(&stalled),
+            ],
+            [9, 9, 9, 1],
+            "reads of [failing, listed then failing, malformed, stalled]"
         );
+        assert_eq!(elapsed, LIVE_KILL_TIMEOUT, "time to the deadline");
     }
 
-    /// Slack over each expected interval in
-    /// [`await_end_doubles_its_interval_up_to_the_cap`].
-    const INTERVAL_SLACK: Duration = Duration::from_millis(100);
-
     /// With every read returning `true`, [`await_end`] reads 9 times within
-    /// [`LIVE_KILL_TIMEOUT`], at intervals of 10, 20, 40, 80, 160, 320, 500
-    /// and 500 ms, each within [`INTERVAL_SLACK`] above its expected value.
-    #[tokio::test]
+    /// [`LIVE_KILL_TIMEOUT`], at intervals of exactly 10, 20, 40, 80, 160,
+    /// 320, 500 and 500 ms.
+    #[tokio::test(start_paused = true)]
     async fn await_end_doubles_its_interval_up_to_the_cap() {
         let calls = std::sync::Mutex::new(Vec::new());
-        let outcome = await_end(scripted_read(&calls, |_| Some(Ok(true)))).await;
+        let outcome = await_end(scripted_read(&calls, |_| Some(Ok(true))), EndScope::Full).await;
         let calls = calls.into_inner().expect("calls lock");
         let gaps: Vec<Duration> = calls.windows(2).map(|w| w[1] - w[0]).collect();
         let want: Vec<Duration> = [10, 20, 40, 80, 160, 320, 500, 500]
@@ -3387,21 +3699,52 @@ mod tests {
             .collect();
 
         assert!(
-            matches!(outcome, EndWait::Listed(None)),
-            "every read listed: want Listed(None); got {outcome:?}"
+            unconfirmed(&outcome, true, None),
+            "every read listed: want Unconfirmed {{ listed: true, None }}; got {outcome:?}"
         );
+        assert_eq!(gaps, want, "intervals between reads");
+    }
+
+    /// [`listed_in`] reads `true` or `false` from an `INFO FOR TABLE` reply
+    /// whose `lives` object holds or lacks the live id, and
+    /// [`ListedReadError::Malformed`], naming the reply as malformed, from a
+    /// reply that is not an object and from an object with no `lives`
+    /// object.
+    #[test]
+    fn listed_in_names_a_malformed_reply() {
+        let live_id = Uuid::new_v4();
+        let mut lives = Object::new();
+        lives.insert(live_id.to_string(), Value::None);
+        let reply = |lives: Value| {
+            let mut o = Object::new();
+            o.insert("lives".to_string(), lives);
+            Value::Object(o)
+        };
+        let read = |info: &Value| match listed_in(info, live_id) {
+            Ok(listed) => format!("Ok({listed})"),
+            Err(ListedReadError::Failed(e)) => format!("Failed({e})"),
+            Err(ListedReadError::Malformed(e)) => {
+                format!(
+                    "Malformed(malformed: {})",
+                    e.to_string().contains("malformed")
+                )
+            }
+        };
         assert_eq!(
-            gaps.len(),
-            want.len(),
-            "intervals between reads: got {gaps:?}, want {want:?}"
+            [
+                read(&reply(Value::Object(lives))),
+                read(&reply(Value::Object(Object::new()))),
+                read(&Value::None),
+                read(&reply(Value::None)),
+            ],
+            [
+                "Ok(true)",
+                "Ok(false)",
+                "Malformed(malformed: true)",
+                "Malformed(malformed: true)",
+            ],
+            "listed_in of [listing, not listing, not an object, no lives object]"
         );
-        let off: Vec<(Duration, Duration)> = gaps
-            .iter()
-            .zip(&want)
-            .filter(|(gap, want)| **gap < **want || **gap > **want + INTERVAL_SLACK)
-            .map(|(gap, want)| (*gap, *want))
-            .collect();
-        assert_eq!(off, Vec::new(), "(interval, expected) pairs out of range");
     }
 
     /// [`finish_subscribe`] logs a failed subscribe at warn with the agent and
@@ -3719,8 +4062,8 @@ mod tests {
         );
     }
 
-    /// [`kill_live`]'s warn line for [`Error::LiveKill`] carries the inner
-    /// surrealdb error text, not only the variant's own message.
+    /// [`warn_live_end`]'s warn line for [`Error::LiveKill`] carries the
+    /// inner surrealdb error text, not only the variant's own message.
     #[test]
     fn kill_live_warning_includes_the_kill_error_source() {
         let inner = "kill refused by datastore";
@@ -3731,7 +4074,7 @@ mod tests {
         };
 
         let (subscriber, sink) = capturing_subscriber();
-        tracing::subscriber::with_default(subscriber, || warn_kill_live(&err));
+        tracing::subscriber::with_default(subscriber, || warn_live_end(&err));
 
         let logs = logged(&sink);
         let line = logs
