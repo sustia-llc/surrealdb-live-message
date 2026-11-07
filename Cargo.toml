@@ -32,3 +32,4 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["test-util"] }
 tokio-graceful-shutdown = "0.20.0"
+trybuild = "1.0.122"
