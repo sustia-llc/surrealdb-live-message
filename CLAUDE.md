@@ -13,6 +13,10 @@ messaging over SurrealDB graph edges + LIVE queries. `src/main.rs` is a binary e
   `await_ready` handshake-error seam): `cargo test --lib`.
 - To use the production cloud endpoint in place of a local container: `RUN_MODE=production cargo test --test integration_test`.
 - Config layers (via the `config` crate): `config/default.toml` → `config/{RUN_MODE}.toml` → env vars (`__` separator). `RUN_MODE` defaults to `development`.
+- `.cargo/config.toml` sets `RUST_MIN_STACK` to 10 MiB for spawned threads, test threads among them. Cargo reads this file from its working directory, not from `--manifest-path`. Run cargo from the checkout root, for example `env -C <checkout> cargo test --lib`.
+- Every integration run uses the container name `sdb_container` and host port 8000 (`config/default.toml`). `SurrealDBContainer::start_and_wait` (`src/sdb_server.rs`) force-removes a container with that name before it starts its own. So two concurrent runs on one host break each other.
+- If more than one integration run can start on one host, run each one under one lock: `flock ~/.cache/cargo/slm-docker.lock cargo test --test integration_test`. Run a `docker stop` or `docker rm` of `sdb_container` under the same lock.
+- If another process holds port 8000, set a different port: `SDB__PORT=8001 cargo test --test integration_test`.
 
 ## SurrealDB SDK gotchas (do not regress)
 
