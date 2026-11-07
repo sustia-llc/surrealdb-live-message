@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-07
+
+### Added
+
+- Tests that fail when one of these clauses is removed (#18): a stop sends
+  one fallback `KILL` when an end is not confirmed; a reconnect after
+  `Exit::CatchUp` sends none; a refused fallback `KILL` of a live query still
+  listed logs `LiveKill` with the server's error.
+- A `trybuild` test that an exhaustive `match` on `Error` outside the crate
+  does not compile. `trybuild` is a new dev-dependency.
+- CI runs `cargo test --lib` on one thread and `cargo test --test
+  compile_fail`.
+
 ## [0.8.0] - 2026-11-06
 
 ### Changed
