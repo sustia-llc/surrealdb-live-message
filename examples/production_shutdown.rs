@@ -39,7 +39,7 @@ use surrealdb_live_message::subsystems::agents::Coalition;
 use surrealdb_live_message::subsystems::sdb::{self, SurrealDBWrapper};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Typed payload exchanged between coalition agents.
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]

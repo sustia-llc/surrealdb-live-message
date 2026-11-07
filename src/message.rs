@@ -6,23 +6,11 @@ pub const MESSAGE_TABLE: &str = "message";
 /// A payload-generic message edge in the agent graph.
 ///
 /// `T` is the user's payload type. It must derive `SurrealValue` so the
-/// live-query stream can deserialize it from the `message` table.
+/// catch-up can decode it from a `message` changefeed record.
 ///
-/// **Two SDK gotchas folded into this type:**
-///
-/// 1. **`SurrealValue` derive uses raw Rust identifiers as wire keys.**
-///    A field named `r#in` serializes to/from `"r#in"`, not `"in"`. SurrealDB
-///    emits `"in"` for the edge source, so the Rust field must be renamed
-///    via `#[surreal(rename = "in")]` (serde rename is ignored by the
-///    `SurrealValue` derive). Without this, `Option<RecordId>` silently
-///    deserializes to `None`.
-///
-/// 2. **A bare `SELECT *` / `LIVE SELECT *` on edge records omits `in`/`out`.**
-///    Read the edge pointers with an explicit projection —
-///    `SELECT *, in, out FROM message WHERE ...`. The two-tier durable bus
-///    sidesteps this on the delivery path: `SHOW CHANGES` changeset records
-///    carry `id`/`in`/`out` natively, so the wake-up subscription in
-///    `agents::Agent::listen_loop` is only `LIVE SELECT id`.
+/// The `SurrealValue` derive maps the field `r#in` to the wire key `"in"`, the
+/// edge source, and a bare `SELECT * FROM message` returns `in` and `out`, so
+/// a row of that select decodes with both pointers set.
 #[derive(Debug, Serialize, Deserialize, SurrealValue)]
 pub struct Message<T: SurrealValue> {
     /// The edge record's own id. Populated on **delivery** (the durable-log
@@ -31,7 +19,6 @@ pub struct Message<T: SurrealValue> {
     /// Lets consumers identify / deduplicate a delivery put on the bus more
     /// than once.
     pub id: Option<RecordId>,
-    #[surreal(rename = "in")]
     pub r#in: Option<RecordId>,
     pub out: Option<RecordId>,
     pub payload: T,

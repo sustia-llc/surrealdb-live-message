@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-06
+
+### Changed
+
+- The crate pins `surrealdb` and `surrealdb-types` 4.0.0, and the test
+  container runs the `surrealdb/surrealdb:v4.0.0` image (#16).
+- Breaking: `Error` is `#[non_exhaustive]`, it gains the variant
+  `LiveEndUnconfirmed`, and its `surrealdb::Error` sources come from the 4.0.0
+  SDK.
+- At a stop, a listen loop ends its live query by dropping the stream, whose
+  SDK `Drop` sends a `KILL`, then reads `INFO FOR TABLE message` until the
+  live query is not listed, up to `LIVE_KILL_TIMEOUT`. An end not confirmed
+  by then logs `LiveEndUnconfirmed` at warn and sends one fallback `KILL`. A
+  failed or refused fallback `KILL` logs `LiveKill`, unless one more read
+  returns and does not list the live query. The loop previously sent its own
+  `KILL`, then dropped the stream.
+- On a reconnect, the end of the live query stops at the first failed read
+  and sends no fallback `KILL`.
+- A loop stops within `CURSOR_SAVE_TIMEOUT + 2 × LIVE_KILL_TIMEOUT` (6 s)
+  after a cancel. The bound was `CURSOR_SAVE_TIMEOUT + LIVE_KILL_TIMEOUT`.
+- A cursor or versionstamp number of any of the 13 `Number` variants reads as
+  an integer when it is a whole number in `i64` range. A float must also be
+  below 2^53 (`Float`), 2^24 (`F32`) or 2^11 (`F16`) in size.
+- `SHUTDOWN_TIMEOUT` in `examples/production_shutdown.rs` and
+  `examples/graceful_shutdown.rs` is 15 s.
+
+### Fixed
+
+- A `KILL` that the server refuses, sent when a live-query stream fails to
+  open, is logged at warn as `LiveKill` with the server's error (#13).
+- Another table with a changefeed in the same database does not end the read
+  of a new agent's start position or a catch-up page early (#14).
+
+### Added
+
+- `.cargo/config.toml` sets `RUST_MIN_STACK = "10485760"` for cargo runs in
+  this repo, because a debug build that runs the `kv-mem` engine can overflow
+  the default thread stack. A consumer that embeds `kv-mem` sets its own stack
+  size.
+
 ## [0.7.0] - 2026-11-02
 
 ### Changed

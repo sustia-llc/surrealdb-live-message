@@ -18,8 +18,8 @@ messaging over SurrealDB graph edges + LIVE queries. `src/main.rs` is a binary e
 
 These are diagnosed fixes, and tests lock them in. See the docstrings in `src/message.rs` and `src/subsystems/agents.rs`.
 
-1. **Edge fields need `#[surreal(rename = "in")]`.** `SurrealValue` derive uses raw Rust identifiers as wire keys, so `r#in` serializes as `"r#in"` without the attribute. SurrealDB emits `"in"` for edge source. **serde `rename` is ignored**, so you must use the `#[surreal(...)]` attribute. (`src/message.rs:34`)
-2. **A bare `SELECT *` / `LIVE SELECT *` on edge records omits `in`/`out`.** Read edge pointers with an explicit projection: `SELECT *, in, out FROM message WHERE ...` (`tests/integration_test.rs:153`, `:177`, `:300`). The pointer assertions at `:167` to `:174` lock it in. The **durable bus sidesteps this**: `SHOW CHANGES` changeset records carry `id`/`in`/`out` natively. So the wake-up subscription is only `LIVE SELECT id FROM message WHERE out = $owner` (`src/subsystems/agents.rs:1658`). The gotcha still applies to any plain `SELECT` you add.
+1. A field named `r#in` decodes from the wire key `in` with no attribute, because the `SurrealValue` derive strips `r#` (`surrealdb-types-derive-4.0.0/src/lib.rs:27-29`). `Message` has no `#[surreal(rename)]` on `r#in` (`src/message.rs:22`). `scenario_bare_select_edge_pointers` decodes it over WS.
+2. A bare `SELECT *` on a `message` edge returns `in` and `out` over WS (`scenario_bare_select_edge_pointers`, `tests/integration_test.rs:284`). The wake-up subscription reads only `id`: `LIVE SELECT id FROM message WHERE out = $owner` (`src/subsystems/agents.rs:1692`). The durable bus reads `in` and `out` from `SHOW CHANGES` changeset records.
 3. Payload types must derive `SurrealValue`. The bound is `Message<T: SurrealValue>`, not only `Serialize`.
 
 ## Lifecycle / shutdown contract
@@ -29,7 +29,8 @@ These are diagnosed fixes, and tests lock them in. See the docstrings in `src/me
 - `Coalition` owns a root `CancellationToken`, which is a child of the caller's token with `Coalition::new_with_parent`.
 - It spawns listen-loops on `child_token()` and exposes `cancellation_token()` + `shutdown().await`.
 - Dropping a `Coalition` cancels its root token without waiting.
-- `shutdown().await` cancels the root token and waits for the listen loops and the retention sweep to end. After the cancel, a loop makes at most one cursor save. That save waits up to `CURSOR_SAVE_TIMEOUT`. The `KILL` waits up to `LIVE_KILL_TIMEOUT`. Tests: `shutdown_is_bounded_with_a_save_in_flight`, `shutdown_is_bounded_with_a_save_on_a_stop`. The sweep's connection and `DELETE` are raced against the token.
+- `shutdown().await` cancels the root token and waits for the listen loops and the retention sweep to end. After the cancel, a loop makes at most one cursor save. That save waits up to `CURSOR_SAVE_TIMEOUT`. The end of its live query waits up to `LIVE_KILL_TIMEOUT`. If that end is not confirmed, one fallback `KILL` and one more `INFO` read share up to `LIVE_KILL_TIMEOUT` more. So a loop stops within `CURSOR_SAVE_TIMEOUT + 2 × LIVE_KILL_TIMEOUT` after the cancel. Tests: `shutdown_is_bounded_with_a_save_in_flight`, `shutdown_is_bounded_with_a_save_on_a_stop`. The sweep's connection and `DELETE` are raced against the token.
+- Only a stop runs that full end. On a reconnect (`Exit::CatchUp` or `Exit::Wake`), the end wait stops at the first failed read and sends no fallback `KILL` (`exit_end_scope_is_full_only_at_a_stop`, `short_end_live_sends_no_fallback_kill`).
 - The library installs no signal handling. Callers wire top-level shutdown (for example bare `tokio::signal::ctrl_c`) outside the library. Do not add signal handling or `tokio-graceful-shutdown` inside the lib.
 
 ### Delivery bus
@@ -53,7 +54,7 @@ These are diagnosed fixes, and tests lock them in. See the docstrings in `src/me
 ### Agent creation
 
 - `Agent::new` writes `agent:<name>` and an absent `cursor:<name>` in one transaction. So `Agent::new` does not write an agent without its cursor. An existing cursor is kept (`scenario_failed_new_keeps_fresh_cursor`).
-- A new agent starts after the highest versionstamp in the whole `message` changefeed. The read goes in pages until a page holds fewer than 1000 changesets. This needs a database where `message` is the one table with a changefeed (`scenario_new_agent_skips_a_long_feed`).
+- A new agent starts after the highest versionstamp in the whole `message` changefeed. The read goes in pages until a page holds fewer than 1000 changesets (`scenario_new_agent_skips_a_long_feed`). Another table with a changefeed in the same database does not end the read early (`scenario_other_changefeed_table`).
 - A `Coalition::new` reads the feed at most once, for its first new agent (`scenario_new_agents_share_one_walk`).
 - An existing agent without a cursor starts at versionstamp 0 with a warn log, so its retained backlog is delivered (`scenario_lost_cursor_replays_backlog`). If the first lookup finds the agent, there is no feed read.
 - A failed changefeed read in `Agent::new` returns `AgentCreate`. So does a page that is not an array, or a full page with no integer versionstamp. A page whose highest versionstamp is below its `SINCE` or is `i64::MAX` does too.
@@ -78,13 +79,13 @@ These are diagnosed fixes, and tests lock them in. See the docstrings in `src/me
 ### Subscribe at a cancel
 
 - A subscribe in flight at a cancel moves to a spawned task that no `TaskTracker` tracks. Neither the loop nor `shutdown()` waits for it, and the live count can settle after they return.
-- When the reply arrives, that task sends a `KILL` of the live query.
-- It logs these cases at warn: a failed subscribe, a failed or timed-out `KILL` call, a reply still missing after `LIVE_KILL_TIMEOUT`, and its own drop before it finishes. After the missing-reply warn, it keeps waiting.
-- The SDK drops the result of a `KILL` statement (`surrealdb-3.3.5/src/method/query.rs:429`).
+- When the reply arrives, that task ends the live query as a loop does at its stop. It drops the stream, and the SDK's `Drop` sends a `KILL` on the stream's session (`surrealdb-4.0.0/src/method/live.rs:369`). It then reads `INFO FOR TABLE message` until the live query is not listed, up to `LIVE_KILL_TIMEOUT`. If the end is not confirmed by then, it sends one `KILL` of its own.
+- It logs these cases at warn: a failed subscribe, a reply still missing after `LIVE_KILL_TIMEOUT`, an end not confirmed by the deadline (`LiveEndUnconfirmed`, whose `listed` field says whether a read still listed the live query), a failed or timed-out fallback `KILL` (`LiveKill`, `LiveKillTimeout`), and its own drop before it finishes. After the missing-reply warn, it keeps waiting.
+- The SDK keeps the result of a `KILL` statement (`surrealdb-4.0.0/src/method/query.rs:445`). After a failed or refused fallback `KILL`, the crate reads `INFO FOR TABLE message` once more. If that read returns and does not list the live query, nothing is logged. Otherwise the crate logs `LiveKill` with the server's error.
 
 ### Catch-up cursor
 
-- `cursor:<agent>` holds `versionstamp` and `change_index` (absent or `NONE` reads as 0). A row that is not an object with non-negative integers fails with `CursorLoad`. So does `change_index: NULL`. `integral` reads three forms as an integer: an `Int`, a `Float` with no fraction below 2^53 in size, and a `Decimal` with no fraction that fits `i64`.
+- `cursor:<agent>` holds `versionstamp` and `change_index` (absent or `NONE` reads as 0). A row that is not an object with non-negative integers fails with `CursorLoad`. So does `change_index: NULL`. `integral` reads a `Number` of any variant as an integer when its value is a whole number in `i64` range. A float must also be below 2^53 (`Float`), 2^24 (`F32`) or 2^11 (`F16`) in size.
 - Each bus send and each page query is raced against the agent's cancel token. The LIVE wake stream is still read while a send waits.
 - The cursor advances past a message addressed to the agent only once its delivery is on the bus.
 - The cursor is persisted after each page and on a stop. After a failed save call on a complete page, the in-memory cursor stays and the pass fails.
@@ -118,7 +119,7 @@ Production shutdown lives in `examples/`, not in `main.rs`, which is the minimal
 
 - Handle **SIGTERM**, not only SIGINT.
 - Race startup readiness against sdb-task failure and a timeout. Otherwise `wait_until_ready` hangs.
-- Bound the drain. The **order is `coalition.shutdown()` first, then cancel the sdb token**. Agents then persist cursors and KILL the live queries of their subscribed streams while the DB is still up. This order does not cover the `KILL` of a subscribe in flight at the cancel.
+- Bound the drain. The **order is `coalition.shutdown()` first, then cancel the sdb token**. Agents then persist cursors and end the live queries of their subscribed streams while the DB is still up. This order does not cover the end of a subscribe in flight at the cancel.
 
 `examples/production_shutdown.rs` is hand-rolled (zero-dep, single subsystem). `examples/graceful_shutdown.rs` uses `tokio-graceful-shutdown` (multi-subsystem supervision + failure propagation). A coalition built with `Coalition::new` has a token independent of the daemon root. Call `coalition.shutdown()` to wait for its drain, because dropping it only cancels.
 

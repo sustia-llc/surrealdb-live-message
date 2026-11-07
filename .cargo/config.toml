@@ -1,0 +1,3 @@
+[env]
+# 10 MiB minimum stack for spawned threads, test threads among them.
+RUST_MIN_STACK = "10485760"

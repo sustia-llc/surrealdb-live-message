@@ -10,6 +10,7 @@ use std::time::Duration;
 
 /// All fallible operations in the library funnel through this enum.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("failed to connect to SurrealDB")]
     Connect(#[source] Box<surrealdb::Error>),
@@ -88,6 +89,23 @@ pub enum Error {
         source: Box<surrealdb::Error>,
     },
 
+    /// The wait, of at most `timeout`, for live query `live_id` to leave
+    /// `INFO FOR TABLE message` stopped with no read showing it gone.
+    /// `listed` is `true` when a read showed it listed, and `false` when no
+    /// read showed whether it was listed. `source` is the error of the last
+    /// read that failed or returned a malformed reply, if one did.
+    #[error("{text}", text = end_unconfirmed_text(.agent, .live_id, .timeout, .listed))]
+    LiveEndUnconfirmed {
+        agent: String,
+        live_id: surrealdb_types::Uuid,
+        timeout: Duration,
+        listed: bool,
+        #[source]
+        source: Option<Box<surrealdb::Error>>,
+    },
+
+    /// A `KILL` of live query `live_id` sent by this crate did not finish
+    /// within `timeout`.
     #[error("KILL of live query {live_id} for agent '{agent}' did not finish within {timeout:?}")]
     LiveKillTimeout {
         agent: String,
@@ -155,6 +173,27 @@ fn cancelled_who(agent: &Option<String>) -> String {
         .map_or_else(|| "every agent".to_string(), |a| format!("agent '{a}'"))
 }
 
+/// The text of [`Error::LiveEndUnconfirmed`]: that live query `live_id` was
+/// still listed for `listed`, else that no read showed whether it had ended.
+fn end_unconfirmed_text(
+    agent: &str,
+    live_id: &surrealdb_types::Uuid,
+    timeout: &Duration,
+    listed: &bool,
+) -> String {
+    if *listed {
+        format!(
+            "live query {live_id} for agent '{agent}' was still listed when the wait of at \
+             most {timeout:?} for it to end stopped"
+        )
+    } else {
+        format!(
+            "no read showed whether live query {live_id} for agent '{agent}' had ended when \
+             the wait of at most {timeout:?} for it to end stopped"
+        )
+    }
+}
+
 /// Render `err` and every error in its [`source`](std::error::Error::source)
 /// chain, outermost first, joined with `": "`.
 pub fn chain(err: &(dyn std::error::Error + 'static)) -> String {
@@ -190,5 +229,34 @@ mod tests {
                 "chain(LiveKill) must contain {needle:?}; rendered {rendered:?}"
             );
         }
+    }
+
+    /// [`Error::LiveEndUnconfirmed`] says that the live query was still
+    /// listed for `listed: true`, and that no read showed whether it had
+    /// ended for `listed: false`.
+    #[test]
+    fn live_end_unconfirmed_text_says_which() {
+        let text = |listed| {
+            Error::LiveEndUnconfirmed {
+                agent: "frank".to_string(),
+                live_id: surrealdb_types::Uuid::nil(),
+                timeout: Duration::from_secs(2),
+                listed,
+                source: None,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            [text(true), text(false)],
+            [
+                "live query 00000000-0000-0000-0000-000000000000 for agent 'frank' was still \
+                 listed when the wait of at most 2s for it to end stopped"
+                    .to_string(),
+                "no read showed whether live query 00000000-0000-0000-0000-000000000000 for \
+                 agent 'frank' had ended when the wait of at most 2s for it to end stopped"
+                    .to_string(),
+            ],
+            "LiveEndUnconfirmed text for listed = [true, false]"
+        );
     }
 }

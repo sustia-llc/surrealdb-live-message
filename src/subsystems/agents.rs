@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use surrealdb::engine::any;
 use surrealdb::method::QueryStream;
 use surrealdb::{Notification, Surreal};
-use surrealdb_types::{Datetime, Number, Object, RecordId, SurrealValue, Uuid, Value};
+use surrealdb_types::{Datetime, Number, Object, RecordId, SurrealValue, Uuid, Value, Wide};
 use tokio::sync::{RwLock, oneshot};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, Instant, sleep, timeout, timeout_at};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Instrument;
 
@@ -44,15 +44,34 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// one it is given.
 const WAKE_DRAIN_MAX: usize = 64;
 
-/// Maximum time [`kill_live`] waits for a `KILL` of a live query, and the time
+/// Maximum time [`kill_live`] waits for a `KILL` of a live query, the time
+/// [`kill_fallback`] waits for its `KILL` and the read after it, the time
+/// [`await_end`] waits for a live query to end, and the time
 /// [`finish_subscribe`] waits for a reply before it logs a warn.
 const LIVE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Interval between the first two reads of the live queries in
+/// [`await_end`]; each later interval is double the one before, up to
+/// [`LIVE_END_POLL_MAX`].
+const LIVE_END_POLL: Duration = Duration::from_millis(10);
+
+/// Largest interval between two reads of the live queries in [`await_end`].
+const LIVE_END_POLL_MAX: Duration = Duration::from_millis(500);
 
 /// Maximum time [`save_cursor_bounded`] waits for a cursor save.
 const CURSOR_SAVE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Smallest `Float` size, 2^53, that [`integral`] does not read as an integer.
+/// Smallest size, 2^53, of a `Float` that [`integral`] does not read as an
+/// integer.
 const FLOAT_INTEGER_BOUND: f64 = 9_007_199_254_740_992.0;
+
+/// Smallest size, 2^24, of an `F32` that [`integral`] does not read as an
+/// integer.
+const F32_INTEGER_BOUND: f64 = 16_777_216.0;
+
+/// Smallest size, 2^11, of an `F16` that [`integral`] does not read as an
+/// integer.
+const F16_INTEGER_BOUND: f64 = 2_048.0;
 
 /// Outcome of [`subscribe_wake`]: the wake stream and its live-query id.
 type Subscribed = Result<(QueryStream<Notification<Value>>, Uuid)>;
@@ -87,8 +106,7 @@ impl Agent {
     /// absent, it is created in the same transaction that checks for
     /// `agent:<name>`: for a new agent, 1 above the highest versionstamp in
     /// the whole `message` changefeed at the time of the read (1 for an empty
-    /// feed), read in pages until a page holds fewer than 1000 changesets, in
-    /// a database where `message` is the one table with a changefeed; for an
+    /// feed), read in pages until a page holds fewer than 1000 changesets; for an
     /// agent whose record already existed, at versionstamp 0, with no changefeed
     /// read if the existence check finds it, so the next catch-up reads the whole retained changefeed, and
     /// that start is logged at warn with the agent and the position as fields.
@@ -149,20 +167,26 @@ impl Agent {
         };
         let agent_id = RecordId::new(AGENT_TABLE, name);
         let cursor_id = RecordId::new(CURSOR_TABLE, name);
-        let stored_id = |id: RecordId| async move {
-            db.query("SELECT VALUE id FROM ONLY $id")
+        // Reads the record of key `id` in `table` by its key: `$id` resolves
+        // to a record-id literal (`surrealdb-core/src/exec/logical/params.rs:89`),
+        // and `id = <record-id literal>` plans a key lookup
+        // (`surrealdb-core/src/exec/planner/util/conditions.rs:1097-1112`).
+        let stored_id = |table: &'static str, id: RecordId| async move {
+            let ids = db
+                .query(format!("SELECT VALUE id FROM {table} WHERE id = $id"))
                 .bind(("id", id))
                 .await?
-                .take::<Option<RecordId>>(0)
+                .take::<Vec<RecordId>>(0)?;
+            Ok::<_, surrealdb::Error>(ids.into_iter().next())
         };
 
-        let cursor_present = bounded(name, bound, stored_id(cursor_id.clone()))
+        let cursor_present = bounded(name, bound, stored_id(CURSOR_TABLE, cursor_id.clone()))
             .await?
             .map_err(create_err)?;
         let cursor_absent = cursor_present.is_none();
         let replay = Cursor::at(0);
         let start = if cursor_absent {
-            let agent_present = bounded(name, bound, stored_id(agent_id.clone()))
+            let agent_present = bounded(name, bound, stored_id(AGENT_TABLE, agent_id.clone()))
                 .await?
                 .map_err(create_err)?;
             match (agent_present, *walked) {
@@ -490,7 +514,7 @@ impl Agent {
             if matches!(exit, Exit::Stop(_)) {
                 stop_save(ctx, &progress).await;
             }
-            end_live(ctx.db, name, live_id, stream).await;
+            end_live(ctx.db, name, live_id, stream, exit.end_scope()).await;
             if let Some(end) = end {
                 end.log(name);
             }
@@ -697,10 +721,12 @@ impl<T: SurrealValue + Send + Sync + Unpin + 'static> Coalition<T> {
 
     /// Cancel the root token, then wait until every listen loop and the
     /// retention sweep have ended. After the cancel, a loop makes at most one
-    /// cursor save, which waits up to 2 s, and waits up to 2 s for its `KILL`.
-    /// A subscribe in flight at the
-    /// cancel is finished by a task that this does not wait for, so its `KILL`
-    /// can run after this returns.
+    /// cursor save, which waits up to 2 s, and waits up to 2 s for the
+    /// datastore to stop listing its live query; if it is not confirmed gone
+    /// by then, the loop sends one `KILL` of it, which waits up to 2 s. A
+    /// subscribe in flight at the
+    /// cancel is finished by a task that this does not wait for, so its live
+    /// query can end after this returns.
     pub async fn shutdown(&self) {
         self.cancellation_token.cancel();
         self.task_tracker.close();
@@ -924,16 +950,24 @@ fn object_versionstamp(o: &Object) -> Option<i64> {
     }
 }
 
-/// The value of `n` if `n` is an integer: an `Int`, a `Float` with no fraction
-/// below [`FLOAT_INTEGER_BOUND`] in size, or a `Decimal` with no fraction that
-/// fits `i64`. Otherwise `None`.
+/// The value of `n` if `n` is a whole number in `i64` range: any `Int`, `I8`,
+/// `U8`, `I16`, `U16`, `I32` or `U32`; a `U64` up to `i64::MAX`; a `Float`
+/// with no fraction below [`FLOAT_INTEGER_BOUND`] in size, an `F32` below
+/// [`F32_INTEGER_BOUND`] and an `F16` below [`F16_INTEGER_BOUND`]; a
+/// `Decimal` or `BigDecimal` with no fraction. Otherwise `None`, a NaN and an
+/// infinity among them.
 fn integral(n: &Number) -> Option<i64> {
-    let exact = match n {
-        Number::Int(_) => true,
-        Number::Float(v) => v.fract() == 0.0 && v.abs() < FLOAT_INTEGER_BOUND,
-        Number::Decimal(v) => v.is_integer(),
+    let float_bound = match n {
+        Number::F32(_) => F32_INTEGER_BOUND,
+        Number::F16(_) => F16_INTEGER_BOUND,
+        _ => FLOAT_INTEGER_BOUND,
     };
-    exact.then(|| n.to_int()).flatten()
+    match n.wide() {
+        Wide::Int(v) => Some(v),
+        Wide::Float(v) => (v.fract() == 0.0 && v.abs() < float_bound).then_some(v as i64),
+        Wide::Decimal(v) => v.is_integer().then(|| i64::try_from(v).ok())?,
+        Wide::BigDecimal(v) => v.to_i64(),
+    }
 }
 
 /// Load the persisted cursor for `agent`, if any. Returns
@@ -1347,6 +1381,18 @@ enum Exit {
     Wake,
 }
 
+impl Exit {
+    /// The [`EndScope`] of [`end_live`] after this exit: [`EndScope::Full`]
+    /// for [`Exit::Stop`], [`EndScope::Short`] for [`Exit::CatchUp`] and
+    /// [`Exit::Wake`].
+    fn end_scope(&self) -> EndScope {
+        match self {
+            Exit::Stop(_) => EndScope::Full,
+            Exit::CatchUp(_) | Exit::Wake => EndScope::Short,
+        }
+    }
+}
+
 /// What one listen loop works with for its whole run.
 struct LoopCtx<'a, T: SurrealValue> {
     db: &'static Surreal<any::Any>,
@@ -1752,12 +1798,18 @@ where
 }
 
 /// A future that awaits `subscribe`, in flight when `agent`'s loop was
-/// cancelled, then sends a `KILL` of the returned live query with [`end_live`].
-/// A failed `subscribe` is logged at warn with the agent and the error chain;
-/// a failed `KILL` call is logged by [`kill_live`]. With no reply after
-/// [`LIVE_KILL_TIMEOUT`], the future logs a warn with the agent and keeps
-/// waiting, with no bound. If the future is dropped before it finishes, polled
-/// or not, [`UnfinishedSubscribe`] logs a warn with the agent.
+/// cancelled, then ends the returned live query with [`end_live`]. It logs at
+/// warn, each with the agent:
+///
+/// - no reply after [`LIVE_KILL_TIMEOUT`]; the future then keeps waiting, with
+///   no bound;
+/// - a failed `subscribe`, with the error chain;
+/// - each outcome of [`end_live`] with [`EndScope::Full`] that it logs: an
+///   end not confirmed ([`Error::LiveEndUnconfirmed`]), and a failed or
+///   timed-out fallback `KILL` ([`Error::LiveKill`],
+///   [`Error::LiveKillTimeout`]);
+/// - a drop before it finishes, polled or not, through
+///   [`UnfinishedSubscribe`].
 fn finish_subscribe<F>(
     db: &Surreal<any::Any>,
     agent: String,
@@ -1781,7 +1833,7 @@ where
             }
         };
         match subscribed {
-            Ok((stream, live_id)) => end_live(db, agent, live_id, stream).await,
+            Ok((stream, live_id)) => end_live(db, agent, live_id, stream, EndScope::Full).await,
             Err(e) => tracing::warn!("subscribe for {agent} failed after a cancel: {}", chain(&e)),
         }
         unfinished.disarm();
@@ -1814,23 +1866,188 @@ impl Drop for UnfinishedSubscribe {
     }
 }
 
-/// Send a `KILL` of live query `live_id` through [`kill_live`], then drop
-/// `stream`.
+/// How much of the end of a live query [`end_live`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndScope {
+    /// [`await_end`] reads past failed reads up to its deadline, and an end
+    /// not confirmed is followed by [`kill_fallback`].
+    Full,
+    /// [`await_end`] stops at the first failed read, and no fallback `KILL`
+    /// follows.
+    Short,
+}
+
+/// Drop `stream`, live query `live_id`'s stream, then wait with
+/// [`await_end`] in `scope` until `INFO FOR TABLE message` no longer lists
+/// `live_id`. The SDK's `Drop` of the stream sends the `KILL`, on the
+/// stream's session, from a task it spawns
+/// (`surrealdb-4.0.0/src/method/live.rs:369`). Outcomes:
+///
+/// - a read confirms `live_id` gone: no log, and no `KILL` from this crate;
+/// - otherwise a warn of [`Error::LiveEndUnconfirmed`] with its source chain,
+///   with `listed` set when a read showed `live_id` listed. With
+///   [`EndScope::Full`], [`kill_fallback`] of `live_id` follows.
 async fn end_live(
     db: &Surreal<any::Any>,
     agent: &str,
     live_id: Uuid,
     stream: QueryStream<Notification<Value>>,
+    scope: EndScope,
 ) {
-    kill_live(db, agent, live_id).await;
     drop(stream);
+    let EndWait::Unconfirmed { listed, source } =
+        await_end(|| live_listed(db, live_id), scope).await
+    else {
+        return;
+    };
+    warn_live_end(&Error::LiveEndUnconfirmed {
+        agent: agent.to_string(),
+        live_id,
+        timeout: LIVE_KILL_TIMEOUT,
+        listed,
+        source,
+    });
+    if scope == EndScope::Full {
+        kill_fallback(db, agent, live_id).await;
+    }
 }
 
-/// `KILL` live query `live_id` through `db` within [`LIVE_KILL_TIMEOUT`],
-/// logging a failure or timeout at warn.
+/// Outcome of [`await_end`].
+#[derive(Debug)]
+enum EndWait {
+    /// A read returned `false`.
+    Gone,
+    /// No read returned `false`. `listed` is `true` when a read returned
+    /// `true`. `source` is the error of the last read that failed or returned
+    /// a malformed reply, if one did.
+    Unconfirmed {
+        listed: bool,
+        source: Option<Box<surrealdb::Error>>,
+    },
+}
+
+/// A read of [`live_listed`] that showed neither `true` nor `false`.
+#[derive(Debug)]
+enum ListedReadError {
+    /// The read call failed, with its error.
+    Failed(Box<surrealdb::Error>),
+    /// The reply was not an object with a `lives` object, named in the error.
+    Malformed(Box<surrealdb::Error>),
+}
+
+/// Call `read`, whether a live query is still listed, until it returns
+/// `Ok(false)` or [`LIVE_KILL_TIMEOUT`] has passed since the call to
+/// `await_end`. With [`EndScope::Short`], a [`ListedReadError::Failed`] read
+/// also ends the wait; with [`EndScope::Full`], no failed read does. A
+/// [`ListedReadError::Malformed`] read does not end the wait. The interval
+/// between two reads starts at [`LIVE_END_POLL`] and doubles after each read,
+/// up to [`LIVE_END_POLL_MAX`]. A read or interval in progress at the
+/// deadline is dropped.
+async fn await_end<F, Fut>(mut read: F, scope: EndScope) -> EndWait
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<bool, ListedReadError>>,
+{
+    let deadline = Instant::now() + LIVE_KILL_TIMEOUT;
+    let mut interval = LIVE_END_POLL;
+    let mut listed = false;
+    let mut source = None;
+    loop {
+        match timeout_at(deadline, read()).await {
+            Err(_elapsed) => break,
+            Ok(Ok(false)) => return EndWait::Gone,
+            Ok(Ok(true)) => listed = true,
+            Ok(Err(ListedReadError::Failed(e))) => {
+                source = Some(e);
+                if scope == EndScope::Short {
+                    break;
+                }
+            }
+            Ok(Err(ListedReadError::Malformed(e))) => source = Some(e),
+        }
+        if timeout_at(deadline, sleep(interval)).await.is_err() {
+            break;
+        }
+        interval = (interval * 2).min(LIVE_END_POLL_MAX);
+    }
+    EndWait::Unconfirmed { listed, source }
+}
+
+/// Whether `INFO FOR TABLE message` lists live query `live_id` under `lives`.
+/// A failed read is [`ListedReadError::Failed`]; a reply is read by
+/// [`listed_in`].
+async fn live_listed(
+    db: &Surreal<any::Any>,
+    live_id: Uuid,
+) -> std::result::Result<bool, ListedReadError> {
+    let info: Value = db
+        .query(format!("INFO FOR TABLE {MESSAGE_TABLE}"))
+        .await
+        .and_then(|mut r| r.take(0))
+        .map_err(|e| ListedReadError::Failed(Box::new(e)))?;
+    listed_in(&info, live_id)
+}
+
+/// Whether `info`, an `INFO FOR TABLE` reply, lists live query `live_id`
+/// under `lives`. A reply that is not an object with a `lives` object is
+/// [`ListedReadError::Malformed`], naming the reply as malformed.
+fn listed_in(info: &Value, live_id: Uuid) -> std::result::Result<bool, ListedReadError> {
+    match info {
+        Value::Object(o) => match o.get("lives") {
+            Some(Value::Object(lives)) => Ok(lives.contains_key(&live_id.to_string())),
+            _ => Err(ListedReadError::Malformed(reply_error(format!(
+                "malformed INFO FOR TABLE reply, with no `lives` object: {info:?}"
+            )))),
+        },
+        _ => Err(ListedReadError::Malformed(reply_error(format!(
+            "malformed INFO FOR TABLE reply, not an object: {info:?}"
+        )))),
+    }
+}
+
+/// [`send_kill`] of live query `live_id` through `db`, by
+/// [`LIVE_KILL_TIMEOUT`] from the call. Its error is logged at warn with its
+/// source chain.
 async fn kill_live(db: &Surreal<any::Any>, agent: &str, live_id: Uuid) {
+    if let Err(e) = send_kill(db, agent, live_id, Instant::now() + LIVE_KILL_TIMEOUT).await {
+        warn_live_end(&e);
+    }
+}
+
+/// The fallback `KILL` of [`end_live`]: [`send_kill`] of live query
+/// `live_id` through `db`, with one deadline, [`LIVE_KILL_TIMEOUT`] from the
+/// call, for the `KILL` and the read after it. An
+/// [`Error::LiveKillTimeout`] is logged at warn. After an
+/// [`Error::LiveKill`], one [`live_listed`] read follows: a reply that does
+/// not list `live_id` logs nothing, and any other outcome logs the
+/// [`Error::LiveKill`] at warn. Each warn carries the source chain.
+async fn kill_fallback(db: &Surreal<any::Any>, agent: &str, live_id: Uuid) {
+    let deadline = Instant::now() + LIVE_KILL_TIMEOUT;
+    let refused = match send_kill(db, agent, live_id, deadline).await {
+        Ok(()) => return,
+        Err(e @ Error::LiveKill { .. }) => e,
+        Err(e) => return warn_live_end(&e),
+    };
+    if !matches!(
+        timeout_at(deadline, live_listed(db, live_id)).await,
+        Ok(Ok(false))
+    ) {
+        warn_live_end(&refused);
+    }
+}
+
+/// `KILL` live query `live_id` through `db` by `deadline`. A failed call or
+/// a `KILL` statement that the datastore refuses is [`Error::LiveKill`], with
+/// the datastore's error in its source; no reply by `deadline` is
+/// [`Error::LiveKillTimeout`].
+async fn send_kill(
+    db: &Surreal<any::Any>,
+    agent: &str,
+    live_id: Uuid,
+    deadline: Instant,
+) -> Result<()> {
     let kill = db.query("KILL $id").bind(("id", Value::Uuid(live_id)));
-    let outcome = match timeout(LIVE_KILL_TIMEOUT, kill).await {
+    match timeout_at(deadline, kill).await {
         Ok(result) => result
             .and_then(|r| r.check())
             .map(drop)
@@ -1844,14 +2061,13 @@ async fn kill_live(db: &Surreal<any::Any>, agent: &str, live_id: Uuid) {
             live_id,
             timeout: LIVE_KILL_TIMEOUT,
         }),
-    };
-    if let Err(e) = outcome {
-        warn_kill_live(&e);
     }
 }
 
-/// Log a [`kill_live`] failure at warn with its full source chain.
-fn warn_kill_live(e: &Error) {
+/// Log `e` at warn with its full source chain. Callers: [`kill_live`] and
+/// [`kill_fallback`], with [`Error::LiveKill`] or [`Error::LiveKillTimeout`];
+/// [`end_live`], with [`Error::LiveEndUnconfirmed`].
+fn warn_live_end(e: &Error) {
     tracing::warn!("{}", chain(e));
 }
 
@@ -1941,12 +2157,10 @@ mod tests {
         );
     }
 
-    /// Time for a `Drop`-spawned SDK KILL to run before the datastore is read.
-    const DROP_KILL_SETTLE: Duration = Duration::from_millis(300);
-
-    /// [`end_live`] removes the wake-up subscription from the datastore.
-    #[tokio::test]
-    async fn end_live_removes_the_live_query() {
+    /// When [`end_live`] returns, the datastore lists no live query on
+    /// `message`, and no warn line was logged, by this crate or by the SDK.
+    #[tokio::test(flavor = "current_thread")]
+    async fn end_live_removes_the_live_query_with_no_warn() {
         let db = mem_db().await;
         let owner = RecordId::new(AGENT_TABLE, "frank");
         let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
@@ -1960,35 +2174,108 @@ mod tests {
             "subscribe registers one live query"
         );
 
-        end_live(&db, "frank", live_id, stream).await;
-        sleep(DROP_KILL_SETTLE).await;
-
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        end_live(&db, "frank", live_id, stream, EndScope::Full).await;
         let after = message_lives(&db).await;
+        sleep(DROP_KILL_SETTLE).await;
+        drop(guard);
+
         assert!(
             after.is_empty(),
-            "live query {id} must be gone after end_live; datastore still lists {after:?}"
+            "live query {id} must be gone when end_live returns; datastore still lists {after:?}"
         );
+        let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warns, Vec::<&str>::new(), "warn lines from end_live");
     }
 
-    /// Countermodel: dropping the SDK stream alone leaves the live query
-    /// registered. Its `Drop` KILL runs on a fresh session with no namespace,
-    /// database or sign-in, which the datastore refuses.
-    #[tokio::test]
-    async fn dropping_the_stream_leaves_the_live_query() {
+    /// Time for a `Drop`-spawned SDK `KILL` to run before the datastore is read.
+    const DROP_KILL_SETTLE: Duration = Duration::from_millis(300);
+
+    /// A dropped SDK stream ends its live query: within [`DROP_KILL_SETTLE`]
+    /// of the drop, the datastore lists no live query on `message`, and the
+    /// SDK logs no warn line.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_the_stream_removes_the_live_query() {
         let db = mem_db().await;
         let owner = RecordId::new(AGENT_TABLE, "frank");
         let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
             .await
             .expect("subscribe");
+        let during = message_lives(&db).await;
+        assert_eq!(
+            during,
+            vec![live_id.to_string()],
+            "precondition: subscribe registers one live query"
+        );
 
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
         drop(stream);
         sleep(DROP_KILL_SETTLE).await;
+        drop(guard);
 
         let after = message_lives(&db).await;
         assert_eq!(
             after,
-            vec![live_id.to_string()],
-            "the SDK's Drop KILL is expected to fail and leave {live_id} registered"
+            Vec::<String>::new(),
+            "the SDK's Drop KILL must end live query {live_id}"
+        );
+        let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warns, Vec::<&str>::new(), "warn lines after the drop");
+    }
+
+    /// [`kill_live`] of a live id the datastore does not hold logs one warn
+    /// line with the agent, the id and the datastore's refusal; a
+    /// [`kill_live`] of a registered live query ends it and logs no warn.
+    #[tokio::test(flavor = "current_thread")]
+    async fn kill_live_warns_on_a_refused_kill_only() {
+        let db = mem_db().await;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let unknown = Uuid::new_v4();
+        let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe");
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        kill_live(&db, "frank", unknown).await;
+        let refused = logged(&sink);
+        kill_live(&db, "frank", live_id).await;
+        let all = logged(&sink);
+        drop(guard);
+        let after = message_lives(&db).await;
+        drop(stream);
+
+        let refused_warns: Vec<&str> = refused.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(
+            refused_warns.len(),
+            1,
+            "warn lines for the refused KILL: {refused_warns:?}"
+        );
+        let line = refused_warns[0];
+        for needle in [
+            "frank",
+            "failed to KILL live query",
+            unknown.to_string().as_str(),
+            "Cannot execute KILL statement",
+        ] {
+            assert!(
+                line.contains(needle),
+                "the refused KILL's warn line must contain {needle:?}; got {line:?}"
+            );
+        }
+        let later = &all[refused.len()..];
+        assert!(
+            !later.contains("WARN"),
+            "a KILL that succeeds must log no warn; got {later:?}"
+        );
+        assert_eq!(
+            after,
+            Vec::<String>::new(),
+            "precondition: kill_live ended live query {live_id}"
         );
     }
 
@@ -2894,10 +3181,24 @@ mod tests {
         task
     }
 
-    /// A [`finish_subscribe`] aborted while its `KILL` waits logs at warn with
-    /// the agent, and the live query stays registered.
+    /// `db`'s live queries on `message`, read every 10 ms until none is
+    /// listed or `within` has passed.
+    async fn lives_after(db: &Surreal<any::Any>, within: Duration) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut lives = message_lives(db).await;
+        while !lives.is_empty() && tokio::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+            lives = message_lives(db).await;
+        }
+        lives
+    }
+
+    /// A [`finish_subscribe`] aborted while [`end_live`] waits for the live
+    /// query to end (see [`hold_session`]) logs at warn with the agent; once
+    /// the stall ends, the `KILL` that the stream's drop sent ends the live
+    /// query.
     #[tokio::test(flavor = "current_thread")]
-    async fn finish_subscribe_logs_a_drop_during_its_kill() {
+    async fn finish_subscribe_logs_a_drop_during_its_end_wait() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
         let owner = RecordId::new(AGENT_TABLE, "frank");
         let (stream, live_id) = subscribe_wake(db, &owner, "frank")
@@ -2917,28 +3218,44 @@ mod tests {
 
         assert!(
             joined.as_ref().is_err_and(|e| e.is_cancelled()),
-            "precondition: the finisher must be aborted during its KILL, got {joined:?}"
+            "precondition: the finisher must be aborted during its end wait, got {joined:?}"
         );
         let logs = logged(&sink);
         assert!(
             logs.lines()
                 .any(|l| l.contains("WARN") && l.contains("frank") && l.contains(DROPPED_WARNING)),
-            "no drop warn line for an abort during the KILL; got {logs:?}"
+            "no drop warn line for an abort during the end wait; got {logs:?}"
         );
         held.await.expect("join");
-        let lives = message_lives(db).await;
+        let lives = lives_after(db, LIVE_KILL_TIMEOUT).await;
         assert_eq!(
             lives,
-            vec![live_id.to_string()],
-            "an aborted KILL leaves the live query registered"
+            Vec::<String>::new(),
+            "the drop's KILL must end live query {live_id} after the stall"
         );
     }
 
-    /// A `KILL` that stalls past [`LIVE_KILL_TIMEOUT`] (see [`hold_session`]):
-    /// [`finish_subscribe`] logs it at warn with the agent and the live id,
-    /// and the live query is still registered.
+    /// Text of the warn line of [`Error::LiveEndUnconfirmed`] with `listed:
+    /// false`.
+    const UNREAD_WARNING: &str = "no read showed whether live query";
+
+    /// Text of the warn line of [`Error::LiveEndUnconfirmed`] with `listed:
+    /// true`.
+    const STILL_LISTED_WARNING: &str = "was still listed when the wait of";
+
+    /// Text of the warn line of [`Error::LiveKill`].
+    const KILL_FAILED_WARNING: &str = "failed to KILL live query";
+
+    /// With every query stalled (see [`hold_session`]) past
+    /// [`LIVE_KILL_TIMEOUT`] after its stream's drop, [`finish_subscribe`]
+    /// logs at warn, with the agent and the live id, that no read showed
+    /// whether the live query had ended, and not that a `KILL` did not
+    /// finish. It then sends one fallback `KILL`, which runs after the stall,
+    /// behind the drop's `KILL`; the datastore refuses it, the read after it
+    /// shows the live query gone, and no `KILL` warn line is logged. The live
+    /// query is gone afterward.
     #[tokio::test(flavor = "current_thread")]
-    async fn finish_subscribe_logs_a_timed_out_kill() {
+    async fn finish_subscribe_logs_an_unread_end_and_not_a_refused_kill_of_a_gone_query() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
         let owner = RecordId::new(AGENT_TABLE, "frank");
         let (stream, live_id) = subscribe_wake(db, &owner, "frank")
@@ -2955,32 +3272,488 @@ mod tests {
 
         assert!(
             elapsed >= LIVE_KILL_TIMEOUT,
-            "precondition: the KILL must stall; finish_subscribe took {elapsed:?}"
+            "precondition: the reads must stall; finish_subscribe took {elapsed:?}"
         );
+        let id = live_id.to_string();
         let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        let crate_warn = |text: &str| {
+            warns
+                .iter()
+                .any(|l| l.contains("frank") && l.contains(&id) && l.contains(text))
+        };
         assert!(
-            logs.lines().any(|l| l.contains("WARN")
-                && l.contains("frank")
-                && l.contains(&live_id.to_string())
-                && l.contains("did not finish within")),
-            "no warn line for the timed-out KILL; got {logs:?}"
+            crate_warn(UNREAD_WARNING),
+            "no warn line that no read showed the end; got {warns:?}"
+        );
+        assert!(
+            !logs.contains(KILL_FAILED_WARNING) && !logs.contains("Cannot execute KILL statement"),
+            "a refused fallback KILL of a live query read as gone must log no warn; \
+             got {warns:?}"
+        );
+        assert!(
+            !logs.contains("did not finish within") && !logs.contains(STILL_LISTED_WARNING),
+            "the end wait must not report a KILL that did not finish or a listed query; \
+             got {warns:?}"
         );
         held.await.expect("join");
         let lives = message_lives(db).await;
         assert_eq!(
             lives,
-            vec![live_id.to_string()],
-            "a timed-out KILL leaves the live query registered"
+            Vec::<String>::new(),
+            "live query {live_id} must be gone after the stall"
+        );
+    }
+
+    /// A live query whose stream [`end_live`] does not hold, so that the
+    /// drop sends no `KILL` of it, stays listed: [`end_live`] logs at warn,
+    /// with the agent and the live id, that it was still listed, then its
+    /// fallback `KILL` ends it, with no `KILL` warn line, before
+    /// [`end_live`] returns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn end_live_kills_a_live_query_still_listed_at_its_deadline() {
+        let db = mem_db().await;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (dropped, _dropped_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe the dropped stream");
+        let (kept, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe the kept stream");
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let began = tokio::time::Instant::now();
+        end_live(&db, "frank", live_id, dropped, EndScope::Full).await;
+        let elapsed = began.elapsed();
+        let after = message_lives(&db).await;
+        drop(guard);
+        drop(kept);
+
+        let id = live_id.to_string();
+        let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert!(
+            warns.iter().any(|l| l.contains("frank")
+                && l.contains(&id)
+                && l.contains(STILL_LISTED_WARNING)),
+            "no warn line that live query {id} was still listed; got {warns:?}"
+        );
+        assert!(
+            elapsed >= LIVE_KILL_TIMEOUT,
+            "precondition: end_live must wait out its deadline; it took {elapsed:?}"
+        );
+        assert_eq!(
+            after,
+            Vec::<String>::new(),
+            "the fallback KILL must end live query {id} before end_live returns"
+        );
+        assert!(
+            !logs.contains(KILL_FAILED_WARNING) && !logs.contains("did not finish within"),
+            "a fallback KILL that succeeds must log no KILL warn; got {warns:?}"
+        );
+    }
+
+    /// [`Exit::end_scope`] is [`EndScope::Full`] for each [`Exit::Stop`], and
+    /// [`EndScope::Short`] for [`Exit::CatchUp`] and [`Exit::Wake`].
+    #[test]
+    fn exit_end_scope_is_full_only_at_a_stop() {
+        let scopes = [
+            Exit::Stop(Stop::Cancelled),
+            Exit::Stop(Stop::NoReceivers),
+            Exit::CatchUp(Error::HealthCheck),
+            Exit::Wake,
+        ]
+        .map(|exit| exit.end_scope());
+        assert_eq!(
+            scopes,
+            [
+                EndScope::Full,
+                EndScope::Full,
+                EndScope::Short,
+                EndScope::Short
+            ],
+            "end scopes of [Stop(Cancelled), Stop(NoReceivers), CatchUp, Wake]"
+        );
+    }
+
+    /// [`end_live`] with [`EndScope::Short`] on a live query whose stream it
+    /// does not hold (see
+    /// [`end_live_kills_a_live_query_still_listed_at_its_deadline`]) logs at
+    /// warn, with the agent and the live id, that it was still listed at the
+    /// deadline, and sends no fallback `KILL`: the live query is still listed
+    /// when [`end_live`] returns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_end_live_sends_no_fallback_kill() {
+        let db = mem_db().await;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (dropped, _dropped_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe the dropped stream");
+        let (kept, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe the kept stream");
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        end_live(&db, "frank", live_id, dropped, EndScope::Short).await;
+        let after = message_lives(&db).await;
+        drop(guard);
+        drop(kept);
+
+        let id = live_id.to_string();
+        let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert!(
+            warns.iter().any(|l| l.contains("frank")
+                && l.contains(&id)
+                && l.contains(STILL_LISTED_WARNING)),
+            "no warn line that live query {id} was still listed; got {warns:?}"
+        );
+        assert_eq!(
+            after,
+            vec![id.clone()],
+            "a short end must send no fallback KILL of live query {id}"
+        );
+    }
+
+    /// [`end_live`] with [`EndScope::Short`] through a client with no
+    /// connection, on which every read fails, returns after one read, within
+    /// [`LIVE_END_POLL`]; it logs one warn line, with the agent, the live id
+    /// and the read's error, that no read showed whether the live query had
+    /// ended, and no `KILL` warn line.
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_end_live_stops_at_a_failed_read() {
+        let db = mem_db().await;
+        let unconnected = Surreal::<any::Any>::init();
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (stream, live_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe");
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let began = tokio::time::Instant::now();
+        end_live(&unconnected, "frank", live_id, stream, EndScope::Short).await;
+        let elapsed = began.elapsed();
+        drop(guard);
+
+        let id = live_id.to_string();
+        let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert!(
+            elapsed < LIVE_END_POLL,
+            "a short end must stop at the first failed read; it took {elapsed:?}"
+        );
+        assert_eq!(warns.len(), 1, "warn lines of a short end: {warns:?}");
+        assert!(
+            warns[0].contains("frank")
+                && warns[0].contains(&id)
+                && warns[0].contains(UNREAD_WARNING)
+                && warns[0].contains("Connection uninitialised"),
+            "the warn line must name the agent, the id, the unread end and the read error; \
+             got {warns:?}"
+        );
+    }
+
+    /// A scripted read for [`await_end`]: the `n`th call (from 0) returns
+    /// `script(n)`, and each call's time is pushed to `calls`.
+    fn scripted_read(
+        calls: &std::sync::Mutex<Vec<tokio::time::Instant>>,
+        script: impl Fn(usize) -> Option<std::result::Result<bool, ListedReadError>> + 'static,
+    ) -> impl FnMut() -> futures::future::BoxFuture<
+        'static,
+        std::result::Result<bool, ListedReadError>,
+    > + '_ {
+        move || {
+            let mut calls = calls.lock().expect("calls lock");
+            let n = calls.len();
+            calls.push(tokio::time::Instant::now());
+            match script(n) {
+                Some(reply) => futures::future::ready(reply).boxed(),
+                None => std::future::pending().boxed(),
+            }
+        }
+    }
+
+    /// A failed read with text `read <n>`.
+    fn read_error(n: usize) -> ListedReadError {
+        ListedReadError::Failed(Box::new(surrealdb::Error::internal(format!("read {n}"))))
+    }
+
+    /// A malformed reply with text `malformed <n>`.
+    fn malformed(n: usize) -> ListedReadError {
+        ListedReadError::Malformed(Box::new(surrealdb::Error::internal(format!(
+            "malformed {n}"
+        ))))
+    }
+
+    /// Whether `outcome` is [`EndWait::Unconfirmed`] with `listed` and a
+    /// source whose text contains `text`, or no source for `None`.
+    fn unconfirmed(outcome: &EndWait, listed: bool, text: Option<&str>) -> bool {
+        match (outcome, text) {
+            (
+                EndWait::Unconfirmed {
+                    listed: l,
+                    source: None,
+                },
+                None,
+            ) => *l == listed,
+            (
+                EndWait::Unconfirmed {
+                    listed: l,
+                    source: Some(e),
+                },
+                Some(t),
+            ) => *l == listed && e.to_string().contains(t),
+            _ => false,
+        }
+    }
+
+    /// With [`EndScope::Full`], [`await_end`] reads again after a failed
+    /// read and after a malformed reply, and a later read that returns
+    /// `false` ends the wait with [`EndWait::Gone`], on the fourth read; with
+    /// [`EndScope::Short`], a malformed reply does not end the wait either,
+    /// and the read after it ends it with [`EndWait::Gone`].
+    #[tokio::test(start_paused = true)]
+    async fn await_end_reads_past_a_failed_read() {
+        let full = std::sync::Mutex::new(Vec::new());
+        let short = std::sync::Mutex::new(Vec::new());
+        let (full_outcome, short_outcome) = tokio::join!(
+            await_end(
+                scripted_read(&full, |n| Some(match n {
+                    0 => Err(read_error(n)),
+                    1 => Err(malformed(n)),
+                    2 => Err(read_error(n)),
+                    _ => Ok(false),
+                })),
+                EndScope::Full,
+            ),
+            await_end(
+                scripted_read(&short, |n| Some(if n == 0 {
+                    Err(malformed(n))
+                } else {
+                    Ok(false)
+                })),
+                EndScope::Short,
+            ),
+        );
+        let reads = |calls: &std::sync::Mutex<Vec<tokio::time::Instant>>| {
+            calls.lock().expect("calls lock").len()
+        };
+        assert!(
+            matches!(full_outcome, EndWait::Gone),
+            "full: a read of false after failed and malformed reads must end in Gone; \
+             got {full_outcome:?}"
+        );
+        assert_eq!(
+            reads(&full),
+            4,
+            "full: reads until the one that returned false"
+        );
+        assert!(
+            matches!(short_outcome, EndWait::Gone),
+            "short: a read of false after a malformed reply must end in Gone; \
+             got {short_outcome:?}"
+        );
+        assert_eq!(
+            reads(&short),
+            2,
+            "short: reads until the one that returned false"
+        );
+    }
+
+    /// With [`EndScope::Short`], [`await_end`] ends at the first failed read,
+    /// at once, with [`EndWait::Unconfirmed`] carrying that read's error:
+    /// `listed` after a read that returned `true`, else not.
+    #[tokio::test(start_paused = true)]
+    async fn short_await_end_stops_at_the_first_failed_read() {
+        let listed_then_failing = std::sync::Mutex::new(Vec::new());
+        let failing = std::sync::Mutex::new(Vec::new());
+        let began = tokio::time::Instant::now();
+        let (listed, failed) = tokio::join!(
+            await_end(
+                scripted_read(&listed_then_failing, |n| Some(if n == 0 {
+                    Ok(true)
+                } else {
+                    Err(read_error(n))
+                })),
+                EndScope::Short,
+            ),
+            await_end(
+                scripted_read(&failing, |n| Some(Err(read_error(n)))),
+                EndScope::Short,
+            ),
+        );
+        let elapsed = began.elapsed();
+        let calls = |calls: &std::sync::Mutex<Vec<tokio::time::Instant>>| {
+            calls
+                .lock()
+                .expect("calls lock")
+                .iter()
+                .map(|t| *t - began)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            unconfirmed(&listed, true, Some("read 1")),
+            "listed, then a failed read: want Unconfirmed {{ listed: true, \"read 1\" }}; \
+             got {listed:?}"
+        );
+        assert!(
+            unconfirmed(&failed, false, Some("read 0")),
+            "a failed first read: want Unconfirmed {{ listed: false, \"read 0\" }}; \
+             got {failed:?}"
+        );
+        assert_eq!(
+            (calls(&listed_then_failing), calls(&failing), elapsed),
+            (
+                vec![Duration::ZERO, LIVE_END_POLL],
+                vec![Duration::ZERO],
+                LIVE_END_POLL
+            ),
+            "(read times listed then failing, read times failing, elapsed)"
+        );
+    }
+
+    /// At [`LIVE_KILL_TIMEOUT`], with [`EndScope::Full`], [`await_end`]
+    /// returns [`EndWait::Unconfirmed`]: not listed, with the last failed
+    /// read's error, when every read failed; listed, with the last failed
+    /// read's error, when one read returned `true` and the later ones failed;
+    /// not listed, with the last malformed reply's error, when every reply
+    /// was malformed; and not listed with no error when the first read never
+    /// returns.
+    #[tokio::test(start_paused = true)]
+    async fn await_end_reports_the_last_error_and_what_was_read() {
+        let failing = std::sync::Mutex::new(Vec::new());
+        let listed_then_failing = std::sync::Mutex::new(Vec::new());
+        let malformed_replies = std::sync::Mutex::new(Vec::new());
+        let stalled = std::sync::Mutex::new(Vec::new());
+        let began = tokio::time::Instant::now();
+        let (failed, listed, bad, unread) = tokio::join!(
+            await_end(
+                scripted_read(&failing, |n| Some(Err(read_error(n)))),
+                EndScope::Full
+            ),
+            await_end(
+                scripted_read(&listed_then_failing, |n| {
+                    Some(if n == 0 { Ok(true) } else { Err(read_error(n)) })
+                }),
+                EndScope::Full,
+            ),
+            await_end(
+                scripted_read(&malformed_replies, |n| Some(Err(malformed(n)))),
+                EndScope::Full,
+            ),
+            await_end(scripted_read(&stalled, |_| None), EndScope::Full),
+        );
+        let elapsed = began.elapsed();
+        let reads = |calls: &std::sync::Mutex<Vec<tokio::time::Instant>>| {
+            calls.lock().expect("calls lock").len()
+        };
+
+        assert!(
+            unconfirmed(&failed, false, Some("read 8")),
+            "every read failed: want Unconfirmed {{ listed: false, \"read 8\" }}; got {failed:?}"
+        );
+        assert!(
+            unconfirmed(&listed, true, Some("read 8")),
+            "listed, then failed reads: want Unconfirmed {{ listed: true, \"read 8\" }}; \
+             got {listed:?}"
+        );
+        assert!(
+            unconfirmed(&bad, false, Some("malformed 8")),
+            "every reply malformed: want Unconfirmed {{ listed: false, \"malformed 8\" }}; \
+             got {bad:?}"
+        );
+        assert!(
+            unconfirmed(&unread, false, None),
+            "a read that never returns: want Unconfirmed {{ listed: false, None }}; \
+             got {unread:?}"
+        );
+        assert_eq!(
+            [
+                reads(&failing),
+                reads(&listed_then_failing),
+                reads(&malformed_replies),
+                reads(&stalled),
+            ],
+            [9, 9, 9, 1],
+            "reads of [failing, listed then failing, malformed, stalled]"
+        );
+        assert_eq!(elapsed, LIVE_KILL_TIMEOUT, "time to the deadline");
+    }
+
+    /// With every read returning `true`, [`await_end`] reads 9 times within
+    /// [`LIVE_KILL_TIMEOUT`], at intervals of exactly 10, 20, 40, 80, 160,
+    /// 320, 500 and 500 ms.
+    #[tokio::test(start_paused = true)]
+    async fn await_end_doubles_its_interval_up_to_the_cap() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let outcome = await_end(scripted_read(&calls, |_| Some(Ok(true))), EndScope::Full).await;
+        let calls = calls.into_inner().expect("calls lock");
+        let gaps: Vec<Duration> = calls.windows(2).map(|w| w[1] - w[0]).collect();
+        let want: Vec<Duration> = [10, 20, 40, 80, 160, 320, 500, 500]
+            .into_iter()
+            .map(Duration::from_millis)
+            .collect();
+
+        assert!(
+            unconfirmed(&outcome, true, None),
+            "every read listed: want Unconfirmed {{ listed: true, None }}; got {outcome:?}"
+        );
+        assert_eq!(gaps, want, "intervals between reads");
+    }
+
+    /// [`listed_in`] reads `true` or `false` from an `INFO FOR TABLE` reply
+    /// whose `lives` object holds or lacks the live id, and
+    /// [`ListedReadError::Malformed`], naming the reply as malformed, from a
+    /// reply that is not an object and from an object with no `lives`
+    /// object.
+    #[test]
+    fn listed_in_names_a_malformed_reply() {
+        let live_id = Uuid::new_v4();
+        let mut lives = Object::new();
+        lives.insert(live_id.to_string(), Value::None);
+        let reply = |lives: Value| {
+            let mut o = Object::new();
+            o.insert("lives".to_string(), lives);
+            Value::Object(o)
+        };
+        let read = |info: &Value| match listed_in(info, live_id) {
+            Ok(listed) => format!("Ok({listed})"),
+            Err(ListedReadError::Failed(e)) => format!("Failed({e})"),
+            Err(ListedReadError::Malformed(e)) => {
+                format!(
+                    "Malformed(malformed: {})",
+                    e.to_string().contains("malformed")
+                )
+            }
+        };
+        assert_eq!(
+            [
+                read(&reply(Value::Object(lives))),
+                read(&reply(Value::Object(Object::new()))),
+                read(&Value::None),
+                read(&reply(Value::None)),
+            ],
+            [
+                "Ok(true)",
+                "Ok(false)",
+                "Malformed(malformed: true)",
+                "Malformed(malformed: true)",
+            ],
+            "listed_in of [listing, not listing, not an object, no lives object]"
         );
     }
 
     /// [`finish_subscribe`] logs a failed subscribe at warn with the agent and
-    /// the error chain, and a failed `KILL` of the returned live query at warn
-    /// with the agent and the error chain, through a client with no
-    /// connection, on which the `KILL` fails. Neither logs a late reply or a
-    /// drop.
+    /// the error chain. Through a client with no connection, on which every
+    /// read fails, it logs at warn, with the agent, the live id and the last
+    /// read's error chain, that no read returned, then the failed fallback
+    /// `KILL` with the same error. Neither logs a late reply or a drop.
     #[tokio::test(flavor = "current_thread")]
-    async fn finish_subscribe_logs_a_failed_subscribe_and_a_failed_kill() {
+    async fn finish_subscribe_logs_a_failed_subscribe_and_a_failed_end_check() {
         let db = mem_db().await;
         let unconnected = Surreal::<any::Any>::init();
         let owner = RecordId::new(AGENT_TABLE, "frank");
@@ -3009,12 +3782,16 @@ mod tests {
                 .any(|l| l.contains("frank") && l.contains("reply refused")),
             "no warn line with the agent and the subscribe's error chain; got {logs:?}"
         );
-        assert!(
-            warns.iter().any(|l| l.contains("frank")
-                && l.contains("failed to KILL live query")
-                && l.contains(&live_id.to_string())),
-            "no warn line for the failed KILL; got {logs:?}"
-        );
+        let id = live_id.to_string();
+        for text in [UNREAD_WARNING, KILL_FAILED_WARNING] {
+            assert!(
+                warns.iter().any(|l| l.contains("frank")
+                    && l.contains(text)
+                    && l.contains(&id)
+                    && l.contains("Connection uninitialised")),
+                "no warn line with {text:?} and the read error; got {logs:?}"
+            );
+        }
         assert!(
             !logs.contains(NO_REPLY_WARNING) && !logs.contains(DROPPED_WARNING),
             "a finisher with a prompt reply must log no late reply or drop; got {logs:?}"
@@ -3285,8 +4062,8 @@ mod tests {
         );
     }
 
-    /// [`kill_live`]'s warn line for [`Error::LiveKill`] carries the inner
-    /// surrealdb error text, not only the variant's own message.
+    /// [`warn_live_end`]'s warn line for [`Error::LiveKill`] carries the
+    /// inner surrealdb error text, not only the variant's own message.
     #[test]
     fn kill_live_warning_includes_the_kill_error_source() {
         let inner = "kill refused by datastore";
@@ -3297,7 +4074,7 @@ mod tests {
         };
 
         let (subscriber, sink) = capturing_subscriber();
-        tracing::subscriber::with_default(subscriber, || warn_kill_live(&err));
+        tracing::subscriber::with_default(subscriber, || warn_live_end(&err));
 
         let logs = logged(&sink);
         let line = logs
@@ -3391,7 +4168,8 @@ mod tests {
 
     /// [`integral`] reads an `Int`, a finite `Float` with no fraction below
     /// 2^53 in size, and a `Decimal` with no fraction that fits `i64`; it
-    /// reads no other tested number.
+    /// reads no other tested number, a `Float` at 2^53 and at the next `f64`
+    /// above it, 2^53 + 2, among them.
     #[test]
     fn integral_reads_only_exact_integers() {
         let cases = [
@@ -3418,9 +4196,74 @@ mod tests {
             (Number::Float(1e30), None),
             (Number::Float(FLOAT_INTEGER_BOUND), None),
             (Number::Float(-FLOAT_INTEGER_BOUND), None),
+            (Number::Float(FLOAT_INTEGER_BOUND + 2.0), None),
+            (Number::Float(-FLOAT_INTEGER_BOUND - 2.0), None),
             (decimal("7.5"), None),
             (decimal("-0.5"), None),
             (decimal("10000000000000000000000000000"), None),
+        ];
+        for (number, want) in cases {
+            let read = integral(&number);
+            assert_eq!(read, want, "integral({number:?}) read {read:?}");
+        }
+    }
+
+    /// `text` as a `BigDecimal` number.
+    fn big_decimal(text: &str) -> Number {
+        Number::BigDecimal(Box::new(text.parse().expect("big decimal text")))
+    }
+
+    /// [`integral`] on each of the ten `Number` variants that the test above
+    /// does not cover: the smallest and largest value of each sized integer,
+    /// a `U64` at and above `i64::MAX`, an `F32` and an `F16` that are whole,
+    /// fractional, NaN and infinite, an `F32` and an `F16` one below their
+    /// bound ([`F32_INTEGER_BOUND`], [`F16_INTEGER_BOUND`]), at it and at the
+    /// next value above it that the type holds, in both signs, and a
+    /// `BigDecimal` that is whole, fractional and beyond `i64`.
+    #[test]
+    fn integral_reads_every_number_variant() {
+        let f16 = surrealdb_types::f16::from_f64;
+        let cases = [
+            (Number::I8(i8::MIN), Some(-128)),
+            (Number::I8(i8::MAX), Some(127)),
+            (Number::U8(u8::MAX), Some(255)),
+            (Number::I16(i16::MIN), Some(-32_768)),
+            (Number::U16(u16::MAX), Some(65_535)),
+            (Number::I32(i32::MIN), Some(-2_147_483_648)),
+            (Number::U32(u32::MAX), Some(4_294_967_295)),
+            (Number::U64(0), Some(0)),
+            (Number::U64(9_223_372_036_854_775_807), Some(i64::MAX)),
+            (Number::U64(9_223_372_036_854_775_808), None),
+            (Number::U64(u64::MAX), None),
+            (Number::F32(7.0), Some(7)),
+            (Number::F32(-7.0), Some(-7)),
+            (Number::F32(16_777_215.0), Some(16_777_215)),
+            (Number::F32(-16_777_215.0), Some(-16_777_215)),
+            (Number::F32(16_777_216.0), None),
+            (Number::F32(-16_777_216.0), None),
+            (Number::F32(16_777_218.0), None),
+            (Number::F32(-16_777_218.0), None),
+            (Number::F32(9_007_199_254_740_992.0), None),
+            (Number::F32(7.5), None),
+            (Number::F32(f32::NAN), None),
+            (Number::F32(f32::INFINITY), None),
+            (Number::F32(f32::NEG_INFINITY), None),
+            (Number::F16(f16(7.0)), Some(7)),
+            (Number::F16(f16(2047.0)), Some(2047)),
+            (Number::F16(f16(-2047.0)), Some(-2047)),
+            (Number::F16(f16(2048.0)), None),
+            (Number::F16(f16(-2048.0)), None),
+            (Number::F16(f16(2050.0)), None),
+            (Number::F16(f16(-2050.0)), None),
+            (Number::F16(f16(65_504.0)), None),
+            (Number::F16(f16(7.5)), None),
+            (Number::F16(f16(f64::NAN)), None),
+            (Number::F16(f16(f64::INFINITY)), None),
+            (big_decimal("7"), Some(7)),
+            (big_decimal("7.00"), Some(7)),
+            (big_decimal("-9223372036854775808"), Some(i64::MIN)),
+            (big_decimal("7.5"), None),
+            (big_decimal("9223372036854775808"), None),
         ];
         for (number, want) in cases {
             let read = integral(&number);
@@ -4433,17 +5276,25 @@ mod tests {
         assert_eq!(stop_save_lines(&logs), Vec::<&str>::new(), "stop saves");
     }
 
-    /// Margin over [`CURSOR_SAVE_TIMEOUT`] plus [`LIVE_KILL_TIMEOUT`] in the
-    /// shutdown tests below.
+    /// Margin over [`SHUTDOWN_BOUND`] in the shutdown tests below.
     const SHUTDOWN_MARGIN: Duration = Duration::from_secs(1);
 
+    /// [`CURSOR_SAVE_TIMEOUT`] for the save at the stop, plus
+    /// [`LIVE_KILL_TIMEOUT`] for the wait of [`await_end`], plus
+    /// [`LIVE_KILL_TIMEOUT`] for the fallback [`kill_live`].
+    const SHUTDOWN_BOUND: Duration = CURSOR_SAVE_TIMEOUT
+        .saturating_add(LIVE_KILL_TIMEOUT)
+        .saturating_add(LIVE_KILL_TIMEOUT);
+
     /// Seconds the shutdown tests below stall every call; above their bound.
-    const ALL_CALLS_STALL_SECS: u64 = 8;
+    const ALL_CALLS_STALL_SECS: u64 = 10;
 
     /// `coalition.shutdown()` with every call stalled, with its time, and the
-    /// assertion that it ends within the bound and that the `KILL` stalled.
+    /// assertion that it ends within [`SHUTDOWN_BOUND`] plus
+    /// [`SHUTDOWN_MARGIN`] and that the end wait and the fallback `KILL`
+    /// stalled.
     async fn assert_bounded_shutdown(coalition: &Coalition<String>, sink: &LogSink) {
-        let limit = CURSOR_SAVE_TIMEOUT + LIVE_KILL_TIMEOUT + SHUTDOWN_MARGIN;
+        let limit = SHUTDOWN_BOUND + SHUTDOWN_MARGIN;
         let began = tokio::time::Instant::now();
         coalition.shutdown().await;
         let elapsed = began.elapsed();
@@ -4452,17 +5303,21 @@ mod tests {
             "shutdown took {elapsed:?}, above its bound {limit:?}"
         );
         let logs = logged(sink);
-        assert!(
-            logs.lines()
-                .any(|l| l.contains("WARN") && l.contains("KILL of live query")),
-            "precondition: the KILL must stall too; got {logs:?}"
-        );
+        for (stage, text) in [
+            ("end wait", UNREAD_WARNING),
+            ("fallback KILL", "KILL of live query"),
+        ] {
+            assert!(
+                logs.lines().any(|l| l.contains("WARN") && l.contains(text)),
+                "precondition: the {stage} must stall too; got {logs:?}"
+            );
+        }
     }
 
     /// With every call stalled and a save in flight at the cancel on a
     /// complete page, [`Coalition::shutdown`] returns within
-    /// [`CURSOR_SAVE_TIMEOUT`] plus [`LIVE_KILL_TIMEOUT`] plus
-    /// [`SHUTDOWN_MARGIN`], with no further save at the stop.
+    /// [`SHUTDOWN_BOUND`] plus [`SHUTDOWN_MARGIN`], with no further save at
+    /// the stop.
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_is_bounded_with_a_save_in_flight() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
@@ -4500,8 +5355,7 @@ mod tests {
 
     /// With every call stalled and a cancel during a send on a full bus, the
     /// save of the stop leaves [`Coalition::shutdown`] within
-    /// [`CURSOR_SAVE_TIMEOUT`] plus [`LIVE_KILL_TIMEOUT`] plus
-    /// [`SHUTDOWN_MARGIN`].
+    /// [`SHUTDOWN_BOUND`] plus [`SHUTDOWN_MARGIN`].
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_is_bounded_with_a_save_on_a_stop() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
