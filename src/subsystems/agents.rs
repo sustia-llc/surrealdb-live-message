@@ -2036,6 +2036,9 @@ async fn kill_fallback(db: &Surreal<any::Any>, agent: &str, live_id: Uuid) {
     }
 }
 
+/// The statement [`send_kill`] sends, with the live-query id bound as `$id`.
+const KILL_STATEMENT: &str = "KILL $id";
+
 /// `KILL` live query `live_id` through `db` by `deadline`. A failed call or
 /// a `KILL` statement that the datastore refuses is [`Error::LiveKill`], with
 /// the datastore's error in its source; no reply by `deadline` is
@@ -2046,7 +2049,7 @@ async fn send_kill(
     live_id: Uuid,
     deadline: Instant,
 ) -> Result<()> {
-    let kill = db.query("KILL $id").bind(("id", Value::Uuid(live_id)));
+    let kill = db.query(KILL_STATEMENT).bind(("id", Value::Uuid(live_id)));
     match timeout_at(deadline, kill).await {
         Ok(result) => result
             .and_then(|r| r.check())
@@ -2299,15 +2302,194 @@ mod tests {
         String::from_utf8(sink.0.lock().expect("log sink lock").clone()).expect("utf-8 logs")
     }
 
-    /// A subscriber writing plain text to a new [`LogSink`].
-    fn capturing_subscriber() -> (impl tracing::Subscriber + Send + Sync, LogSink) {
-        let sink = LogSink::default();
+    /// A layer that writes events at INFO and above as plain text to `sink`.
+    fn text_layer<S>(sink: &LogSink) -> impl tracing_subscriber::Layer<S> + Send + Sync + use<S>
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        use tracing_subscriber::Layer as _;
         let writer = sink.clone();
-        let subscriber = tracing_subscriber::fmt()
+        tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_writer(move || writer.clone())
-            .finish();
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO)
+    }
+
+    /// A subscriber writing plain text to a new [`LogSink`] through
+    /// [`text_layer`].
+    fn capturing_subscriber() -> (impl tracing::Subscriber + Send + Sync, LogSink) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let sink = LogSink::default();
+        let subscriber = tracing_subscriber::registry().with(text_layer(&sink));
         (subscriber, sink)
+    }
+
+    /// Target of SurrealDB core's per-statement TRACE event
+    /// (`surrealdb-core-4.0.0/src/dbs/executor.rs:61`).
+    const STATEMENT_TARGET: &str = "surrealdb::core::dbs";
+
+    /// Message of SurrealDB core's per-statement TRACE event
+    /// (`surrealdb-core-4.0.0/src/dbs/executor.rs:4650`, `:5186`, `:5534`).
+    const STATEMENT_MESSAGE: &str = "Executing statement";
+
+    /// The statement text of the `KILL` that a dropped stream runs on an
+    /// embedded engine (`surrealdb-engine-local-4.0.0/src/engine.rs:83`,
+    /// `:100`).
+    const DROP_KILL_STATEMENT: &str = "KILL $__kill_id";
+
+    /// The number of [`KILL_STATEMENT`]s and of [`DROP_KILL_STATEMENT`]s the
+    /// datastore began to execute on the thread where a subscriber built by
+    /// [`statement_counting_subscriber`] was the default, while it was: each
+    /// [`STATEMENT_MESSAGE`] event on [`STATEMENT_TARGET`] whose `statement`
+    /// field equals one of the two texts.
+    #[derive(Clone, Default)]
+    struct StatementCount {
+        kill: Arc<std::sync::atomic::AtomicUsize>,
+        drop_kill: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// A `fmt::Write` sink that tracks whether the text written to it so far
+    /// is a prefix of `rest`'s original text; `rest` is what is left of it.
+    struct PrefixOf<'a> {
+        rest: &'a str,
+        prefix: bool,
+    }
+
+    impl std::fmt::Write for PrefixOf<'_> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            match self.rest.strip_prefix(s) {
+                Some(rest) if self.prefix => self.rest = rest,
+                _ => self.prefix = false,
+            }
+            Ok(())
+        }
+    }
+
+    /// Whether `value`'s `Debug` rendering equals `text`.
+    fn renders_as(value: &dyn std::fmt::Debug, text: &str) -> bool {
+        use std::fmt::Write as _;
+        let mut sink = PrefixOf {
+            rest: text,
+            prefix: true,
+        };
+        write!(sink, "{value:?}").is_ok() && sink.prefix && sink.rest.is_empty()
+    }
+
+    /// The statement text of an event, when it is [`KILL_STATEMENT`] or
+    /// [`DROP_KILL_STATEMENT`].
+    #[derive(Clone, Copy)]
+    enum Counted {
+        Kill,
+        DropKill,
+    }
+
+    /// Whether one event's `message` is [`STATEMENT_MESSAGE`], and which
+    /// counted text its `statement` field is, if any.
+    #[derive(Default)]
+    struct StatementFields {
+        message: bool,
+        statement: Option<Counted>,
+    }
+
+    impl tracing::field::Visit for StatementFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            match field.name() {
+                "message" => self.message = renders_as(value, STATEMENT_MESSAGE),
+                "statement" if renders_as(value, KILL_STATEMENT) => {
+                    self.statement = Some(Counted::Kill);
+                }
+                "statement" if renders_as(value, DROP_KILL_STATEMENT) => {
+                    self.statement = Some(Counted::DropKill);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for StatementCount {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = StatementFields::default();
+            event.record(&mut fields);
+            let counter = match (fields.message, fields.statement) {
+                (true, Some(Counted::Kill)) => &self.kill,
+                (true, Some(Counted::DropKill)) => &self.drop_kill,
+                _ => return,
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A subscriber that writes events at INFO and above as plain text to a
+    /// new [`LogSink`] through [`text_layer`], and counts statements in a new
+    /// [`StatementCount`] from TRACE events on [`STATEMENT_TARGET`].
+    fn statement_counting_subscriber() -> (
+        impl tracing::Subscriber + Send + Sync,
+        LogSink,
+        StatementCount,
+    ) {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let sink = LogSink::default();
+        let counts = StatementCount::default();
+        let counter = counts.clone().with_filter(
+            tracing_subscriber::filter::Targets::new()
+                .with_target(STATEMENT_TARGET, tracing::Level::TRACE),
+        );
+        let subscriber = tracing_subscriber::registry()
+            .with(text_layer(&sink))
+            .with(counter);
+        (subscriber, sink, counts)
+    }
+
+    /// The counts of [`KILL_STATEMENT`] and [`DROP_KILL_STATEMENT`] in
+    /// `counts`.
+    fn kill_counts(counts: &StatementCount) -> (usize, usize) {
+        let load = |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::SeqCst);
+        (load(&counts.kill), load(&counts.drop_kill))
+    }
+
+    /// A new [`StatementCount`] holds 1 [`KILL_STATEMENT`] and 0
+    /// [`DROP_KILL_STATEMENT`]s after a [`kill_live`] of a registered live
+    /// query, and 1 of each after the drop of another live query's stream
+    /// that follows. Both live queries are gone within
+    /// [`DROP_KILL_SETTLE`] of the drop, read while the subscriber is the
+    /// default.
+    #[tokio::test(flavor = "current_thread")]
+    async fn statement_count_tells_the_crate_kill_from_a_stream_drop() {
+        let db = mem_db().await;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (killed, killed_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe the killed stream");
+        let (dropped, _dropped_id) = subscribe_wake(&db, &owner, "frank")
+            .await
+            .expect("subscribe the dropped stream");
+
+        let (subscriber, _sink, counts) = statement_counting_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        kill_live(&db, "frank", killed_id).await;
+        let after_kill = kill_counts(&counts);
+        drop(dropped);
+        sleep(DROP_KILL_SETTLE).await;
+        let after_drop = kill_counts(&counts);
+        let lives = message_lives(&db).await;
+        drop(guard);
+        drop(killed);
+
+        assert_eq!(
+            [after_kill, after_drop],
+            [(1, 0), (1, 1)],
+            "(KILL $id, KILL $__kill_id) counts after [kill_live, stream drop]"
+        );
+        assert_eq!(
+            lives,
+            Vec::<String>::new(),
+            "precondition: kill_live and the drop end both live queries"
+        );
     }
 
     /// An [`Error::LiveQueryIdMissing`] for `agent`.
@@ -3157,19 +3339,21 @@ mod tests {
 
     /// [`hold_session_for`] 3 s.
     async fn hold_session(db: &'static Surreal<any::Any>) -> tokio::task::JoinHandle<()> {
-        hold_session_for(db, 3).await
+        hold_session_for(db, Duration::from_secs(3)).await
     }
 
-    /// Stall every later query on `db` for `secs` seconds: a `SLEEP` holds the
-    /// session's read lock, a queued `use_db` waits for its write lock, and a
-    /// later query waits behind that writer. The returned task ends with the
-    /// stall.
+    /// Stall every later query on `db` for `stall`, in whole milliseconds: a
+    /// `SLEEP` holds the session's read lock, a queued `use_db` waits for its
+    /// write lock, and a later query waits behind that writer. The returned
+    /// task ends with the stall. Panics on a `stall` below 1 ms.
     async fn hold_session_for(
         db: &'static Surreal<any::Any>,
-        secs: u64,
+        stall: Duration,
     ) -> tokio::task::JoinHandle<()> {
+        let millis = stall.as_millis();
+        assert!(millis > 0, "a stall of {stall:?} renders as SLEEP 0ms");
         let held = async move {
-            let (slept, used) = tokio::join!(db.query(format!("SLEEP {secs}s")), async {
+            let (slept, used) = tokio::join!(db.query(format!("SLEEP {millis}ms")), async {
                 tokio::task::yield_now().await;
                 db.use_db("test").await
             });
@@ -3250,10 +3434,9 @@ mod tests {
     /// [`LIVE_KILL_TIMEOUT`] after its stream's drop, [`finish_subscribe`]
     /// logs at warn, with the agent and the live id, that no read showed
     /// whether the live query had ended, and not that a `KILL` did not
-    /// finish. It then sends one fallback `KILL`, which runs after the stall,
-    /// behind the drop's `KILL`; the datastore refuses it, the read after it
-    /// shows the live query gone, and no `KILL` warn line is logged. The live
-    /// query is gone afterward.
+    /// finish. The datastore began to execute 1 [`KILL_STATEMENT`] (see
+    /// [`StatementCount`]) by the time [`finish_subscribe`] returns, and no
+    /// `KILL` warn line is logged. The live query is gone afterward.
     #[tokio::test(flavor = "current_thread")]
     async fn finish_subscribe_logs_an_unread_end_and_not_a_refused_kill_of_a_gone_query() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
@@ -3263,16 +3446,21 @@ mod tests {
             .expect("subscribe");
         let held = hold_session(db).await;
 
-        let (subscriber, sink) = capturing_subscriber();
+        let (subscriber, sink, counts) = statement_counting_subscriber();
         let guard = tracing::subscriber::set_default(subscriber);
         let began = tokio::time::Instant::now();
         finish_subscribe(db, "frank".to_string(), async { Ok((stream, live_id)) }).await;
         let elapsed = began.elapsed();
+        let (killed, _) = kill_counts(&counts);
         drop(guard);
 
         assert!(
             elapsed >= LIVE_KILL_TIMEOUT,
             "precondition: the reads must stall; finish_subscribe took {elapsed:?}"
+        );
+        assert_eq!(
+            killed, 1,
+            "KILL $id statements begun by the time finish_subscribe returns"
         );
         let id = live_id.to_string();
         let logs = logged(&sink);
@@ -3307,9 +3495,10 @@ mod tests {
 
     /// A live query whose stream [`end_live`] does not hold, so that the
     /// drop sends no `KILL` of it, stays listed: [`end_live`] logs at warn,
-    /// with the agent and the live id, that it was still listed, then its
-    /// fallback `KILL` ends it, with no `KILL` warn line, before
-    /// [`end_live`] returns.
+    /// with the agent and the live id, that it was still listed. The
+    /// datastore began to execute 1 [`KILL_STATEMENT`] (see
+    /// [`StatementCount`]) by the time [`end_live`] returns, the live query is
+    /// gone when it returns, and no `KILL` warn line is logged.
     #[tokio::test(flavor = "current_thread")]
     async fn end_live_kills_a_live_query_still_listed_at_its_deadline() {
         let db = mem_db().await;
@@ -3321,14 +3510,20 @@ mod tests {
             .await
             .expect("subscribe the kept stream");
 
-        let (subscriber, sink) = capturing_subscriber();
+        let (subscriber, sink, counts) = statement_counting_subscriber();
         let guard = tracing::subscriber::set_default(subscriber);
         let began = tokio::time::Instant::now();
         end_live(&db, "frank", live_id, dropped, EndScope::Full).await;
         let elapsed = began.elapsed();
+        let (killed, _) = kill_counts(&counts);
         let after = message_lives(&db).await;
         drop(guard);
         drop(kept);
+
+        assert_eq!(
+            killed, 1,
+            "KILL $id statements begun by the time end_live returns"
+        );
 
         let id = live_id.to_string();
         let logs = logged(&sink);
@@ -3353,6 +3548,86 @@ mod tests {
             "a fallback KILL that succeeds must log no KILL warn; got {warns:?}"
         );
     }
+
+    /// A `mem://` datastore with authentication on, and two sessions on it,
+    /// signed in as the database users `alice` and `bob` (role OWNER) of
+    /// `test`/`test`, which defines the `message` table.
+    async fn alice_and_bob() -> (Surreal<any::Any>, Surreal<any::Any>) {
+        use surrealdb::opt::auth::{Database, Root};
+        let root_user = || Root {
+            username: "root".to_string(),
+            password: "root".to_string(),
+        };
+        let config = surrealdb::opt::Config::new().user(root_user());
+        let root = any::connect(("mem://", config))
+            .await
+            .expect("connect mem:// with auth");
+        root.signin(root_user()).await.expect("root signin");
+        root.use_ns("test").use_db("test").await.expect("use ns/db");
+        root.query(format!(
+            "DEFINE TABLE {MESSAGE_TABLE}; \
+             DEFINE USER alice ON DATABASE PASSWORD 'alice' ROLES OWNER; \
+             DEFINE USER bob ON DATABASE PASSWORD 'bob' ROLES OWNER;"
+        ))
+        .await
+        .and_then(|r| r.check())
+        .expect("define the message table and two users");
+        let signed_in = |user: &str| Database {
+            namespace: "test".to_string(),
+            database: "test".to_string(),
+            username: user.to_string(),
+            password: user.to_string(),
+        };
+        let alice = root.clone();
+        alice
+            .signin(signed_in("alice"))
+            .await
+            .expect("alice signin");
+        let bob = root.clone();
+        bob.signin(signed_in("bob")).await.expect("bob signin");
+        (alice, bob)
+    }
+
+    /// [`kill_fallback`] through a session that does not own a registered
+    /// live query (see [`alice_and_bob`]) logs one warn line, which holds the
+    /// agent, the live id, [`KILL_FAILED_WARNING`] and [`KILL_REFUSAL`]. The
+    /// live query is still listed after [`kill_fallback`] returns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn kill_fallback_logs_a_refused_kill_of_a_listed_query() {
+        let (alice, bob) = alice_and_bob().await;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (kept, live_id) = subscribe_wake(&alice, &owner, "frank")
+            .await
+            .expect("alice subscribes");
+
+        let (subscriber, sink) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        kill_fallback(&bob, "frank", live_id).await;
+        drop(guard);
+        let after = message_lives(&bob).await;
+        drop(kept);
+
+        let id = live_id.to_string();
+        assert_eq!(
+            after,
+            vec![id.clone()],
+            "precondition: bob's refused KILL leaves live query {id} listed"
+        );
+        let logs = logged(&sink);
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warns.len(), 1, "warn lines of kill_fallback: {warns:?}");
+        for needle in ["frank", id.as_str(), KILL_FAILED_WARNING, KILL_REFUSAL] {
+            assert!(
+                warns[0].contains(needle),
+                "the refused KILL's warn line must contain {needle:?}; got {:?}",
+                warns[0]
+            );
+        }
+    }
+
+    /// Text of the datastore's refusal of a `KILL` by a user who does not
+    /// own the live query.
+    const KILL_REFUSAL: &str = "Not enough permissions";
 
     /// [`Exit::end_scope`] is [`EndScope::Full`] for each [`Exit::Stop`], and
     /// [`EndScope::Short`] for [`Exit::CatchUp`] and [`Exit::Wake`].
@@ -4735,6 +5010,96 @@ mod tests {
         }
     }
 
+    /// A reconnect of one listen loop after an [`Exit::CatchUp`] whose end
+    /// wait no read answers: the second page read starts a stall of every
+    /// query for 1.5 × [`LIVE_KILL_TIMEOUT`] (see [`hold_session_for`]) and
+    /// fails. From the start of the loop until the first read after the
+    /// resubscribe and the old live query no longer listed, the loop logs at
+    /// warn, with the agent, that no read showed whether the live query had
+    /// ended, and the datastore began to execute 0 [`KILL_STATEMENT`]s and at
+    /// least 1 [`DROP_KILL_STATEMENT`] (see [`StatementCount`]). A
+    /// [`kill_live`] of another live query after that moves the
+    /// [`KILL_STATEMENT`] count from 0 to 1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_end_sends_no_fallback_kill() {
+        let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
+        let stall = LIVE_KILL_TIMEOUT * 3 / 2;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let mut call = 0;
+        let reads = move |at: Cursor| -> CatchUpRead {
+            call += 1;
+            let nth = call;
+            let seen_tx = seen_tx.clone();
+            Box::pin(async move {
+                seen_tx.send(at).expect("the test holds the receiver");
+                if nth == 2 {
+                    drop(hold_session_for(db, stall).await);
+                    return Err(failed_read());
+                }
+                Ok(ControlFlow::Continue(Vec::new()))
+            })
+        };
+
+        let (subscriber, sink, counts) = statement_counting_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let coalition = scripted_coalition(db, Cursor::at(5), 8, reads).await;
+        next_read(&mut seen).await;
+        let old = message_lives(db).await;
+        wake_frank(db).await;
+        next_read(&mut seen).await;
+        let resubscribe_within = stall * 2;
+        timeout(resubscribe_within, seen.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("no read after the resubscribe within {resubscribe_within:?}")
+            })
+            .expect("the read channel is open");
+        timeout(resubscribe_within, async {
+            while message_lives(db).await.iter().any(|id| old.contains(id)) {
+                sleep(LIVE_END_POLL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("old live query {old:?} still listed after {resubscribe_within:?}")
+        });
+        let (killed, drop_killed) = kill_counts(&counts);
+        let logs = logged(&sink);
+        let (scratch, scratch_id) = subscribe_wake(db, &owner, "frank")
+            .await
+            .expect("subscribe the scratch live query");
+        kill_live(db, "frank", scratch_id).await;
+        let (control, _) = kill_counts(&counts);
+        coalition.shutdown().await;
+        drop(guard);
+        drop(scratch);
+
+        assert_eq!(
+            old.len(),
+            1,
+            "precondition: one live query before the wake: {old:?}"
+        );
+        assert!(
+            logs.lines()
+                .any(|l| l.contains("WARN") && l.contains("frank") && l.contains(UNREAD_WARNING)),
+            "precondition: the reconnect's end must be unconfirmed; got {logs:?}"
+        );
+        assert!(
+            drop_killed >= 1,
+            "positive control: KILL $__kill_id statements begun up to the read after the \
+             resubscribe: {drop_killed}"
+        );
+        assert_eq!(
+            killed, 0,
+            "KILL $id statements begun up to the read after the resubscribe"
+        );
+        assert_eq!(
+            control, 1,
+            "positive control: KILL $id statements after one kill_live of a scratch live query"
+        );
+    }
+
     /// A short page with no position, read six times by one listen loop: the
     /// first read from position 5 logs it; later reads from 5, across a wake
     /// and a resubscribe, do not, the last of them with a page that moves the
@@ -4986,7 +5351,7 @@ mod tests {
             let page = page_at(at);
             Box::pin(async move {
                 if hold {
-                    drop(hold_session_for(db, stall_secs).await);
+                    drop(hold_session_for(db, Duration::from_secs(stall_secs)).await);
                 }
                 Ok(ControlFlow::Continue(page))
             })
