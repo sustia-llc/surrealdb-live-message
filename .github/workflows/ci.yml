@@ -23,6 +23,18 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  unit:
+    name: lib and compile-fail tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --lib
+        run: cargo test --lib
+      - name: cargo test --test compile_fail
+        run: cargo test --test compile_fail
+
   test:
     name: integration test (Docker)
     runs-on: ubuntu-latest

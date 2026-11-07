@@ -11,6 +11,8 @@ messaging over SurrealDB graph edges + LIVE queries. `src/main.rs` is a binary e
 - Run: `cargo test --test integration_test` (the Docker-backed integration test).
 - Deterministic unit tests (no Docker) live in `src/subsystems/agents.rs` (the
   `await_ready` handshake-error seam): `cargo test --lib`.
+- `tests/compile_fail.rs` (no Docker) is a `trybuild` test: an exhaustive `match` on `Error` outside the crate must not compile. Run: `cargo test --test compile_fail`.
+- After a change to the `Error` variants or a toolchain bump, regenerate its expected output: `TRYBUILD=overwrite cargo test --test compile_fail`. Then read the new `tests/ui/error_match_without_wildcard.stderr` before you commit it.
 - To use the production cloud endpoint in place of a local container: `RUN_MODE=production cargo test --test integration_test`.
 - Config layers (via the `config` crate): `config/default.toml` → `config/{RUN_MODE}.toml` → env vars (`__` separator). `RUN_MODE` defaults to `development`.
 - `.cargo/config.toml` sets `RUST_MIN_STACK` to 10 MiB for spawned threads, test threads among them. Cargo reads this file from its working directory, not from `--manifest-path`. Run cargo from the checkout root, for example `env -C <checkout> cargo test --lib`.
