@@ -81,7 +81,7 @@ These are diagnosed fixes, and tests lock them in. See the docstrings in `src/me
 - A subscribe in flight at a cancel moves to a spawned task that no `TaskTracker` tracks. Neither the loop nor `shutdown()` waits for it, and the live count can settle after they return.
 - When the reply arrives, that task ends the live query as a loop does at its stop. It drops the stream, and the SDK's `Drop` sends a `KILL` on the stream's session (`surrealdb-4.0.0/src/method/live.rs:369`). It then reads `INFO FOR TABLE message` until the live query is not listed, up to `LIVE_KILL_TIMEOUT`. If the end is not confirmed by then, it sends one `KILL` of its own.
 - It logs these cases at warn: a failed subscribe, a reply still missing after `LIVE_KILL_TIMEOUT`, an end not confirmed by the deadline (`LiveEndUnconfirmed`, whose `listed` field says whether a read still listed the live query), a failed or timed-out fallback `KILL` (`LiveKill`, `LiveKillTimeout`), and its own drop before it finishes. After the missing-reply warn, it keeps waiting.
-- The SDK keeps the result of a `KILL` statement (`surrealdb-4.0.0/src/method/query.rs:445`). After a failed or refused fallback `KILL`, the crate reads `INFO FOR TABLE message` once more. If that read does not list the live query, nothing is logged. Otherwise the crate logs `LiveKill` with the server's error.
+- The SDK keeps the result of a `KILL` statement (`surrealdb-4.0.0/src/method/query.rs:445`). After a failed or refused fallback `KILL`, the crate reads `INFO FOR TABLE message` once more. If that read returns and does not list the live query, nothing is logged. Otherwise the crate logs `LiveKill` with the server's error.
 
 ### Catch-up cursor
 

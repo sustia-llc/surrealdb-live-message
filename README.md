@@ -58,6 +58,8 @@ Since the 2026-04 library-first refactor, the library exposes a `Coalition<T: Su
 - Every await before then is raced against the token, and a cancel is sent before any cleanup await.
 - After `Ok(())`, the loop puts nothing on the bus until `Coalition::new` opens the `start` signal. If its ready send fails, the loop ends.
 - It runs until `token.cancelled()`. Messages are **never deleted here**.
+- At a stop, it saves the cursor, then ends its live query. It drops the stream, and the SDK sends a `KILL` on the stream's session. It then reads `INFO FOR TABLE message` until the live query is not listed, up to 2 s. If the end is not confirmed by then, it logs `Error::LiveEndUnconfirmed` at warn and sends one `KILL` of its own. A failed or refused `KILL` is logged as `Error::LiveKill`, unless one more read returns and does not list the live query.
+- On a reconnect, the same end stops at the first failed read and sends no `KILL` of its own.
 
 **`Coalition<T>`** holds a registry, a `TaskTracker`, a root `CancellationToken` and a per-spawn `child_token()`. Its startup and shutdown follow these rules:
 
@@ -70,7 +72,7 @@ Since the 2026-04 library-first refactor, the library exposes a `Coalition<T: Su
 - `Error::ListenLoopDropped` means a loop ended without a ready signal and without a cancel.
 - Dropping the `new()` future cancels every spawned loop and the retention sweep without waiting for them.
 - `new()` also spawns one **retention sweep** task that ages out the durable log (`DELETE message WHERE created < now - sdb.message_retention_secs`, default 24h).
-- `shutdown().await` cancels the root token and waits for these tasks. Dropping a `Coalition` cancels the root token without waiting.
+- `shutdown().await` cancels the root token and waits for these tasks. After the cancel, each loop stops within 6 s: one cursor save of up to 2 s, the end of its live query of up to 2 s, and a fallback `KILL` of up to 2 s. Dropping a `Coalition` cancels the root token without waiting.
 - `new_with_parent(names, &parent)` makes the root token a child of `parent`.
 
 For names that pass validation, a cancel before every loop is ready returns `Error::Cancelled`, unless the waits see another sent error or `Error::ListenLoopDropped`. The `agent` field is set as follows:
@@ -88,6 +90,8 @@ See the integration test for an end-to-end library-first usage.
 - [Rust](https://www.rust-lang.org/tools/install)
 - [Docker](https://docs.docker.com/get-docker/)
 - [SurrealDB](https://surrealdb.com/docs/surrealdb/installation/) (for client SQL queries, see Run below)
+
+The crate pins the SurrealDB 4.0.0 SDK, and the test container runs the `surrealdb/surrealdb:v4.0.0` image. The tests run against a 4.0.0 server. A SurrealDB 3.x client refuses a 4.0.0 server, so a client and its server move to 4.0 together.
 
 ## Test
 
