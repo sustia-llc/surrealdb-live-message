@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # Honors rust-toolchain.toml (channel 1.96.0 + rustfmt + clippy).
+      # Honors rust-toolchain.toml (its channel, rustfmt and clippy).
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
@@ -23,26 +23,19 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
-  unit:
-    name: lib and compile-fail tests
+  test:
+    name: tests (lib, compile-fail, integration with Docker)
     runs-on: ubuntu-latest
+    # ubuntu-latest runners ship a running Docker daemon; the integration test
+    # pulls the surrealdb/surrealdb image tag in config/default.toml and manages
+    # its own container via bollard.
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --lib
-        run: cargo test --lib
+        run: cargo test --lib -- --test-threads=1
       - name: cargo test --test compile_fail
         run: cargo test --test compile_fail
-
-  test:
-    name: integration test (Docker)
-    runs-on: ubuntu-latest
-    # ubuntu-latest runners ship a running Docker daemon; the integration test
-    # pulls surrealdb/surrealdb:v3.1.2 and manages its own container via bollard.
-    steps:
-      - uses: actions/checkout@v5
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
       - name: cargo test
         run: cargo test --test integration_test

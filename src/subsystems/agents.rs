@@ -2337,35 +2337,70 @@ mod tests {
     /// `:100`).
     const DROP_KILL_STATEMENT: &str = "KILL $__kill_id";
 
-    /// Per statement text, the number of statements the datastore began to
-    /// execute on the thread where a subscriber built by
+    /// The number of [`KILL_STATEMENT`]s and of [`DROP_KILL_STATEMENT`]s the
+    /// datastore began to execute on the thread where a subscriber built by
     /// [`statement_counting_subscriber`] was the default, while it was: each
-    /// [`STATEMENT_MESSAGE`] event on [`STATEMENT_TARGET`], keyed by its
-    /// `statement` field.
+    /// [`STATEMENT_MESSAGE`] event on [`STATEMENT_TARGET`] whose `statement`
+    /// field equals one of the two texts.
     #[derive(Clone, Default)]
-    struct StatementCount(Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>);
+    struct StatementCount {
+        kill: Arc<std::sync::atomic::AtomicUsize>,
+        drop_kill: Arc<std::sync::atomic::AtomicUsize>,
+    }
 
-    impl StatementCount {
-        /// The count so far of statements whose text is `statement`.
-        fn of(&self, statement: &str) -> usize {
-            let counts = self.0.lock().expect("statement count lock");
-            counts.get(statement).copied().unwrap_or(0)
+    /// A `fmt::Write` sink that tracks whether the text written to it so far
+    /// is a prefix of `rest`'s original text; `rest` is what is left of it.
+    struct PrefixOf<'a> {
+        rest: &'a str,
+        prefix: bool,
+    }
+
+    impl std::fmt::Write for PrefixOf<'_> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            match self.rest.strip_prefix(s) {
+                Some(rest) if self.prefix => self.rest = rest,
+                _ => self.prefix = false,
+            }
+            Ok(())
         }
     }
 
-    /// The `message` and `statement` fields of one event, rendered with
-    /// `Debug`.
+    /// Whether `value`'s `Debug` rendering equals `text`.
+    fn renders_as(value: &dyn std::fmt::Debug, text: &str) -> bool {
+        use std::fmt::Write as _;
+        let mut sink = PrefixOf {
+            rest: text,
+            prefix: true,
+        };
+        write!(sink, "{value:?}").is_ok() && sink.prefix && sink.rest.is_empty()
+    }
+
+    /// The statement text of an event, when it is [`KILL_STATEMENT`] or
+    /// [`DROP_KILL_STATEMENT`].
+    #[derive(Clone, Copy)]
+    enum Counted {
+        Kill,
+        DropKill,
+    }
+
+    /// Whether one event's `message` is [`STATEMENT_MESSAGE`], and which
+    /// counted text its `statement` field is, if any.
     #[derive(Default)]
     struct StatementFields {
-        message: Option<String>,
-        statement: Option<String>,
+        message: bool,
+        statement: Option<Counted>,
     }
 
     impl tracing::field::Visit for StatementFields {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             match field.name() {
-                "message" => self.message = Some(format!("{value:?}")),
-                "statement" => self.statement = Some(format!("{value:?}")),
+                "message" => self.message = renders_as(value, STATEMENT_MESSAGE),
+                "statement" if renders_as(value, KILL_STATEMENT) => {
+                    self.statement = Some(Counted::Kill);
+                }
+                "statement" if renders_as(value, DROP_KILL_STATEMENT) => {
+                    self.statement = Some(Counted::DropKill);
+                }
                 _ => {}
             }
         }
@@ -2379,12 +2414,12 @@ mod tests {
         ) {
             let mut fields = StatementFields::default();
             event.record(&mut fields);
-            if fields.message.as_deref() == Some(STATEMENT_MESSAGE)
-                && let Some(statement) = fields.statement
-            {
-                let mut counts = self.0.lock().expect("statement count lock");
-                *counts.entry(statement).or_default() += 1;
-            }
+            let counter = match (fields.message, fields.statement) {
+                (true, Some(Counted::Kill)) => &self.kill,
+                (true, Some(Counted::DropKill)) => &self.drop_kill,
+                _ => return,
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -2413,14 +2448,14 @@ mod tests {
     /// The counts of [`KILL_STATEMENT`] and [`DROP_KILL_STATEMENT`] in
     /// `counts`.
     fn kill_counts(counts: &StatementCount) -> (usize, usize) {
-        (counts.of(KILL_STATEMENT), counts.of(DROP_KILL_STATEMENT))
+        let load = |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::SeqCst);
+        (load(&counts.kill), load(&counts.drop_kill))
     }
 
-    /// Across a [`kill_live`] of a registered live query, [`StatementCount`]
-    /// goes up by 1 for [`KILL_STATEMENT`] and by 0 for
-    /// [`DROP_KILL_STATEMENT`]; across the drop of another live query's
-    /// stream, by 0 for [`KILL_STATEMENT`] and by 1 for
-    /// [`DROP_KILL_STATEMENT`]. Both live queries are gone within
+    /// A new [`StatementCount`] holds 1 [`KILL_STATEMENT`] and 0
+    /// [`DROP_KILL_STATEMENT`]s after a [`kill_live`] of a registered live
+    /// query, and 1 of each after the drop of another live query's stream
+    /// that follows. Both live queries are gone within
     /// [`DROP_KILL_SETTLE`] of the drop, read while the subscriber is the
     /// default.
     #[tokio::test(flavor = "current_thread")]
@@ -2436,7 +2471,6 @@ mod tests {
 
         let (subscriber, _sink, counts) = statement_counting_subscriber();
         let guard = tracing::subscriber::set_default(subscriber);
-        let before = kill_counts(&counts);
         kill_live(&db, "frank", killed_id).await;
         let after_kill = kill_counts(&counts);
         drop(dropped);
@@ -2446,11 +2480,10 @@ mod tests {
         drop(guard);
         drop(killed);
 
-        let delta = |from: (usize, usize), to: (usize, usize)| (to.0 - from.0, to.1 - from.1);
         assert_eq!(
-            [delta(before, after_kill), delta(after_kill, after_drop)],
-            [(1, 0), (0, 1)],
-            "(KILL $id, KILL $__kill_id) count increases across [kill_live, stream drop]"
+            [after_kill, after_drop],
+            [(1, 0), (1, 1)],
+            "(KILL $id, KILL $__kill_id) counts after [kill_live, stream drop]"
         );
         assert_eq!(
             lives,
@@ -3312,12 +3345,13 @@ mod tests {
     /// Stall every later query on `db` for `stall`, in whole milliseconds: a
     /// `SLEEP` holds the session's read lock, a queued `use_db` waits for its
     /// write lock, and a later query waits behind that writer. The returned
-    /// task ends with the stall.
+    /// task ends with the stall. Panics on a `stall` below 1 ms.
     async fn hold_session_for(
         db: &'static Surreal<any::Any>,
         stall: Duration,
     ) -> tokio::task::JoinHandle<()> {
         let millis = stall.as_millis();
+        assert!(millis > 0, "a stall of {stall:?} renders as SLEEP 0ms");
         let held = async move {
             let (slept, used) = tokio::join!(db.query(format!("SLEEP {millis}ms")), async {
                 tokio::task::yield_now().await;
@@ -3417,7 +3451,7 @@ mod tests {
         let began = tokio::time::Instant::now();
         finish_subscribe(db, "frank".to_string(), async { Ok((stream, live_id)) }).await;
         let elapsed = began.elapsed();
-        let killed = counts.of(KILL_STATEMENT);
+        let (killed, _) = kill_counts(&counts);
         drop(guard);
 
         assert!(
@@ -3481,7 +3515,7 @@ mod tests {
         let began = tokio::time::Instant::now();
         end_live(&db, "frank", live_id, dropped, EndScope::Full).await;
         let elapsed = began.elapsed();
-        let killed = counts.of(KILL_STATEMENT);
+        let (killed, _) = kill_counts(&counts);
         let after = message_lives(&db).await;
         drop(guard);
         drop(kept);
@@ -4979,15 +5013,18 @@ mod tests {
     /// A reconnect of one listen loop after an [`Exit::CatchUp`] whose end
     /// wait no read answers: the second page read starts a stall of every
     /// query for 1.5 × [`LIVE_KILL_TIMEOUT`] (see [`hold_session_for`]) and
-    /// fails. From the start of the loop until the read after the
-    /// resubscribe, the loop logs at warn, with the agent, that no read showed
-    /// whether the live query had ended, and the datastore began to execute 0
-    /// [`KILL_STATEMENT`]s and at least 1 [`DROP_KILL_STATEMENT`] (see
-    /// [`StatementCount`]).
+    /// fails. From the start of the loop until the first read after the
+    /// resubscribe and the old live query no longer listed, the loop logs at
+    /// warn, with the agent, that no read showed whether the live query had
+    /// ended, and the datastore began to execute 0 [`KILL_STATEMENT`]s and at
+    /// least 1 [`DROP_KILL_STATEMENT`] (see [`StatementCount`]). A
+    /// [`kill_live`] of another live query after that moves the
+    /// [`KILL_STATEMENT`] count from 0 to 1.
     #[tokio::test(flavor = "current_thread")]
     async fn reconnect_end_sends_no_fallback_kill() {
         let db: &'static Surreal<any::Any> = Box::leak(Box::new(mem_db().await));
         let stall = LIVE_KILL_TIMEOUT * 3 / 2;
+        let owner = RecordId::new(AGENT_TABLE, "frank");
         let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
         let mut call = 0;
         let reads = move |at: Cursor| -> CatchUpRead {
@@ -5008,17 +5045,41 @@ mod tests {
         let guard = tracing::subscriber::set_default(subscriber);
         let coalition = scripted_coalition(db, Cursor::at(5), 8, reads).await;
         next_read(&mut seen).await;
+        let old = message_lives(db).await;
         wake_frank(db).await;
         next_read(&mut seen).await;
-        timeout(Duration::from_secs(10), seen.recv())
+        let resubscribe_within = stall * 2;
+        timeout(resubscribe_within, seen.recv())
             .await
-            .expect("no read after the resubscribe within 10 s")
+            .unwrap_or_else(|_| {
+                panic!("no read after the resubscribe within {resubscribe_within:?}")
+            })
             .expect("the read channel is open");
+        timeout(resubscribe_within, async {
+            while message_lives(db).await.iter().any(|id| old.contains(id)) {
+                sleep(LIVE_END_POLL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("old live query {old:?} still listed after {resubscribe_within:?}")
+        });
         let (killed, drop_killed) = kill_counts(&counts);
         let logs = logged(&sink);
+        let (scratch, scratch_id) = subscribe_wake(db, &owner, "frank")
+            .await
+            .expect("subscribe the scratch live query");
+        kill_live(db, "frank", scratch_id).await;
+        let (control, _) = kill_counts(&counts);
         coalition.shutdown().await;
         drop(guard);
+        drop(scratch);
 
+        assert_eq!(
+            old.len(),
+            1,
+            "precondition: one live query before the wake: {old:?}"
+        );
         assert!(
             logs.lines()
                 .any(|l| l.contains("WARN") && l.contains("frank") && l.contains(UNREAD_WARNING)),
@@ -5032,6 +5093,10 @@ mod tests {
         assert_eq!(
             killed, 0,
             "KILL $id statements begun up to the read after the resubscribe"
+        );
+        assert_eq!(
+            control, 1,
+            "positive control: KILL $id statements after one kill_live of a scratch live query"
         );
     }
 
